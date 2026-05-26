@@ -1,0 +1,57 @@
+# Canonical 3D-FRONT dataset contract and legacy src.data adapter settings.
+spec:
+  resolution: 518
+  num_points: 4096
+  local_obj_num_points: 2048
+  num_ctx_points: 0
+  axis_convention: y_up_z_forward
+  unit_scale: 1.0
+  augmentation_policy: canonical_train_only
+  split_dir: splits
+  coordinate_frame:
+    handedness: right
+    up_axis: y
+    forward_axis: z
+    units: meters
+  normalization:
+    mode: bbox
+    bound: 0.95
+    center: true
+    preserve_aspect_ratio: true
+
+src_data:
+  type: 3d-front
+  path: datasets/3d-front-ar-packed-flattened
+  num_points: ${dataset.spec.num_points}
+  norm_bound: ${dataset.spec.normalization.bound}
+  with_normals: false
+  mesh_path: datasets/3d-front-meshes
+  num_pos_tokens: ${model.num_pos_tokens}
+  random_scale: true
+  random_scale_min: 0.75
+  random_rotate_sampled_instance: false
+  random_rotate: true
+  random_rotate_min: -45.0
+  random_rotate_max: 45.0
+  random_jitter_point_clouds: true
+  random_jitter_probability: 0.5
+  random_jitter_offset: 0.01
+  random_jitter_depth: true
+  random_jitter_depth_offset: 0.02
+  random_shift: true
+  random_shift_max: 0.2
+  visualize: false
+  local_obj_num_points: ${dataset.spec.local_obj_num_points}
+  mask_path: datasets/3d-front-panoptic
+  mask_erosion_size: 3
+  depth_path: ""
+  use_predicted_depth: false
+  predicted_depth_aligned: false
+  local_obj_cond_drop_prob: 0.2
+  use_masked_obj_pc: true
+  load_images: false
+  image_preprocessor: facebook/dpt-dinov2-small-nyu
+  image_size_divisor: 28
+  num_ctx_points: ${dataset.spec.num_ctx_points}
+  ignore_obj_seq: false
+  ignore_layout_seq: false

@@ -1,0 +1,8 @@
+# MeshXL model adapter override; inherits the PixARMesh-compatible base.
+defaults:
+  - pixarmesh
+  - _self_
+
+name: meshxl
+ar_model_type: meshxl
+tokenization_method: meshxl

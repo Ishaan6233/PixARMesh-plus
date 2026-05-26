@@ -1,0 +1,29 @@
+# Root Hydra config for the canonical FAIR benchmark wrapper.
+defaults:
+  - dataset: canonical_3d_front
+  - model: pixarmesh
+  - train: default
+  - eval: canonical
+  - runtime: canonical
+  - environment: h200_cu124
+  - experiment: pixarmesh_canonical
+  - _self_
+
+task: validate
+seed: 1234
+
+deterministic:
+  strict: true
+
+output:
+  base_dir: outputs
+  date: ${now:%Y-%m-%d}
+
+hydra:
+  job:
+    chdir: true
+    env_set:
+      OMP_NUM_THREADS: "1"
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+  run:
+    dir: ${output.base_dir}/${output.date}/${experiment.name}/hydra

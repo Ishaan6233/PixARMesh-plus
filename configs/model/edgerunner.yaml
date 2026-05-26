@@ -1,0 +1,8 @@
+# EdgeRunner model adapter override; keeps benchmark policy unchanged.
+defaults:
+  - pixarmesh
+  - _self_
+
+name: edgerunner
+ar_model_type: edgerunner
+tokenization_method: edgerunner

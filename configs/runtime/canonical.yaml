@@ -1,0 +1,8 @@
+# Canonical runtime benchmarking protocol shared by all models.
+precision: bf16
+batch_size: 1
+warmup_steps: 20
+benchmark_steps: 100
+execution_mode:
+  - eager
+  - compile

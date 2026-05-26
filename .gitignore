@@ -1,7 +1,9 @@
 /checkpoint/
-/outputs/
+/outputs/*
+!/outputs/.gitkeep
 /outputs-*/
-/models/
+/artifacts/*
+!/artifacts/.gitkeep
 /datasets/
 /debug/
 /visualize/

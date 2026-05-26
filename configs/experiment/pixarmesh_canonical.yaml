@@ -1,0 +1,3 @@
+# Named canonical PixARMesh benchmark experiment.
+name: pixarmesh_canonical
+description: Canonical FAIR PixARMesh benchmark run.

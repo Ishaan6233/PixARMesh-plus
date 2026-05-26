@@ -1,0 +1,10 @@
+# Canonical Tier 2 H200/CUDA 12.4 benchmark environment declaration.
+name: h200-cu124
+python: "3.11"
+cuda: "12.4"
+torch: "2.5.1+cu124"
+torchvision: "0.20.1+cu124"
+pytorch3d_commit: 75ebeeaea0908c5527e7b1e305fbc7681382db47
+flash_attn: "2.8.3"
+triton: "3.1.0"
+benchmark_tier: 2

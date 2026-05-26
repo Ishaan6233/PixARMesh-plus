@@ -1,0 +1,16 @@
+# Canonical evaluation policy shared by all benchmarked models.
+sample_points: 100000
+chamfer:
+  squared: true
+  reduction: mean
+fscore:
+  threshold: 0.01
+normals:
+  enabled: true
+mesh_sampling:
+  method: area_weighted
+  seed: 0
+mesh_cleanup:
+  remove_degenerate_faces: true
+  remove_duplicate_vertices: true
+  watertight_required: false
