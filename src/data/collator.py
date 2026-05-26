@@ -44,7 +44,7 @@ class BaseCollator:
         self.max_seq_length = model_cfg.max_seq_length
 
         if self.tokenization_method == "edgerunner":
-            from meto import Engine
+            from meto.meto import Engine
 
             self.tokenizer = Engine(
                 discrete_bins=self.num_pos_tokens, backend="LR_ABSCO"

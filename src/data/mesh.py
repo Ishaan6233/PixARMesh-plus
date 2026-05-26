@@ -18,7 +18,7 @@ class MeshTokenizer(PreTrainedTokenizerBase):
             padding_side="right",
         )
         self.is_fast = True
-        self.vocab_size = model_cfg.vocab_size
+        self._vocab_size = model_cfg.vocab_size
         self._special_tokens_map.update(
             {
                 "pad_token": "<pad>",
@@ -31,6 +31,10 @@ class MeshTokenizer(PreTrainedTokenizerBase):
             "<bos>": model_cfg.bos_token_id,
             "<eos>": model_cfg.eos_token_id,
         }
+
+    @property
+    def vocab_size(self):
+        return self._vocab_size
 
     @property
     def added_tokens_decoder(self):
