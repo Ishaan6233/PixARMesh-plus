@@ -1,0 +1,12 @@
+# Conda wrapper for the canonical FAIR benchmark pip lock.
+name: pixarmesh-benchmark-cu124
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.11
+  - cuda-version=12.4
+  - pip
+  - pip:
+      - -r requirements.lock.txt

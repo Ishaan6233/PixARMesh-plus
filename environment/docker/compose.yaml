@@ -1,0 +1,20 @@
+# Docker Compose service for running the canonical benchmark GPU container.
+services:
+  benchmark:
+    build:
+      context: ../..
+      dockerfile: environment/docker/Dockerfile
+    image: pixarmesh-benchmark:cu124
+    working_dir: /workspace/PixARMesh
+    volumes:
+      - ../..:/workspace/PixARMesh
+    environment:
+      CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+      OMP_NUM_THREADS: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    shm_size: 32gb
+    tty: true
