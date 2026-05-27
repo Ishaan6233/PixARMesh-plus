@@ -126,9 +126,12 @@ class EdgeRunnerPointEncoder(PreTrainedModel):
         self.point_embed = PointEmbed(dim=config.hidden_dim)
         if config.with_extra_feat:
             self.extra_feat_proj = nn.Linear(config.extra_feat_dim, config.hidden_dim)
-            # # Zero init
-            # self.extra_feat_proj.weight.data.zero_()
-            # self.extra_feat_proj.bias.data.zero_()
+            # Zero init so image features start with zero contribution.
+            # Must use zeros_ (not normal_/kaiming_uniform_) because from_pretrained runs
+            # __init__ under no_init_weights() which patches normal_/kaiming_uniform_ to no-ops,
+            # leaving missing-checkpoint params as uninitialized garbage that becomes NaN in bfloat16.
+            nn.init.zeros_(self.extra_feat_proj.weight)
+            nn.init.zeros_(self.extra_feat_proj.bias)
 
         self.ln = nn.LayerNorm(config.hidden_dim)
 

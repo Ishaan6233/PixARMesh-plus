@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from src.utils.config import ModelConfig
 from .meshxl import MeshOPT, MeshOPTConfig
 from .edgerunner import ShapeOPT, ShapeOPTConfig
@@ -7,6 +8,38 @@ from .pc_miche.encoder import PointCloudEncoder
 from .pc_edgerunner.encoder import EdgeRunnerPointEncoder
 from .cond import ConditionEncoder
 from .img_cond import ImageConditionEncoder, HighResImageConditionEncoder
+
+
+def _fix_uninit_params(model):
+    """Reinitialize any NaN/Inf parameters left by from_pretrained's no_init_weights context.
+
+    from_pretrained runs __init__ under no_init_weights(), which patches kaiming_uniform_/normal_
+    to no-ops. Modules whose keys are absent from the checkpoint are never overwritten, leaving
+    them as uninitialized GPU memory. After casting to bfloat16, garbage float32 values can
+    become bfloat16 NaN and corrupt the entire forward pass.
+    """
+    init_std = getattr(getattr(model, "config", None), "init_std", 0.02)
+    for module in model.modules():
+        has_bad = any(
+            p.is_floating_point() and (torch.isnan(p.data).any() or torch.isinf(p.data).any())
+            for p in module.parameters(recurse=False)
+        )
+        if not has_bad:
+            continue
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight.data, mean=0.0, std=init_std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias.data)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight.data, mean=0.0, std=init_std)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight.data)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias.data)
+        else:
+            for p in module.parameters(recurse=False):
+                if p.is_floating_point():
+                    nn.init.normal_(p.data, mean=0.0, std=init_std)
 
 
 def get_model(
@@ -46,16 +79,35 @@ def get_model(
             raise ValueError(f"Unknown model type: {model_type}")
 
     config = config_class.from_pretrained(local_model_path, **extra_args)
+    # Snapshot the pre-loaded cond_encoder state before from_pretrained, because
+    # from_pretrained detects cond_encoder.* as "MISSING" from the main checkpoint
+    # and re-initializes them with random weights, discarding the pretrained values.
+    cond_enc_state = (
+        {k: v.clone() for k, v in cond_encoder.state_dict().items()}
+        if cond_encoder is not None
+        else None
+    )
     model = model_class.from_pretrained(
         local_model_path,
         config=config,
-        torch_dtype=torch.float32,
-        attn_implementation="flash_attention_2",
         cond_encoder=cond_encoder,
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
         ignore_mismatched_sizes=True,
     )
+    # Restore the pretrained cond_encoder weights that from_pretrained overwrote.
+    if cond_enc_state is not None:
+        model.cond_encoder.load_state_dict(cond_enc_state, strict=False)
+    # ctx_aggregator is absent from the checkpoint and was created under from_pretrained's
+    # no_init_weights() context (which patches kaiming_uniform_/normal_ to no-ops), leaving
+    # it as uninitialized garbage. Re-initialize it here, outside that context, so the
+    # OPT _init_weights actually runs.
+    if hasattr(model, "ctx_aggregator") and model.ctx_aggregator is not None:
+        model.ctx_aggregator.apply(model._init_weights)
+    model = model.to(torch.bfloat16)
+    # Safety: catch any remaining NaN/Inf params from other missing-checkpoint modules.
+    _fix_uninit_params(model)
+    model.config._attn_implementation = "flash_attention_2"
     if config.vocab_size != model_cfg.vocab_size:
         model.resize_token_embeddings(model_cfg.vocab_size, pad_to_multiple_of=64)
     return model
@@ -77,6 +129,8 @@ def get_condition_encoder(
         extra_args["with_extra_feat"] = True
         extra_args["extra_feat_dim"] = cond_encoder_img.output_dim
     model = model_class.from_pretrained(local_model_path, **extra_args)
+    model = model.to(torch.bfloat16)
+    _fix_uninit_params(model)
     return ConditionEncoder(model, freeze=model_cfg.freeze_cond_encoder)
 
 
@@ -90,4 +144,4 @@ def get_image_condition_encoder(model_cfg: ModelConfig):
         )
     else:
         model = ImageConditionEncoder(model_name=model_cfg.image_encoder)
-    return model
+    return model.to(torch.bfloat16)

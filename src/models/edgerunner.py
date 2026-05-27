@@ -199,7 +199,9 @@ class ShapeOPT(OPTForCausalLM):
         num_face_embeds = self.embed_num_face(cond_num_faces)
         all_cond_embeds.append(num_face_embeds)
         if len(all_cond_embeds) > 0:
-            all_cond_embeds = torch.cat(all_cond_embeds, dim=1).flatten(0, 1)
+            all_cond_embeds = torch.cat(
+                [e.to(inputs_embeds.dtype) for e in all_cond_embeds], dim=1
+            ).flatten(0, 1)
             inputs_embeds.masked_scatter_(
                 cond_token_mask.unsqueeze(-1), all_cond_embeds
             )
