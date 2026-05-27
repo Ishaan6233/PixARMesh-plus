@@ -55,8 +55,13 @@ def train_with_existing_stack(cfg: Any, output_dir: str | Path) -> None:
         }
     )
     train_args_dict = OmegaConf.to_container(cfg.train.train_args, resolve=True)
+    resume_from_checkpoint = bool(train_args_dict.pop("resume_from_checkpoint", True))
     train_args_dict["output_dir"] = str(Path(output_dir) / "checkpoints")
     train_args_dict["logging_dir"] = str(Path(output_dir) / "logs")
+    allowed_train_keys = {field.name for field in fields(CustomSFTConfig)}
+    train_args_dict = {
+        key: value for key, value in train_args_dict.items() if key in allowed_train_keys
+    }
     train_args = CustomSFTConfig(
         **train_args_dict,
         max_length=model_cfg.max_seq_length,
@@ -81,7 +86,10 @@ def train_with_existing_stack(cfg: Any, output_dir: str | Path) -> None:
             sig_cb,
         ],
     )
-    trainer.train(resume_from_checkpoint=get_last_checkpoint(train_args.output_dir))
+    resume_checkpoint = (
+        get_last_checkpoint(train_args.output_dir) if resume_from_checkpoint else None
+    )
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     if not sig_cb.signal_received:
         trainer.save_model((Path(train_args.output_dir) / "final").as_posix())
     trainer.accelerator.wait_for_everyone()

@@ -10,6 +10,7 @@ from transformers import (
 class JsonlLoggerCallback(TrainerCallback):
     def __init__(self, log_file_path):
         self.log_file_path = os.path.join(log_file_path, "log.jsonl")
+        os.makedirs(log_file_path, exist_ok=True)
 
     def on_log(self, args, state: TrainerState, control, logs=None, **kwargs):
         if logs is None:

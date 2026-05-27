@@ -1,7 +1,9 @@
 import datasets
 import hydra
 import transformers
+from dataclasses import fields
 from pathlib import Path
+from typing import Any
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from omegaconf import OmegaConf
@@ -24,7 +26,52 @@ logger = get_logger(__name__)
 OmegaConf.register_new_resolver("sub", lambda x, y: x - y)
 
 
-@hydra.main(version_base=None, config_path="configs")
+def _to_container(node):
+    return OmegaConf.to_container(node, resolve=True)
+
+
+def _filter_dataclass_kwargs(dataclass_type, values: dict[str, Any]):
+    allowed_keys = {field.name for field in fields(dataclass_type)}
+    return {key: value for key, value in values.items() if key in allowed_keys}
+
+
+def _build_data_config(cfg):
+    if OmegaConf.select(cfg, "dataset.src_data") is not None:
+        data_values = _to_container(cfg.dataset.src_data)
+    elif OmegaConf.select(cfg, "data") is not None:
+        data_values = _to_container(cfg.data)
+    elif OmegaConf.select(cfg, "dataset") is not None:
+        data_values = _to_container(cfg.dataset)
+    else:
+        raise ValueError("Expected either cfg.dataset.src_data, cfg.data, or cfg.dataset")
+    return DataConfig(**_filter_dataclass_kwargs(DataConfig, data_values))
+
+
+def _build_model_config(cfg):
+    model_values = _to_container(cfg.model)
+    return ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+
+
+def _build_train_args(cfg, model_cfg):
+    train_arg_values = _to_container(cfg.train.train_args)
+    resume_from_checkpoint = bool(train_arg_values.pop("resume_from_checkpoint", True))
+    train_arg_values = _filter_dataclass_kwargs(CustomSFTConfig, train_arg_values)
+    train_args = CustomSFTConfig(
+        **train_arg_values,
+        max_length=model_cfg.max_seq_length,
+        dataset_kwargs={
+            "skip_prepare_dataset": True,
+        },
+        remove_unused_columns=False,
+    )
+    return train_args, resume_from_checkpoint
+
+
+@hydra.main(
+    version_base=None,
+    config_path="configs",
+    config_name="config",
+)
 def main(cfg):
     install_sigusr1_handler()
 
@@ -32,8 +79,8 @@ def main(cfg):
 
     accelerator = Accelerator()
     accelerator.print(OmegaConf.to_yaml(cfg))
-    data_cfg = DataConfig(**OmegaConf.to_container(cfg.data, resolve=True))
-    model_cfg = ModelConfig(**OmegaConf.to_container(cfg.model, resolve=True))
+    data_cfg = _build_data_config(cfg)
+    model_cfg = _build_model_config(cfg)
     local_model_path = model_cfg.local_path
     local_cond_model_path = model_cfg.local_cond_path
 
@@ -45,14 +92,7 @@ def main(cfg):
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    train_args = CustomSFTConfig(
-        **OmegaConf.to_container(cfg.train.train_args, resolve=True),
-        max_length=model_cfg.max_seq_length,
-        dataset_kwargs={
-            "skip_prepare_dataset": True,
-        },
-        remove_unused_columns=False,
-    )
+    train_args, should_resume = _build_train_args(cfg, model_cfg)
 
     with accelerator.local_main_process_first():
         if model_cfg.img_cond:
@@ -82,12 +122,13 @@ def main(cfg):
         data_collator=get_mesh_data_collator(data_cfg, model_cfg),
         processing_class=MeshProcessor(model_cfg),
         callbacks=[
-            JsonlLoggerCallback(log_file_path=cfg.train.train_args.logging_dir),
+            JsonlLoggerCallback(log_file_path=train_args.logging_dir),
             sig_cb,
         ],
     )
 
-    trainer.train(resume_from_checkpoint=get_last_checkpoint(train_args.output_dir))
+    resume_checkpoint = get_last_checkpoint(train_args.output_dir) if should_resume else None
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     final_output_dir = Path(train_args.output_dir) / "final"
     if not sig_cb.signal_received:
         trainer.save_model(final_output_dir.as_posix())
