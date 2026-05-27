@@ -1,8 +1,38 @@
-# EdgeRunner model adapter override; keeps benchmark policy unchanged.
+# EdgeRunner model adapter for the canonical benchmark.
 defaults:
   - pixarmesh
   - _self_
 
 name: edgerunner
+
+# Model architecture
 ar_model_type: edgerunner
 tokenization_method: edgerunner
+vocab_size: 576
+num_pos_tokens: 512
+max_seq_length: 43019
+max_position_embeddings: ${model.max_seq_length}
+pos_token_offset: 6
+layout_tokenization_method: full
+
+# Token IDs
+bos_token_id: 1
+eos_token_id: 2
+pad_token_id: 0
+sep_token_id: 518
+indicator_token_id: 518
+
+# Prefix / point cloud
+prefix_len: 2049
+pc_latent_len: 2048
+
+# Condition encoder
+cond: true
+local_cond_path: zx1239856/edgerunner-pc-encoder
+cond_enc_type: edgerunner
+
+# Pretrained weights
+local_path: zx1239856/edgerunner
+
+# Loss
+loss_layout_scale: null

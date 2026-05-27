@@ -1,7 +1,7 @@
 # Root Hydra config for the canonical FAIR benchmark wrapper.
 defaults:
   - dataset: canonical_3d_front
-  - model: pixarmesh
+  - model: edgerunner
   - train: default
   - eval: canonical
   - runtime: canonical
