@@ -166,6 +166,7 @@ def transform_3d_front(
     result_all_obj_model_ids = []
 
     result_pixel_values = []
+    result_scene_transforms = []
 
     num_points = data_cfg.num_points
     with_normals = data_cfg.with_normals
@@ -401,6 +402,23 @@ def transform_3d_front(
                 all_obj_to_cam_transform_rect = (
                     shift_matrix @ all_obj_to_cam_transform_rect
                 )
+            # Compute the combined camera-frame → normalized-scene-space transform so that
+            # Pi3X local_points (camera frame) can be placed in the same coordinate space
+            # as the existing point clouds without re-running the data pipeline.
+            # Chain: camera → gravity-align → rot → normalize → shift
+            M_gravity = T_gravity_inv @ y_up_matrix
+            M_rot_4d = np.eye(4, dtype=np.float32)
+            if is_train and data_cfg.random_rotate:
+                M_rot_4d[:3, :3] = rot_mat
+            M_shift = (
+                shift_matrix
+                if (is_train and data_cfg.random_shift)
+                else np.eye(4, dtype=np.float32)
+            )
+            # Combined (right-to-left application order for pts_h @ M.T convention)
+            scene_transform = M_shift @ normalize_matrix @ M_rot_4d @ M_gravity
+            result_scene_transforms.append(scene_transform.astype(np.float32))
+
             all_pcd = all_pcd.reshape(img_shape[0], img_shape[1], 3)
             result_all_point_clouds.append(all_pcd)
             result_all_point_clouds_2d.append(pix_pcs)
@@ -489,6 +507,7 @@ def transform_3d_front(
         ret["point_clouds"] = result_point_clouds
         ret["point_clouds_2d"] = result_point_clouds_2d
         ret["point_clouds_valid"] = result_pc_valid
+        ret["scene_transforms"] = result_scene_transforms
     if has_ctx_pc:
         ret["ctx_point_clouds"] = result_ctx_point_clouds
         ret["ctx_point_clouds_2d"] = result_ctx_point_clouds_2d

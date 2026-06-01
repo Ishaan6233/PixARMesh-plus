@@ -80,3 +80,8 @@ class ModelConfig:
     with_ctx_pc: bool = False
     img_cond_drop_prob: float = 0.0
     loss_layout_scale: Optional[float] = None
+    # Pi3X: frozen image→3D backbone (replaces Depth Pro + Grounded-SAM)
+    use_pi3x: bool = False
+    pi3x_ckpt_path: str = "checkpoints/pi3x"
+    pi3x_greedy_anchor: bool = True
+    pi3x_disable_multimodal: bool = True

@@ -1,0 +1,12 @@
+defaults:
+  - edgerunner_3d_front_global_obj_pose_w_img_ctx
+  - _self_
+
+all:
+  name: edgerunner-3d-front-global-obj-pose-w-img-ctx-pi3x
+
+model:
+  use_pi3x: True
+  pi3x_ckpt_path: checkpoints/pi3x
+  pi3x_greedy_anchor: True
+  pi3x_disable_multimodal: True

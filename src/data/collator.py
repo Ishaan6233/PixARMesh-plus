@@ -202,12 +202,18 @@ class Front3DCollator(BaseCollator):
         has_obj_pc = has_obj and "obj_point_clouds" in examples[0]
         has_pixel_values = "pixel_values" in examples[0]
         has_ctx_pc = "ctx_point_clouds" in examples[0]
+        # scene_transforms is present whenever has_pc=True (computed in transform_3d_front).
+        # Gated on has_pc — NOT has_ctx_pc — because Pi3X needs scene_transform to replace
+        # per-object point clouds (cond_pcs) independently of whether context PCs are used.
+        # Tying it to has_ctx_pc would silently disable Pi3X when num_ctx_points=0.
+        has_scene_transform = has_pc and "scene_transforms" in examples[0]
         all_obj_indices = []
         all_obj_bboxes = []
         all_obj_cond_pcs = []
         layout_prefix_lens = []
 
         all_pixel_values = []
+        all_scene_transforms = []
 
         for example in examples:
             bboxes = example["bboxes"]
@@ -235,6 +241,8 @@ class Front3DCollator(BaseCollator):
                 ctx_pc_2d = example["ctx_point_clouds_2d"]
                 all_ctx_pcs.append(ctx_pc)
                 all_ctx_pcs_2d.append(ctx_pc_2d)
+                if has_scene_transform:
+                    all_scene_transforms.append(example["scene_transforms"])
 
             obj_seq = []
             obj_type_ids = []
@@ -310,6 +318,10 @@ class Front3DCollator(BaseCollator):
             ret["ctx_pcs"] = torch.as_tensor(all_ctx_pcs, dtype=torch.float32)
             all_ctx_pcs_2d = np.array(all_ctx_pcs_2d)
             ret["ctx_pcs_2d"] = torch.as_tensor(all_ctx_pcs_2d, dtype=torch.float32)
+            if has_scene_transform:
+                ret["scene_transform"] = torch.as_tensor(
+                    np.array(all_scene_transforms), dtype=torch.float32
+                )
         if has_obj:
             all_obj_indices = np.array(all_obj_indices)
             ret["obj_indices"] = torch.as_tensor(all_obj_indices, dtype=torch.long)
