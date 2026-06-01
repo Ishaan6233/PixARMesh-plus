@@ -121,7 +121,6 @@ def main():
     device = state.device
     model, model_cfg, data_cfg = prepare_model_for_inference(is_bpt, args.checkpoint)
     model.to(device)
-    model.compile()
 
     data_cfg.use_predicted_depth = not use_gt_depth
     if not use_gt_depth:
