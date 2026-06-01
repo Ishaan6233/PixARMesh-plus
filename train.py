@@ -11,6 +11,7 @@ from src.models.utils import (
     get_model,
     get_condition_encoder,
     get_image_condition_encoder,
+    get_pi3x_encoder,
 )
 from src.data.collator import get_mesh_data_collator
 from src.data.mesh import get_mesh_dataset, MeshProcessor
@@ -105,11 +106,13 @@ def main(cfg):
             )
         else:
             cond_encoder = None
+        pi3x_enc = get_pi3x_encoder(model_cfg) if model_cfg.use_pi3x else None
         model = get_model(
             local_model_path,
             model_cfg,
             cond_encoder=cond_encoder,
             cond_encoder_img=cond_encoder_img,
+            pi3x_encoder=pi3x_enc,
         )
         train_set, val_set, _ = get_mesh_dataset(data_cfg)
 
