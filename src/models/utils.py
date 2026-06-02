@@ -110,22 +110,30 @@ def get_model(
         is_scene=is_scene,
         ignore_mismatched_sizes=True,
     )
-    # Restore the pretrained cond_encoder weights that from_pretrained overwrote.
+    # Restore pretrained cond_encoder keys that the checkpoint did NOT supply.
+    # We detect which keys the checkpoint provided by comparing the post-load model state
+    # against the pre-load snapshot: keys that now differ were loaded from the checkpoint
+    # and must be kept; keys still matching the snapshot were absent from the checkpoint
+    # and need the pretrained values restored (to undo any no_init_weights corruption).
+    # This works for both local paths and HuggingFace model IDs.
     if cond_enc_state is not None:
-        model.cond_encoder.load_state_dict(cond_enc_state, strict=False)
+        loaded_state = model.cond_encoder.state_dict()
+        restore = {
+            k: v for k, v in cond_enc_state.items()
+            if k not in loaded_state
+            or torch.equal(loaded_state[k].float().cpu(), v.float().cpu())
+        }
+        model.cond_encoder.load_state_dict(restore, strict=False)
     # Attach frozen encoders post-from_pretrained.
     # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
     # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
     if pi3x_encoder is not None and hasattr(model, "pi3x_encoder"):
         model.pi3x_encoder = pi3x_encoder
-    # ctx_aggregator is absent from the checkpoint and was created under from_pretrained's
-    # no_init_weights() context (which patches kaiming_uniform_/normal_ to no-ops), leaving
-    # it as uninitialized garbage. Re-initialize it here, outside that context, so the
-    # OPT _init_weights actually runs.
-    if hasattr(model, "ctx_aggregator") and model.ctx_aggregator is not None:
-        model.ctx_aggregator.apply(model._init_weights)
     model = model.to(torch.bfloat16)
-    # Safety: catch any remaining NaN/Inf params from other missing-checkpoint modules.
+    # Catch NaN/Inf params left by no_init_weights (absent checkpoint keys → garbage memory
+    # → bfloat16 NaN).  This covers ctx_aggregator when loading from the original edgerunner
+    # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
+    # when loading from a stage-2 checkpoint that already contains them.
     _fix_uninit_params(model)
     model.config._attn_implementation = "flash_attention_2"
     if config.vocab_size != model_cfg.vocab_size:
