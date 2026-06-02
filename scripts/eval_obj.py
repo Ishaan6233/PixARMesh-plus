@@ -68,6 +68,11 @@ def main():
         default=1600,
     )
     parser.add_argument(
+        "--no-align",
+        action="store_true",
+        help="Skip pose alignment; compare normalized clouds directly (for eval protocol testing)",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Whether to overwrite existing eval results",
@@ -140,13 +145,6 @@ def main():
         }
 
         if has_gt and has_pred:
-            gt_pcds = evaluation.sample_points_from_o3d_mesh(gt_mesh, 5000)
-            pred_pcds = evaluation.sample_points_from_o3d_mesh(pred_mesh, 5000)
-            gt_pcds = evaluation.get_normalized_pcd(gt_pcds)
-            pred_pcds = evaluation.get_normalized_pcd(pred_pcds)
-            transform_matrices = evaluation.get_object_transformations(
-                [pred_pcds], [gt_pcds]
-            )
             gt_pcds = evaluation.sample_points_from_o3d_mesh(
                 gt_mesh, args.num_sample_points
             )
@@ -155,16 +153,21 @@ def main():
             )
             gt_pcds = evaluation.get_normalized_pcd(gt_pcds)
             pred_pcds = evaluation.get_normalized_pcd(pred_pcds)
-
-            transformed_pred_pcds = evaluation.apply_transformation_matrix(
-                pred_pcds,
-                transform_matrices[0],
-            )
+            if args.no_align:
+                eval_pred_pcds = pred_pcds
+            else:
+                transform_matrices = evaluation.get_object_transformations(
+                    [pred_pcds], [gt_pcds]
+                )
+                eval_pred_pcds = evaluation.apply_transformation_matrix(
+                    pred_pcds,
+                    transform_matrices[0],
+                )
             cd_loss = chamfer_distance(
                 gt_pcds.unsqueeze(0).cuda(),
-                transformed_pred_pcds.unsqueeze(0).cuda(),
+                eval_pred_pcds.unsqueeze(0).cuda(),
             )[0].item()
-            f_score = evaluation.f_score(gt_pcds.numpy(), transformed_pred_pcds.numpy())
+            f_score = evaluation.f_score(gt_pcds.numpy(), eval_pred_pcds.numpy())
             record["cd"] = float(cd_loss)
             record["f_score"] = float(f_score)
 
