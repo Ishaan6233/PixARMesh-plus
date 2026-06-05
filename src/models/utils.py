@@ -15,17 +15,24 @@ logger = logging.getLogger(__name__)
 
 
 def _fix_uninit_params(model):
-    """Reinitialize any NaN/Inf parameters left by from_pretrained's no_init_weights context.
+    """Reinitialize any NaN/Inf/garbage parameters left by from_pretrained.
 
-    from_pretrained runs __init__ under no_init_weights(), which patches kaiming_uniform_/normal_
-    to no-ops. Modules whose keys are absent from the checkpoint are never overwritten, leaving
-    them as uninitialized GPU memory. After casting to bfloat16, garbage float32 values can
-    become bfloat16 NaN and corrupt the entire forward pass.
+    from_pretrained replaces MISSING-key parameters with new uninitialized bfloat16 tensors
+    (observed in transformers ≥ 5.x). These may contain garbage float32 memory reinterpreted
+    as bfloat16 — values up to ~3e38 that are finite but absurdly large. Such values are not
+    caught by isnan/isinf alone, but their squared norms overflow float32 → loss becomes NaN.
+
+    We treat any floating-point parameter with abs().max() > 1e6 as uninitialized garbage
+    and reinitialize it, in addition to the original NaN/Inf check.
     """
     init_std = getattr(getattr(model, "config", None), "init_std", 0.02)
     for module in model.modules():
         has_bad = any(
-            p.is_floating_point() and (torch.isnan(p.data).any() or torch.isinf(p.data).any())
+            p.is_floating_point() and (
+                torch.isnan(p.data).any()
+                or torch.isinf(p.data).any()
+                or p.data.abs().max() > 1e6
+            )
             for p in module.parameters(recurse=False)
         )
         if not has_bad:
@@ -118,9 +125,15 @@ def get_model(
     # This works for both local paths and HuggingFace model IDs.
     if cond_enc_state is not None:
         loaded_state = model.cond_encoder.state_dict()
+
+        def _is_garbage(t):
+            f = t.float()
+            return bool(f.isnan().any() or f.isinf().any() or f.abs().max() > 1e6)
+
         restore = {
             k: v for k, v in cond_enc_state.items()
             if k not in loaded_state
+            or _is_garbage(loaded_state[k])  # from_pretrained replaced with uninit garbage
             or torch.equal(loaded_state[k].float().cpu(), v.float().cpu())
         }
         model.cond_encoder.load_state_dict(restore, strict=False)

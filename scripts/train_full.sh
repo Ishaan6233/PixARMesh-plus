@@ -2,19 +2,23 @@
 # Full 2-stage PixARMesh+ training (EdgeRunner).
 #
 # Usage (inside a tmux session):
-#   bash scripts/train_full.sh           # baseline (Depth Pro depth)
-#   bash scripts/train_full.sh --pi3x   # Pi3X frozen encoder variant
+#   bash scripts/train_full.sh                    # baseline (Depth Pro depth)
+#   bash scripts/train_full.sh --pi3x             # Pi3X frozen encoder variant
+#   bash scripts/train_full.sh --force-stage1     # force Stage 1 even if checkpoint exists
 #
 # Stage 1 is skipped automatically if a 'final/' checkpoint already exists
-# (safe to re-run after an interruption).
+# (safe to re-run after an interruption). Use --force-stage1 when changing
+# the image encoder (e.g. small→base), which invalidates old Stage 1 weights.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 USE_PI3X=false
+FORCE_STAGE1=false
 for arg in "$@"; do
     [[ "$arg" == "--pi3x" ]] && USE_PI3X=true
+    [[ "$arg" == "--force-stage1" ]] && FORCE_STAGE1=true
 done
 
 if $USE_PI3X; then
@@ -36,10 +40,10 @@ echo "[train_full] ════════════════════�
 # ── Stage 1 ──────────────────────────────────────────────────────────────────
 STAGE1_CKPT=$(ls -td "${S1_OUT_PREFIX}"/*/checkpoints/final 2>/dev/null | head -1 || true)
 
-if [[ -n "$STAGE1_CKPT" ]]; then
+if [[ -n "$STAGE1_CKPT" ]] && [[ "$FORCE_STAGE1" == "false" ]]; then
     echo "[train_full] Stage 1 final checkpoint already exists:"
     echo "[train_full]   $STAGE1_CKPT"
-    echo "[train_full] Skipping Stage 1."
+    echo "[train_full] Skipping Stage 1. (pass --force-stage1 to override)"
 else
     echo "[train_full] ── Stage 1: layout-only training ──"
     python launch.py train.py --config-name="${STAGE1_CFG}"
