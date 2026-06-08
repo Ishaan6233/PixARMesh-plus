@@ -172,6 +172,17 @@ def get_condition_encoder(
     model = model_class.from_pretrained(local_model_path, **extra_args)
     model = model.to(torch.bfloat16)
     _fix_uninit_params(model)
+    # extra_feat_proj is never in the base HF encoder checkpoint, so it always
+    # comes out of from_pretrained as zeros (our __init__ zeros_ safety net).
+    # Re-init with proper random weights here — outside no_init_weights — so that
+    # image features contribute gradient from step 1 of stage-2 training rather
+    # than starting cold from zero contribution.
+    # The restore logic in get_model() preserves real trained values when loading
+    # a stage-2 checkpoint (they differ from this random init, so torch.equal fails
+    # and the trained values are kept).
+    if hasattr(model, "extra_feat_proj"):
+        nn.init.normal_(model.extra_feat_proj.weight, std=0.02)
+        nn.init.zeros_(model.extra_feat_proj.bias)
     return ConditionEncoder(model, freeze=model_cfg.freeze_cond_encoder)
 
 
