@@ -73,6 +73,16 @@ def main():
         help="Skip pose alignment; compare normalized clouds directly (for eval protocol testing)",
     )
     parser.add_argument(
+        "--align-sample-points",
+        type=int,
+        default=0,
+        help=(
+            "Number of points to sample for computing the alignment transform. "
+            "0 (default) = use the same sample as --num-sample-points (fair protocol). "
+            "5000 = separate alignment sample matching the paper's original protocol."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Whether to overwrite existing eval results",
@@ -156,9 +166,24 @@ def main():
             if args.no_align:
                 eval_pred_pcds = pred_pcds
             else:
-                transform_matrices = evaluation.get_object_transformations(
-                    [pred_pcds], [gt_pcds]
-                )
+                align_n = args.align_sample_points
+                if align_n > 0 and align_n != args.num_sample_points:
+                    # Paper protocol: compute transform from a separate smaller sample,
+                    # then apply it to the full eval sample (--align-sample-points 5000).
+                    gt_align = evaluation.get_normalized_pcd(
+                        evaluation.sample_points_from_o3d_mesh(gt_mesh, align_n)
+                    )
+                    pred_align = evaluation.get_normalized_pcd(
+                        evaluation.sample_points_from_o3d_mesh(pred_mesh, align_n)
+                    )
+                    transform_matrices = evaluation.get_object_transformations(
+                        [pred_align], [gt_align]
+                    )
+                else:
+                    # Fair protocol: same sample for alignment and metrics.
+                    transform_matrices = evaluation.get_object_transformations(
+                        [pred_pcds], [gt_pcds]
+                    )
                 eval_pred_pcds = evaluation.apply_transformation_matrix(
                     pred_pcds,
                     transform_matrices[0],
