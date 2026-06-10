@@ -380,7 +380,7 @@ def prepare_model_for_inference(is_bpt, checkpoint):
         layout_tokenization_method="full",
         loss_layout_scale=None,
         img_cond=True,
-        image_encoder="facebook/dinov2-with-registers-base",
+        image_encoder="facebook/dinov2-with-registers-small",
         local_cond_path=f"zx1239856/{cond_encoder_name}",
         local_path=checkpoint,
         high_res_image_encoder=False,
@@ -406,7 +406,7 @@ def prepare_model_for_inference(is_bpt, checkpoint):
         with_normals=is_bpt,
         random_jitter_point_clouds=False,
         load_images=True,
-        image_preprocessor="facebook/dinov2-with-registers-base",
+        image_preprocessor="facebook/dpt-dinov2-small-nyu",
         image_size_divisor=28,
         num_ctx_points=16384,
     )
