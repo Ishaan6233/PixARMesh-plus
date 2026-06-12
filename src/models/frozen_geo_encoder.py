@@ -449,6 +449,7 @@ def _get_per_view_target_ids(
     local_points_z: torch.Tensor,      # (N, H, W) Pi3X depth
     view_mask: torch.Tensor,           # (N,) bool
     depth_rtol: float = 0.10,
+    min_seed_count: int = 10,
 ) -> torch.Tensor:                     # (N,) long, -1 = no valid seed visible
     """Per-view target instance ID from seed projection + plurality vote.
 
@@ -465,13 +466,21 @@ def _get_per_view_target_ids(
     pix_coords, pts_cam = _project_pts_to_views(
         seed_pcs, scene_transforms_n, K_per_view_n, H, W
     )   # pix_coords: (P, N, 2),  pts_cam: (P, N, 3)
+    # depth_rtol=100.0: skip depth occlusion test for target ID discovery.
+    # Any depth_rtol eliminates seed points at the object's surface boundary,
+    # leaving a thin minority slice that votes for the wrong SAM region.
     seed_ids = _sample_mask_ids(
-        pix_coords, pts_cam, panoptic_masks, local_points_z, view_mask, depth_rtol
+        pix_coords, pts_cam, panoptic_masks, local_points_z, view_mask,
+        depth_rtol=100.0,
     )   # (P, N) long, -1 = not visible / invalid
     for n in range(N):
         if not view_mask[n]:
             continue
         ids_n = seed_ids[:, n]
+        # Skip views where too few seed points landed in-bounds: the plurality
+        # vote over a handful of points is unreliable and often picks background.
+        if int((ids_n >= 0).sum().item()) < min_seed_count:
+            continue
         valid = ids_n > 0   # exclude background (0) and not-visible (-1)
         if valid.any():
             ids_valid = ids_n[valid]
@@ -630,16 +639,28 @@ def discover_instance_points_mv(
         n_valid_views = int((target_ids_n > 0).sum().item())
         if n_valid_views > 0:
             pix_coords, pts_cam = _project_pts_to_views(pool_pts, st_b, K_b, H, W)
-            pool_ids = _sample_mask_ids(
-                pix_coords, pts_cam, pm_b, lp_z, vm_b, depth_rtol
-            )   # (pool_size, N) long, -1 = not visible / invalid
             P = pool_pts.shape[0]
-            hit_count = torch.zeros(P, dtype=torch.long, device=device)
-            for n in range(N):
-                if not vm_b[n] or target_ids_n[n] <= 0:
-                    continue
-                hit_count += (pool_ids[:, n] == target_ids_n[n]).long()
             threshold = min(min_views, n_valid_views)
+
+            def _pool_mask(rtol: float) -> torch.Tensor:
+                ids = _sample_mask_ids(
+                    pix_coords, pts_cam, pm_b, lp_z, vm_b, depth_rtol=rtol
+                )
+                hc = torch.zeros(P, dtype=torch.long, device=device)
+                for n in range(N):
+                    if not vm_b[n] or target_ids_n[n] <= 0:
+                        continue
+                    hc += (ids[:, n] == target_ids_n[n]).long()
+                return hc
+
+            hit_count = _pool_mask(depth_rtol)
+            if hit_count.max() < threshold:
+                # Fallback: Pi3X depth maps are not globally consistent across wide-
+                # baseline views (same 3D point can be 0.5+ scene units apart in
+                # different views).  depth_rtol=100.0 skips the depth check entirely;
+                # the 2D projection still uses ground-truth camera poses.
+                hit_count = _pool_mask(100.0)
+
             is_obj = hit_count >= threshold
             obj_pts = pool_pts[is_obj]
             obj_scores = hit_count[is_obj].float() / n_valid_views  # (n_obj,) in [0,1]
