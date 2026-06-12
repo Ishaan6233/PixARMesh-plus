@@ -10,7 +10,7 @@ format:
 	ruff format src/ scripts/ tests/
 
 eval-obj:
-	python scripts/eval_obj.py $(ARGS)
+	python scripts/eval/eval_obj.py $(ARGS)
 
 eval-scene:
-	python scripts/eval_scene.py $(ARGS)
+	python scripts/eval/eval_scene.py $(ARGS)

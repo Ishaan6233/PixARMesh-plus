@@ -26,7 +26,7 @@ import scipy.sparse
 import scipy.sparse.csgraph
 import scipy.spatial
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 
 def parse_args():

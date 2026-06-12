@@ -27,6 +27,10 @@ RUNS = {
             "label": "Run 3 (Jun 04)",
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only/20260604-185418/checkpoints/runs/Jun04_18-54-53_gpu-h200-204",
         },
+        {
+            "label": "Run 4 (Jun 07)",
+            "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only/20260607-173300/checkpoints/runs/Jun07_17-33-50_gpu-h200-204",
+        },
     ],
     "img-ctx": [
         {
@@ -38,8 +42,12 @@ RUNS = {
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260605-055027/checkpoints/runs/Jun05_05-51-06_gpu-h200-204",
         },
         {
-            "label": "Run 3 (Jun 07, in-progress)",
+            "label": "Run 3 (Jun 07)",
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260607-184311/checkpoints/runs/Jun07_18-43-48_gpu-h200-204",
+        },
+        {
+            "label": "Run 4 (Jun 10, in-progress)",
+            "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260610-015711/checkpoints/runs/Jun10_01-57-46_gpu-h200-204",
         },
     ],
 }
@@ -67,8 +75,8 @@ def smooth(values, weight=0.9):
 
 
 PALETTE = {
-    "layout-only": ["#4878D0", "#6ACC65", "#D65F5F"],
-    "img-ctx":     ["#EE854A", "#956CB4", "#8C613C"],
+    "layout-only": ["#4878D0", "#6ACC65", "#D65F5F", "#FF9F0A"],
+    "img-ctx":     ["#EE854A", "#956CB4", "#8C613C", "#3DB4C8"],
 }
 
 
@@ -163,7 +171,7 @@ def main():
 
     fig2, axes2 = plt.subplots(3, 4, figsize=(18, 12))
     fig2.suptitle("Stage-2 Training Curves (img-ctx, joint pose+mesh)\n"
-                  "Run 1=May28 (pre-fix) · Run 2=Jun05 (pre-fix) · Run 3=Jun07 (extra_feat fix applied)",
+                  "Run 1=May28 (pre-fix) · Run 2=Jun05 (pre-fix) · Run 3=Jun07 (extra_feat fix) · Run 4=Jun10 (in-progress)",
                   fontsize=12, fontweight="bold", y=1.01)
     axes2_flat = axes2.flatten()
 

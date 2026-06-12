@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 from transformers import AutoImageProcessor
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import datasets
 from src.models.pi3x_cond import Pi3XFrozenEncoder
