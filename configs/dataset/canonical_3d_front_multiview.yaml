@@ -1,0 +1,61 @@
+# Multi-view 3D-FRONT training config.
+# Dataset: datasets/3d-front-multiview  (produced by scripts/data/prepare_multiview_dataset.py)
+# Model: prefix_len = mv_num_obj_queries + mv_num_scene_queries + 1 = 322
+
+spec:
+  resolution: 518
+  num_points: 4096
+  axis_convention: y_up_z_forward
+  unit_scale: 1.0
+  augmentation_policy: canonical_train_only
+  coordinate_frame:
+    handedness: right
+    up_axis: y
+    forward_axis: z
+    units: meters
+  normalization:
+    mode: bbox
+    bound: 0.95
+    center: true
+    preserve_aspect_ratio: true
+
+src_data:
+  type: 3d-front-multiview
+  path: datasets/3d-front-multiview
+  num_views: 4
+  num_points: ${dataset.spec.num_points}
+  norm_bound: ${dataset.spec.normalization.bound}
+  with_normals: false
+  num_pos_tokens: ${model.num_pos_tokens}
+  random_scale: true
+  random_scale_min: 0.75
+  random_rotate: true
+  random_rotate_min: -45.0
+  random_rotate_max: 45.0
+  random_jitter_point_clouds: true
+  random_jitter_probability: 0.5
+  random_jitter_offset: 0.01
+  random_jitter_depth: true
+  random_jitter_depth_offset: 0.02
+  random_shift: true
+  random_shift_max: 0.2
+  visualize: false
+  use_masked_obj_pc: true
+  load_images: true
+  image_preprocessor: facebook/dpt-dinov2-small-nyu
+  image_size_divisor: 28
+  ignore_obj_seq: false
+  ignore_layout_seq: false
+
+model:
+  # OPT prefix: z_i (257) + z_scene (64) + num_face (1) = 322
+  prefix_len: 322
+  mv_voxel_encoder: true
+  mv_num_obj_queries: 257
+  mv_num_scene_queries: 64
+  mv_num_obj_voxels: 512
+  mv_num_ctx_voxels: 1024
+  mv_voxel_dim: 512
+  mv_mask_feat_dim: 64
+  mv_num_heads: 8
+  img_cond: true

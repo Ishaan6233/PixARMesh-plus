@@ -357,8 +357,30 @@ class Front3DCollator(BaseCollator):
             labels[~pc_valid_mask] = -100
         ret["labels"] = labels
         if has_pixel_values:
-            all_pixel_values = torch.concat(all_pixel_values, dim=0)
-            ret["pixel_values"] = all_pixel_values
+            # Multi-view: pixel_values per example is (N, C, H, W) with N > 1 → (B, N, C, H, W)
+            # Single-view: pixel_values per example is (1, C, H, W) → concat → (B, C, H, W)
+            if all_pixel_values[0].shape[0] > 1:
+                ret["pixel_values"] = torch.stack(all_pixel_values, dim=0)  # (B, N, C, H, W)
+            else:
+                ret["pixel_values"] = torch.concat(all_pixel_values, dim=0) # (B, C, H, W)
+
+        # Multi-view extra fields: scene_transforms (B,N,4,4), K_per_view (B,N,3,3),
+        # view_mask (B,N) — present when the dataset returns per-view transforms.
+        has_mv_fields = "K_per_view" in examples[0]
+        if has_mv_fields:
+            ret["scene_transforms"] = torch.as_tensor(
+                np.array([ex["scene_transforms"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, 4, 4)
+            ret["K_per_view"] = torch.as_tensor(
+                np.array([ex["K_per_view"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, 3, 3)
+            ret["view_mask"] = torch.as_tensor(
+                np.array([ex["view_mask"] for ex in examples]), dtype=torch.bool
+            )  # (B, N)
+            if "panoptic_masks" in examples[0]:
+                ret["panoptic_masks"] = torch.as_tensor(
+                    np.array([ex["panoptic_masks"] for ex in examples]), dtype=torch.long
+                )  # (B, N, H, W)
         return ret
 
 
@@ -367,7 +389,7 @@ def get_mesh_data_collator(data_cfg: DataConfig, model_cfg: ModelConfig):
     match data_type:
         case "shapenet":
             collator = MeshDataCollator(data_cfg, model_cfg)
-        case "3d-front" | "3d-front-layout":
+        case "3d-front" | "3d-front-layout" | "3d-front-multiview":
             collator = Front3DCollator(data_cfg, model_cfg)
         case _:
             raise ValueError(f"Unknown dataset type: {data_type}")

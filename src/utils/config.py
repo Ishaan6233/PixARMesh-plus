@@ -44,6 +44,8 @@ class DataConfig:
     # Ablations
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False
+    # Multi-view
+    num_views: int = 1
 
 
 @dataclass
@@ -85,3 +87,12 @@ class ModelConfig:
     pi3x_ckpt_path: str = "checkpoints/pi3x"
     pi3x_greedy_anchor: bool = True
     pi3x_disable_multimodal: bool = True
+    # Multi-view voxel encoder
+    mv_voxel_encoder: bool = False
+    mv_num_obj_voxels: int = 512
+    mv_num_ctx_voxels: int = 1024
+    mv_voxel_dim: int = 512
+    mv_mask_feat_dim: int = 64
+    mv_num_obj_queries: int = 257
+    mv_num_scene_queries: int = 64
+    mv_num_heads: int = 8

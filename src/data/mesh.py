@@ -6,6 +6,7 @@ import json
 import trimesh
 import numpy as np
 import random
+import torch
 from transformers import AutoImageProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from src.utils.config import DataConfig, ModelConfig
 from src.data import utils
@@ -522,6 +523,314 @@ def transform_3d_front(
     return ret
 
 
+def transform_3d_front_multiview(
+    example,
+    is_train,
+    data_cfg: DataConfig,
+    image_preprocessor=None,
+):
+    """Multi-view variant of transform_3d_front.
+
+    Expects the dataset to store N views per sample under list-valued fields
+    (images, depths, wrd2cam_rects, rect_invs, Ks).  Returns per-view
+    scene_transforms and K_per_view alongside the standard fields.
+
+    The normalisation matrix is computed from the **merged** N-view point cloud
+    so the resulting scene frame is independent of view ordering.  The reference
+    view (used for cond_pcs and bbox computation) is the view with the most
+    valid depth pixels, with a deterministic uid-based tie-break.
+    """
+    result_bboxes = []
+    result_point_clouds = []
+    result_point_clouds_2d = []
+    result_pc_valid = []
+    result_obj_indices = []
+    result_vertices = []
+    result_faces = []
+    result_pixel_values = []
+    result_scene_transforms_all = []   # per-sample list of (N, 4, 4)
+    result_K_per_view = []             # per-sample list of (N, 3, 3)
+    result_view_masks = []             # per-sample list of (N,)
+    result_panoptic_masks = []         # per-sample list of (N, H, W) int32
+
+    num_points   = data_cfg.num_points
+    with_normals = data_cfg.with_normals
+    norm_bound   = data_cfg.norm_bound
+    has_pc       = num_points > 0
+    load_images  = data_cfg.load_images and image_preprocessor is not None
+    use_masked_obj_pc = data_cfg.use_masked_obj_pc
+
+    y_up_matrix = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
+
+    for idx in range(len(example["uid"])):
+        scene_id = example["uid"][idx]
+        objects  = example["objects"][idx]
+        all_model_ids = objects["model_ids"]
+        bounds    = np.array(objects["bounds"],     dtype=np.float32)
+        transforms_obj = np.array(objects["transforms"], dtype=np.float32)
+
+        # --- Load all N views ---
+        images_n         = example["images"][idx]        # list of N PIL/array
+        depths_n         = example["depths"][idx]        # list of N arrays
+        wrd2cam_rects_n  = example["wrd2cam_rects"][idx] # list of N (4,4)
+        rect_invs_n      = example["rect_invs"][idx]     # list of N (3,3)
+        Ks_n             = example["Ks"][idx]            # list of N (3,3)
+        N_views          = len(images_n)
+
+        per_view_data = []   # gravity-aligned PCs, pixel data, etc.
+        ref_cand_counts = []
+        for n in range(N_views):
+            img_n        = np.array(images_n[n])
+            depth_n_raw  = np.array(depths_n[n], dtype=np.float32)
+            depth_n      = (1 - depth_n_raw / 255.0) * 10.0
+            wrd2cam_n    = np.array(wrd2cam_rects_n[n], dtype=np.float32)
+            rect_inv_n   = np.array(rect_invs_n[n],     dtype=np.float32)
+            K_n          = np.array(Ks_n[n],            dtype=np.float32)
+
+            # Image preprocessing
+            pad_left = pad_top = 0
+            out_h, out_w = img_n.shape[:2]
+            pv_n = None
+            if load_images:
+                proc    = image_preprocessor(images=img_n, return_tensors="pt")
+                pv_n    = proc["pixel_values"]
+                out_h, out_w = pv_n.shape[2], pv_n.shape[3]
+                pad_left = (out_w - img_n.shape[1]) // 2
+                pad_top  = (out_h - img_n.shape[0]) // 2
+
+            # Adjusted intrinsics (account for padding)
+            K_adj = K_n.copy()
+            K_adj[0, 2] += pad_left
+            K_adj[1, 2] += pad_top
+
+            # Depth augmentation (jitter)
+            depth_n = depth_n.copy()
+            depth_trunc = 1e-6
+            valid_n = depth_n > depth_trunc
+            if is_train and data_cfg.random_jitter_depth:
+                noise = np.random.randn(*depth_n.shape) * data_cfg.random_jitter_depth_offset
+                depth_n[valid_n] += noise[valid_n]
+                depth_n[valid_n] = depth_n[valid_n].clip(min=depth_trunc)
+
+            # Gravity-align: camera → gravity-aligned frame
+            t_cam = wrd2cam_n[:3, 3]
+            T_gravity_n = np.eye(4, dtype=np.float32)
+            T_gravity_n[:3, :3] = rect_inv_n
+            T_gravity_n[:3, 3]  = t_cam - rect_inv_n @ t_cam
+            T_gravity_inv_n     = np.linalg.inv(T_gravity_n).astype(np.float32)
+
+            K_inv_n = np.linalg.inv(K_n).astype(np.float32)
+            depth_pcs_n, pix_pcs_n = utils.back_project_depth(
+                depth_n, K_inv_n, return_pix_coords=True
+            )
+            # Adjust pixel coords for padding
+            pix_pcs_n = pix_pcs_n + np.array([pad_left, pad_top])
+            pix_pcs_n = (pix_pcs_n + 0.5) / np.array([out_w, out_h]) * 2 - 1
+
+            img_shape = depth_pcs_n.shape[:2]
+            depth_pcs_n = utils.transform_3d_points(
+                depth_pcs_n.reshape(-1, 3), T_gravity_inv_n @ y_up_matrix
+            ).reshape(img_shape[0], img_shape[1], 3)
+            depth_pcs_n[~valid_n] = depth_trunc
+
+            ref_cand_counts.append(valid_n.sum())
+            per_view_data.append({
+                "pv": pv_n,
+                "K_adj": K_adj,
+                "T_gravity_inv": T_gravity_inv_n,
+                "all_pcd": depth_pcs_n.reshape(-1, 3),
+                "pix_pcs": pix_pcs_n.reshape(-1, 2),
+                "valid_mask": valid_n,
+                "pcd_2d": depth_pcs_n.reshape(img_shape[0], img_shape[1], 3),
+                "wrd2cam_rect": wrd2cam_n,
+            })
+
+        # --- Reference view: argmax valid-depth pixels (deterministic uid tiebreak) ---
+        ref_view = int(np.argmax(ref_cand_counts))
+
+        # --- Object selection (from reference view, same as single-view logic) ---
+        if is_train:
+            inst_idx = np.random.randint(0, len(all_model_ids))
+        else:
+            inst_idx = idx % len(all_model_ids)
+
+        vertices, faces = get_instance_mesh(
+            objects["vertices"][inst_idx], objects["faces"][inst_idx]
+        )
+        if vertices is not None and faces is not None:
+            vertices, obj_center, obj_scale = utils.normalize_vertices(
+                vertices, bound=norm_bound, return_all=True
+            )
+            faces = np.array(faces)
+        result_obj_indices.append(inst_idx)
+        result_vertices.append(vertices)
+        result_faces.append(faces)
+
+        if has_pc:
+            # --- Shared random augmentation ---
+            if is_train and data_cfg.random_scale:
+                bound = np.random.uniform(data_cfg.random_scale_min, norm_bound)
+            else:
+                bound = norm_bound
+
+            M_rot_4d = np.eye(4, dtype=np.float32)
+            if is_train and data_cfg.random_rotate:
+                azimuth = np.random.uniform(
+                    data_cfg.random_rotate_min, data_cfg.random_rotate_max
+                )
+                rot_mat = utils.get_rotation_y_matrix(np.deg2rad(azimuth))
+                M_rot_4d[:3, :3] = rot_mat
+            else:
+                rot_mat = None
+
+            # Merge all views for shared normalisation
+            merged_pcd_list = []
+            for n in range(N_views):
+                pcd_n = per_view_data[n]["all_pcd"]
+                vm_n  = per_view_data[n]["valid_mask"].reshape(-1)
+                merged_pcd_list.append(pcd_n[vm_n])
+            merged_pcd = np.concatenate(merged_pcd_list, axis=0)
+
+            # Bboxes in reference view's gravity-aligned camera-rect frame
+            wrd2cam_ref = per_view_data[ref_view]["wrd2cam_rect"]
+            all_bboxes_rect = []
+            all_obj_to_cam_ref = []
+            for obj_idx, (bound_o, tr) in enumerate(zip(bounds, transforms_obj)):
+                to_cam_ref = wrd2cam_ref @ tr
+                pts = utils.make_3d_bbox(*bound_o)
+                pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)
+                all_bboxes_rect.append((pts_h @ to_cam_ref.T)[:, :3])
+                all_obj_to_cam_ref.append(to_cam_ref)
+            all_bboxes_rect = np.stack(all_bboxes_rect, axis=0)
+            all_obj_to_cam_ref = np.array(all_obj_to_cam_ref)
+
+            if rot_mat is not None:
+                all_bboxes_rect = all_bboxes_rect @ rot_mat.T
+                merged_pcd      = merged_pcd @ rot_mat.T
+
+            all_bboxes_rect, merged_pcd, normalize_matrix = (
+                utils.normalize_bboxes_with_point_clouds(
+                    all_bboxes_rect, merged_pcd, bound=bound, return_matrix=True
+                )
+            )
+
+            M_shift = np.eye(4, dtype=np.float32)
+            if is_train and data_cfg.random_shift:
+                all_bboxes_rect, merged_pcd, M_shift = (
+                    utils.random_shift_bboxes_with_point_clouds(
+                        all_bboxes_rect,
+                        merged_pcd,
+                        max_shift=data_cfg.random_shift_max,
+                        bound=bound,
+                        return_matrix=True,
+                    )
+                )
+
+            # --- Per-view scene_transforms ---
+            scene_transforms_n = []
+            K_per_view_n       = []
+            for n in range(N_views):
+                M_gravity_n    = per_view_data[n]["T_gravity_inv"] @ y_up_matrix
+                scene_trans_n  = M_shift @ normalize_matrix @ M_rot_4d @ M_gravity_n
+                scene_transforms_n.append(scene_trans_n.astype(np.float32))
+                K_per_view_n.append(per_view_data[n]["K_adj"].astype(np.float32))
+
+            result_scene_transforms_all.append(np.stack(scene_transforms_n, axis=0))
+            result_K_per_view.append(np.stack(K_per_view_n, axis=0))
+            result_view_masks.append(np.ones(N_views, dtype=bool))
+
+            # --- cond_pcs from reference view ---
+            ref_pcd   = per_view_data[ref_view]["pcd_2d"]    # (H, W, 3) gravity-aligned
+            ref_valid = per_view_data[ref_view]["valid_mask"]
+            ref_pix   = per_view_data[ref_view]["pix_pcs"].reshape(
+                ref_valid.shape[0], ref_valid.shape[1], 2
+            )
+
+            # Apply shared augmentation to reference view's point cloud
+            ref_pts_flat = ref_pcd.reshape(-1, 3)
+            if rot_mat is not None:
+                ref_pts_flat = ref_pts_flat @ rot_mat.T
+            # Normalize (apply same matrix as merged_pcd got)
+            ref_pts_flat = utils.transform_3d_points(
+                ref_pts_flat, normalize_matrix
+            )
+            ref_pts_flat = utils.transform_3d_points(ref_pts_flat, M_shift)
+            ref_pcd_augmented = ref_pts_flat.reshape(ref_valid.shape[0], ref_valid.shape[1], 3)
+
+            if use_masked_obj_pc and "panoptic_mask" in example:
+                inst_ids = objects["inst_ids"]
+                obj_masks = utils.get_masks_by_ids(
+                    example["panoptic_mask"][idx][ref_view]
+                    if isinstance(example["panoptic_mask"][idx], list)
+                    else example["panoptic_mask"][idx],
+                    inst_ids,
+                    erode_size=data_cfg.mask_erosion_size,
+                )
+                pts_mask = ref_valid & obj_masks[inst_idx]
+            else:
+                pts_mask = ref_valid
+
+            valid_pts    = ref_pcd_augmented[pts_mask]
+            valid_pts_2d = ref_pix[pts_mask]
+
+            sampled_pc, sampled_pc_2d, pc_valid, _ = subsample_point_clouds(
+                valid_pts, valid_pts_2d, num_points, is_train, data_cfg, with_normals
+            )
+            result_point_clouds.append(sampled_pc)
+            result_point_clouds_2d.append(sampled_pc_2d)
+            result_pc_valid.append(pc_valid)
+            result_bboxes.append(all_bboxes_rect)
+        else:
+            result_bboxes.append(
+                np.zeros((len(bounds), 8, 3), dtype=np.float32)
+            )
+
+        # --- Stack per-view pixel_values ---
+        if load_images:
+            pv_stack = torch.cat(
+                [per_view_data[n]["pv"] for n in range(N_views)], dim=0
+            )  # (N, C, H, W)
+            result_pixel_values.append(pv_stack)
+
+        # --- Per-view panoptic masks (decoded to integer instance IDs) ---
+        # Stored as RGB PNG; decode with color_to_id: R*65536 + G*256 + B
+        pan_key = "panoptic_masks" if "panoptic_masks" in example else (
+            "panoptic_mask" if "panoptic_mask" in example else None
+        )
+        if pan_key is not None:
+            raw_masks = example[pan_key][idx]
+            def _decode_pan(m):
+                arr = np.array(m, dtype=np.uint32)
+                if arr.ndim == 3:  # (H, W, 3) RGB-encoded
+                    return (arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]).astype(np.int32)
+                return arr.astype(np.int32)  # already (H, W)
+            if isinstance(raw_masks, list):
+                pan_stack = np.stack([_decode_pan(m) for m in raw_masks], axis=0)  # (N, H, W)
+            else:
+                pan_stack = np.stack([_decode_pan(raw_masks)] * N_views, axis=0)
+            result_panoptic_masks.append(pan_stack)
+
+    ret = {
+        "uid":      example["uid"],
+        "bboxes":   result_bboxes,
+        "obj_indices": result_obj_indices,
+        "vertices": result_vertices,
+        "faces":    result_faces,
+    }
+    if has_pc:
+        ret["point_clouds"]       = result_point_clouds
+        ret["point_clouds_2d"]    = result_point_clouds_2d
+        ret["point_clouds_valid"] = result_pc_valid
+        ret["scene_transforms"]   = result_scene_transforms_all   # (N, 4, 4) per sample
+        ret["K_per_view"]         = result_K_per_view             # (N, 3, 3) per sample
+        ret["view_mask"]          = result_view_masks              # (N,) per sample
+    if load_images:
+        ret["pixel_values"] = result_pixel_values   # list of (N, C, H, W) tensors
+    if result_panoptic_masks:
+        ret["panoptic_masks"] = result_panoptic_masks  # list of (N, H, W) int32
+    return ret
+
+
 def get_mesh_dataset(data_cfg: DataConfig):
     local_path = Path(data_cfg.path).absolute().as_posix()
     num_proc = max(min(os.cpu_count(), 64), 16)
@@ -532,6 +841,8 @@ def get_mesh_dataset(data_cfg: DataConfig):
             mapper = transform_mesh
         case "3d-front" | "3d-front-layout":
             mapper = transform_3d_front
+        case "3d-front-multiview":
+            mapper = transform_3d_front_multiview
         case _:
             raise ValueError(f"Unknown dataset type: {data_type}")
     kwargs = {}
