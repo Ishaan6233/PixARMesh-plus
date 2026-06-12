@@ -8,7 +8,11 @@ from transformers.models.opt.modeling_opt import OPTDecoder
 from .cond import EdgeRunnerProjector, ContextAggregator
 from .embed import CoordEmbed
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
-from .frozen_geo_encoder import build_geo_ctx_pc, build_geo_obj_pc
+from .frozen_geo_encoder import (
+    build_geo_ctx_pc, build_geo_obj_pc,
+    discover_instance_points_mv, fps_centroid_seeded,
+)
+from .mv_voxel_encoder import MultiViewVoxelAlignedEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +123,21 @@ class ShapeOPT(OPTForCausalLM):
             )
             self.ctx_aggregator.apply(self._init_weights)
 
+        # Multi-view voxel encoder (replaces MICHE when pixel_values.dim() == 5).
+        # Instance discovery uses Grounded-SAM consensus voting (no binary mask conv).
+        self.mv_voxel_encoder = None
+        if getattr(config, "mv_voxel_encoder", False) and cond_encoder_img is not None:
+            img_feat_dim = getattr(cond_encoder_img, "output_feat_dim", 384)
+            self.mv_voxel_encoder = MultiViewVoxelAlignedEncoder(
+                feat_dim          = img_feat_dim,
+                voxel_dim         = getattr(config, "mv_voxel_dim",          512),
+                out_dim           = config.word_embed_proj_dim,
+                num_obj_queries   = getattr(config, "mv_num_obj_queries",   257),
+                num_scene_queries = getattr(config, "mv_num_scene_queries",  64),
+                num_heads         = getattr(config, "mv_num_heads",           8),
+            )
+            self.mv_voxel_encoder.apply(self._init_weights)
+
     def _init_weights(self, module):
         return PreTrainedModel._init_weights(self, module)
 
@@ -215,6 +234,204 @@ class ShapeOPT(OPTForCausalLM):
             )
         return inputs_embeds
 
+    def _select_ref_view(self, local_points: torch.Tensor, view_mask: torch.Tensor) -> torch.Tensor:
+        """Return the reference-view index per batch item.
+
+        Reference = view with most positive-depth pixels; deterministic (argmax, first-wins tie).
+        Args:
+            local_points: (B, N, H, W, 3) per-view camera frame
+            view_mask:    (B, N) bool
+        Returns:
+            ref_idx: (B,) long
+        """
+        B, N, H, W, _ = local_points.shape
+        valid_count = (local_points[..., 2] > 0).reshape(B, N, -1).sum(-1).float()  # (B, N)
+        if view_mask is not None:
+            valid_count = valid_count * view_mask.float()
+        return valid_count.argmax(dim=1)   # (B,)
+
+    def _forward_multiview(
+        self,
+        input_ids,
+        pixel_values,           # (B, N, C, H, W)
+        scene_transforms,       # (B, N, 4, 4)
+        K_per_view,             # (B, N, 3, 3)
+        view_mask,              # (B, N) bool
+        panoptic_masks,         # (B, N, H, W) long or None
+        cond_pcs,               # (B, P, 3)  data-loader seed PC in scene space
+        cond_pcs_2d,            # (B, P, 2)  reference-view pixel coords
+        cond_num_faces,
+        **decoder_kwargs,
+    ):
+        B, N, C, H, W = pixel_values.shape
+        device = pixel_values.device
+
+        if view_mask is None:
+            view_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+        # --- Pi3X: all N views in one forward ---
+        pi3x_out   = self.pi3x_encoder.forward_all_views_joint(pixel_values)
+        lp         = pi3x_out["local_points"]   # (B, N, H, W, 3) camera frame
+        pi3x_depth = lp[..., 2]                 # (B, N, H, W)
+        st         = scene_transforms.to(device, dtype=torch.float32)
+        K_f        = K_per_view.float().to(device)
+
+        # --- Instance discovery via Grounded-SAM consensus voting ---
+        # For every Pi3X 3D point: project to all views, collect mask IDs,
+        # majority-vote to assign each point to an instance.
+        # seed_pcs selects the target instance (data-loader object PC).
+        mv_num_obj_voxels = getattr(self.config, "mv_num_obj_voxels", 512)
+        mv_num_ctx_voxels = getattr(self.config, "mv_num_ctx_voxels", 1024)
+
+        if panoptic_masks is not None:
+            # Enhance seed first: use Pi3X geometry at reference-view obj pixels
+            ref_idx = self._select_ref_view(lp, view_mask)
+            seed_list = []
+            for b in range(B):
+                rv   = ref_idx[b].item()
+                pc_b = build_geo_obj_pc(
+                    lp[b:b+1, rv], cond_pcs_2d[b:b+1], st[b:b+1, rv]
+                )
+                seed_list.append(pc_b)
+            seed_pcs = torch.cat(seed_list, dim=0)   # (B, P, 3)
+
+            obj_voxels, ctx_voxels = discover_instance_points_mv(
+                local_points     = lp,
+                scene_transforms = st,
+                panoptic_masks   = panoptic_masks.to(device),
+                K_per_view       = K_f,
+                view_mask        = view_mask,
+                seed_pcs         = seed_pcs.float(),
+                num_obj_voxels   = mv_num_obj_voxels,
+                num_ctx_voxels   = mv_num_ctx_voxels,
+                conf             = pi3x_out["conf"],
+            )   # (B, V_obj, 3), (B, V_ctx, 3)
+        else:
+            # Panoptic masks not available — fall back to FPS of Pi3X geometry
+            logger.warning_once(
+                "panoptic_masks not provided; falling back to seed-FPS for obj_voxels."
+            )
+            ref_idx = self._select_ref_view(lp, view_mask)
+            seed_list = []
+            for b in range(B):
+                rv   = ref_idx[b].item()
+                pc_b = build_geo_obj_pc(
+                    lp[b:b+1, rv], cond_pcs_2d[b:b+1], st[b:b+1, rv]
+                )
+                seed_list.append(pc_b)
+            seed_pcs   = torch.cat(seed_list, dim=0)
+            obj_voxels = fps_centroid_seeded(seed_pcs.float(), mv_num_obj_voxels)
+            # ctx: all valid Pi3X scene points merged across views
+            ctx_list = []
+            for b in range(B):
+                pts_all = []
+                for n in range(N):
+                    if not view_mask[b, n]:
+                        continue
+                    lp_n = lp[b, n]
+                    valid = lp_n[..., 2] > 0
+                    if valid.any():
+                        from .frozen_geo_encoder import _apply_scene_transform
+                        pts_s = _apply_scene_transform(
+                            lp_n[valid].float().unsqueeze(0), st[b:b+1, n]
+                        ).squeeze(0)
+                        pts_all.append(pts_s)
+                merged = torch.cat(pts_all, dim=0) if pts_all else seed_pcs[b].float()
+                ctx_list.append(fps_centroid_seeded(merged.unsqueeze(0), mv_num_ctx_voxels).squeeze(0))
+            ctx_voxels = torch.stack(ctx_list, dim=0)
+
+        obj_voxels = obj_voxels.to(lp.dtype)
+        ctx_voxels = ctx_voxels.to(lp.dtype)
+
+        # --- DINOv2 spatial feature maps ---
+        if self.cond_encoder_img is None:
+            raise RuntimeError("cond_encoder_img is required for multi-view path")
+        pv_flat    = pixel_values.reshape(B * N, C, H, W)
+        dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
+        _, C_d, Hf, Wf = dino_flat.shape
+        dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
+
+        # --- Multi-view voxel encoder → z_i, z_scene (no mask_feats) ---
+        mv_out  = self.mv_voxel_encoder(
+            obj_voxels, ctx_voxels,
+            dino_feats, None,                    # mask_feats=None (discovery handles localization)
+            st, K_f, pi3x_depth, view_mask,
+        )
+        z_i     = mv_out["z_i"]      # (B, M, out_dim)
+        z_scene = mv_out["z_scene"]  # (B, S, out_dim)
+
+        # --- Assemble input embeddings ---
+        if cond_num_faces is None:
+            cond_num_faces = torch.zeros(B, 1, dtype=torch.long, device=device)
+        num_face_embeds = self.embed_num_face(cond_num_faces)   # (B, 1, D)
+
+        input_ids_clone = input_ids.clone()
+        cond_token_mask = input_ids_clone == self.config.pc_token_id
+        indicator_mask  = input_ids_clone == self.config.indicator_token_id
+        obj_pc_mask     = input_ids_clone == self.config.obj_pc_token_id
+        input_ids_clone[cond_token_mask | indicator_mask | obj_pc_mask] = (
+            self.config.pad_token_id
+        )
+        inputs_embeds = self.model.decoder.embed_tokens(input_ids_clone)
+
+        # Fill pc_token slots: z_i (M tokens) + z_scene (S tokens) + num_face (1 token)
+        all_cond = torch.cat(
+            [z_i.to(inputs_embeds.dtype),
+             z_scene.to(inputs_embeds.dtype),
+             num_face_embeds.to(inputs_embeds.dtype)],
+            dim=1,
+        ).flatten(0, 1)   # (B*(M+S+1), D)
+        inputs_embeds.masked_scatter_(cond_token_mask.unsqueeze(-1), all_cond)
+
+        # --- OPT decoder ---
+        output_attentions    = decoder_kwargs.pop("output_attentions",    self.config.output_attentions)
+        output_hidden_states = decoder_kwargs.pop("output_hidden_states", self.config.output_hidden_states)
+        return_dict          = decoder_kwargs.pop("return_dict",          self.config.use_return_dict)
+        labels               = decoder_kwargs.pop("labels", None)
+        attention_mask       = decoder_kwargs.pop("attention_mask", None)
+        position_ids         = decoder_kwargs.pop("position_ids", None)
+        head_mask            = decoder_kwargs.pop("head_mask", None)
+        past_key_values      = decoder_kwargs.pop("past_key_values", None)
+        use_cache            = decoder_kwargs.pop("use_cache", None)
+        cache_position       = decoder_kwargs.pop("cache_position", None)
+
+        outputs = self.model.decoder(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+            cache_position=cache_position,
+            **decoder_kwargs,
+        )
+        logits = self.lm_head(outputs[0]).contiguous()
+
+        loss = loss_layout = loss_object = None
+        if labels is not None:
+            labels = labels.to(logits.device)
+            loss, loss_layout, loss_object = self.loss_function(
+                logits,
+                labels,
+                vocab_size=self.config.vocab_size,
+                loss_layout_scale=self.config.loss_layout_scale,
+                **decoder_kwargs,
+            )
+
+        return CustomCausalLMOutputWithTokenTypes(
+            loss=loss,
+            loss_layout=loss_layout,
+            loss_object=loss_object,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
     @property
     def loss_function(self):
         return causal_lm_loss_with_token_types
@@ -243,8 +460,47 @@ class ShapeOPT(OPTForCausalLM):
         obj_cond_pcs=None,
         pixel_values=None,
         scene_transform=None,
+        # Multi-view fields
+        scene_transforms=None,    # (B, N, 4, 4) — per-view; present in MV batch
+        K_per_view=None,          # (B, N, 3, 3)
+        view_mask=None,           # (B, N) bool
+        panoptic_masks=None,      # (B, N, H, W) long — Grounded-SAM instance IDs
         **kwargs,
     ):
+        # Multi-view path: pixel_values is (B, N, C, H, W) when N > 1.
+        # All N views are processed in a single Pi3X forward, producing per-view geometry;
+        if (
+            self.pi3x_encoder is not None
+            and self.mv_voxel_encoder is not None
+            and pixel_values is not None
+            and pixel_values.dim() == 5
+            and scene_transforms is not None
+        ):
+            return self._forward_multiview(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                scene_transforms=scene_transforms,
+                K_per_view=K_per_view,
+                view_mask=view_mask,
+                panoptic_masks=panoptic_masks,
+                cond_pcs=cond_pcs,
+                cond_pcs_2d=cond_pcs_2d,
+                cond_num_faces=cond_num_faces,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                past_key_values=past_key_values,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                obj_indices=obj_indices,
+                obj_bboxes=obj_bboxes,
+                **kwargs,
+            )
+
         # Pi3X override: replace data-loader point clouds with Pi3X predictions.
         # Requires both pixel_values (for Pi3X inference) and scene_transform (to convert
         # camera-frame XYZ → normalised scene space). If scene_transform is absent

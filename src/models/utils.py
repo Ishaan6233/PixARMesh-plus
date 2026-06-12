@@ -1,4 +1,5 @@
 import logging
+import math
 import torch
 import torch.nn as nn
 from src.utils.config import ModelConfig
@@ -124,6 +125,24 @@ def get_model(
             or torch.equal(loaded_state[k].float().cpu(), v.float().cpu())
         }
         model.cond_encoder.load_state_dict(restore, strict=False)
+    # If extra_feat_proj is still all-zeros or has garbage values after loading
+    # (shape mismatch caused ignore_mismatched_sizes to skip it, leaving uninitialized
+    # GPU memory that can overflow float32 norm to inf), re-init with Normal(0, 0.02).
+    if cond_encoder_img is not None and cond_encoder is not None:
+        enc = model.cond_encoder.encoder
+        if hasattr(enc, "extra_feat_proj"):
+            w = enc.extra_feat_proj.weight
+            w_f32 = w.detach().float()
+            w_norm = w_f32.norm().item()
+            needs_reinit = not math.isfinite(w_norm) or not w_f32.any()
+            if needs_reinit:
+                logger.info(
+                    f"extra_feat_proj has unusable values (norm={w_norm:.4g}); "
+                    "re-initializing with Normal(0, 0.02)"
+                )
+                w_init = torch.empty(w.shape, dtype=torch.float32).normal_(std=0.02)
+                enc.extra_feat_proj.weight.data.copy_(w_init.to(w.dtype))
+                enc.extra_feat_proj.bias.data.zero_()
     # Attach frozen encoders post-from_pretrained.
     # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
     # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
@@ -159,6 +178,14 @@ def get_condition_encoder(
     model = model_class.from_pretrained(local_model_path, **extra_args)
     model = model.to(torch.bfloat16)
     _fix_uninit_params(model)
+    # extra_feat_proj is zero-initialized in encoder.__init__ (to survive no_init_weights).
+    # Re-initialize with Normal(0, 0.02) here — outside no_init_weights — so image features
+    # contribute from training step 1 instead of gradually turning on from zero.
+    if hasattr(model, "extra_feat_proj"):
+        w = model.extra_feat_proj.weight
+        w_init = torch.empty(w.shape, dtype=torch.float32).normal_(std=0.02)
+        w.data.copy_(w_init.to(w.dtype))
+        nn.init.zeros_(model.extra_feat_proj.bias.data)
     return ConditionEncoder(model, freeze=model_cfg.freeze_cond_encoder)
 
 

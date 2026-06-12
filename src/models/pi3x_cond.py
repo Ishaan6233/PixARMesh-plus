@@ -59,6 +59,32 @@ class Pi3XFrozenEncoder(FrozenGeoEncoder):
         }
 
     @torch.no_grad()
+    def forward_all_views_joint(self, pixel_values: torch.Tensor) -> dict:
+        """Single Pi3X forward over all N views simultaneously.
+
+        All N × (H/14 × W/14) patch tokens attend to each other in Pi3X's
+        standard 36-layer transformer — no special cross-view mechanism.
+
+        Args:
+            pixel_values: (B, N, 3, H, W) DiNOv2-normalised images.
+        Returns:
+            local_points: (B, N, H, W, 3) per-view camera frame
+            conf:         (B, N, H, W, 1)
+            camera_poses: (B, N, 4, 4) C2W OpenCV, or None if not produced
+        """
+        B, N, C, H, W = pixel_values.shape
+        patch_h, patch_w = H // 14, W // 14
+        hidden, *_ = self.pi3x.encode(pixel_values, with_prior=False)
+        hidden = hidden.reshape(B, N, -1, self.pi3x.dec_embed_dim)
+        hidden, pos = self.pi3x.decode(hidden, N, H, W, None, None)
+        out = self.pi3x.forward_head(hidden, pos, B, N, H, W, patch_h, patch_w)
+        return {
+            "local_points": out["local_points"].to(pixel_values.dtype),
+            "conf":         out["conf"].to(pixel_values.dtype),
+            "camera_poses": out.get("camera_poses", None),
+        }
+
+    @torch.no_grad()
     def forward_multiview(self, pixel_values: torch.Tensor) -> dict:
         """Greedy-anchor multi-view forward.
 
