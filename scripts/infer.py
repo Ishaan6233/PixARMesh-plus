@@ -86,6 +86,20 @@ def main():
         action="store_true",
         help="Whether to use ground-truth masks",
     )
+    parser.add_argument(
+        "--image-encoder",
+        type=str,
+        default=None,
+        help="DINOv2 image encoder (e.g. facebook/dinov2-with-registers-small). "
+             "Defaults to base; use small for paper/stage-1-initialized checkpoints.",
+    )
+    parser.add_argument(
+        "--image-preprocessor",
+        type=str,
+        default=None,
+        help="Image preprocessor matching the encoder "
+             "(e.g. facebook/dpt-dinov2-small-nyu for small).",
+    )
     args = parser.parse_args()
 
     is_bpt = args.model_type == "bpt"
@@ -119,7 +133,11 @@ def main():
     state = PartialState()
 
     device = state.device
-    model, model_cfg, data_cfg = prepare_model_for_inference(is_bpt, args.checkpoint)
+    model, model_cfg, data_cfg = prepare_model_for_inference(
+        is_bpt, args.checkpoint,
+        image_encoder=args.image_encoder,
+        image_preprocessor=args.image_preprocessor,
+    )
     model.to(device)
 
     data_cfg.use_predicted_depth = not use_gt_depth

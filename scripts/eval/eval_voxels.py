@@ -68,6 +68,16 @@ def parse_args():
                    help="Min views a pool point must match (1=any, 2=consensus)")
     p.add_argument("--depth-rtol",     type=float, default=0.10,
                    help="Depth relative tolerance for visibility test (default 0.10)")
+    p.add_argument("--sweep-rtols",    default=None,
+                   help="Comma-separated rtol values to sweep, e.g. '0.10,0.20,0.50,100.0'. "
+                        "Pi3X runs once per batch; discover runs once per rtol value.")
+    p.add_argument("--no-adaptive-fallback", action="store_true",
+                   help="Disable adaptive depth_rtol=100 fallback in pool masking")
+    p.add_argument("--mask-seeded-pool", action="store_true",
+                   help="Build pool by back-projecting target SAM mask pixels from all N views "
+                        "instead of seed-biased FPS (fixes pool-coverage bottleneck)")
+    p.add_argument("--boundary-bias-alpha", type=float, default=0.0,
+                   help="Over-weight mask boundary pixels in mask-seeded pool FPS (0=uniform)")
     p.add_argument("--batch-size",     type=int, default=1)
     p.add_argument("--no-ply",         action="store_true",
                    help="Skip per-sample PLY export (recommended for large runs)")
@@ -191,10 +201,29 @@ def main():
     args = parse_args()
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    per_sample_path = out_dir / "per_sample.jsonl"
-    per_sample_path.write_text("")
-    print(f"Streaming per-sample metrics to {per_sample_path}")
     device = torch.device(args.device)
+
+    sweep_rtols = None
+    if args.sweep_rtols:
+        sweep_rtols = [float(r) for r in args.sweep_rtols.split(",")]
+        print(f"Sweep mode: {len(sweep_rtols)} rtol values: {sweep_rtols}")
+    adaptive_fallback = not args.no_adaptive_fallback
+
+    if sweep_rtols:
+        rtol_paths = {}
+        rtol_results = {}
+        for rtol in sweep_rtols:
+            rtol_key = f"rtol_{rtol:g}"
+            rd = out_dir / rtol_key
+            rd.mkdir(parents=True, exist_ok=True)
+            rtol_paths[rtol] = rd / "per_sample.jsonl"
+            rtol_paths[rtol].write_text("")
+            rtol_results[rtol] = []
+        print(f"Sweep outputs → {out_dir}/rtol_*/per_sample.jsonl")
+    else:
+        per_sample_path = out_dir / "per_sample.jsonl"
+        per_sample_path.write_text("")
+        print(f"Streaming per-sample metrics to {per_sample_path}")
 
     # --- Dataset (deterministic: no augmentation) ---
     data_cfg = DataConfig(
@@ -286,6 +315,7 @@ def main():
         uids            = batch["uid"]
         B, N, C, H, W  = pixel_values.shape
 
+        # Pi3X forward: runs ONCE per batch regardless of mode
         with torch.no_grad():
             pi3x_out = pi3x.forward_all_views_joint(pixel_values.float())
             lp   = pi3x_out["local_points"]   # (B, N, H, W, 3)
@@ -294,7 +324,6 @@ def main():
             st  = scene_transforms.float()
             K_f = K_per_view.float()
 
-            # Build Pi3X-enhanced seed (same as _forward_multiview)
             ref_idx = _select_ref_view(lp, view_mask)
             seed_list = []
             for b in range(B):
@@ -303,102 +332,225 @@ def main():
                 seed_list.append(pc_b)
             seed_pcs = torch.cat(seed_list, dim=0).float()   # (B, P, 3)
 
-            obj_voxels, ctx_voxels, diag = discover_instance_points_mv(
-                local_points       = lp,
-                scene_transforms   = st,
-                panoptic_masks     = panoptic_masks,
-                K_per_view         = K_f,
-                view_mask          = view_mask,
-                seed_pcs           = seed_pcs,
-                num_obj_voxels     = args.num_obj_voxels,
-                num_ctx_voxels     = args.num_ctx_voxels,
-                conf               = conf,
-                pool_size          = args.pool_size,
-                min_views          = args.min_views,
-                depth_rtol         = args.depth_rtol,
-                return_diagnostics = True,
-            )
-
         lp_z = lp[..., 2]   # (B, N, H, W)
 
-        for b in range(B):
-            uid_b  = uids[b]
-            rv     = int(ref_idx[b].item())
-            st_b   = st[b]          # (N, 4, 4)
-            K_b    = K_f[b]         # (N, 3, 3)
-            vm_b   = view_mask[b]   # (N,)
-            pm_b   = panoptic_masks[b]    # (N, H, W)
-            lp_z_b = lp_z[b]              # (N, H, W)
-            ov_b   = obj_voxels[b]        # (V_obj, 3)
-            cv_b   = ctx_voxels[b]        # (V_ctx, 3)
-            cp_b   = cond_pcs[b]          # (P, 3)
+        if sweep_rtols:
+            # Pre-compute target IDs once per sample at fixed rtol=0.10 for purity
+            target_ids_by_b = []
+            for b in range(B):
+                with torch.no_grad():
+                    tids = _get_per_view_target_ids(
+                        seed_pcs[b].float(), st[b], K_f[b],
+                        panoptic_masks[b], lp_z[b], view_mask[b],
+                        depth_rtol=0.10,
+                    )
+                target_ids_by_b.append(tids)
 
-            # Per-view target IDs (needed for purity)
+            for rtol in sweep_rtols:
+                with torch.no_grad():
+                    obj_voxels, _ctx, diag = discover_instance_points_mv(
+                        local_points        = lp,
+                        scene_transforms    = st,
+                        panoptic_masks      = panoptic_masks,
+                        K_per_view          = K_f,
+                        view_mask           = view_mask,
+                        seed_pcs            = seed_pcs,
+                        num_obj_voxels      = args.num_obj_voxels,
+                        num_ctx_voxels      = args.num_ctx_voxels,
+                        conf                = conf,
+                        pool_size           = args.pool_size,
+                        min_views           = args.min_views,
+                        depth_rtol          = rtol,
+                        adaptive_fallback   = False,
+                        mask_seeded_pool    = args.mask_seeded_pool,
+                        boundary_bias_alpha = args.boundary_bias_alpha,
+                        return_diagnostics  = True,
+                    )
+
+                for b in range(B):
+                    uid_b = uids[b]
+                    ov_b  = obj_voxels[b]
+                    cp_b  = cond_pcs[b]
+
+                    with torch.no_grad():
+                        purity = _compute_purity(
+                            ov_b, st[b], K_f[b], panoptic_masks[b], lp_z[b],
+                            view_mask[b], target_ids_by_b[b], depth_rtol=0.10,
+                        )
+
+                    hit_rate = float(diag["pool_hit_rate"][b])
+
+                    ov_cpu = ov_b.unsqueeze(0).float().cpu()
+                    cp_cpu = cp_b.unsqueeze(0).float().cpu()
+                    fwd_cd = float(chamfer_distance(
+                        cp_cpu, ov_cpu, squared=False, reduction="mean", single_directional=True,
+                    ).item())
+                    bwd_cd = float(chamfer_distance(
+                        ov_cpu, cp_cpu, squared=False, reduction="mean", single_directional=True,
+                    ).item())
+                    fps_cv = _fps_spread_cv(ov_b.float().cpu().numpy())
+
+                    rec = {
+                        "uid":           uid_b,
+                        "purity":        purity,
+                        "pool_hit_rate": hit_rate,
+                        "chamfer_fwd":   fwd_cd,
+                        "chamfer_bwd":   bwd_cd,
+                        "fps_spread_cv": fps_cv,
+                        "n_obj_pts_raw": int(diag["n_obj_pts_raw"][b]),
+                    }
+                    rtol_results[rtol].append(rec)
+                    n_r = len(rtol_results[rtol])
+                    with rtol_paths[rtol].open("a") as f:
+                        f.write(json.dumps({"rtol": rtol, "index": n_r, **rec}) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                n_done = len(rtol_results[sweep_rtols[0]])
+                recent = rtol_results[rtol][-B:]
+                sample_str = "  ".join(
+                    f"p={recent[b_]['purity']:.3f} hit={recent[b_]['pool_hit_rate']:.3f}"
+                    for b_ in range(min(B, len(recent)))
+                )
+                print(f"  [{n_done:4d}] rtol={rtol:<8.3g}  {sample_str}")
+
+        else:
             with torch.no_grad():
-                target_ids_n = _get_per_view_target_ids(
-                    seed_pcs[b].float(), st_b, K_b, pm_b, lp_z_b, vm_b,
-                    depth_rtol=args.depth_rtol,
+                obj_voxels, ctx_voxels, diag = discover_instance_points_mv(
+                    local_points        = lp,
+                    scene_transforms    = st,
+                    panoptic_masks      = panoptic_masks,
+                    K_per_view          = K_f,
+                    view_mask           = view_mask,
+                    seed_pcs            = seed_pcs,
+                    num_obj_voxels      = args.num_obj_voxels,
+                    num_ctx_voxels      = args.num_ctx_voxels,
+                    conf                = conf,
+                    pool_size           = args.pool_size,
+                    min_views           = args.min_views,
+                    depth_rtol          = args.depth_rtol,
+                    adaptive_fallback   = adaptive_fallback,
+                    mask_seeded_pool    = args.mask_seeded_pool,
+                    boundary_bias_alpha = args.boundary_bias_alpha,
+                    return_diagnostics  = True,
                 )
 
-            # 1. Purity
-            with torch.no_grad():
-                purity = _compute_purity(
-                    ov_b, st_b, K_b, pm_b, lp_z_b, vm_b, target_ids_n,
-                    depth_rtol=args.depth_rtol,
+            for b in range(B):
+                uid_b  = uids[b]
+                st_b   = st[b]
+                K_b    = K_f[b]
+                vm_b   = view_mask[b]
+                pm_b   = panoptic_masks[b]
+                lp_z_b = lp_z[b]
+                ov_b   = obj_voxels[b]
+                cv_b   = ctx_voxels[b]
+                cp_b   = cond_pcs[b]
+
+                with torch.no_grad():
+                    target_ids_n = _get_per_view_target_ids(
+                        seed_pcs[b].float(), st_b, K_b, pm_b, lp_z_b, vm_b,
+                        depth_rtol=args.depth_rtol,
+                    )
+                    purity = _compute_purity(
+                        ov_b, st_b, K_b, pm_b, lp_z_b, vm_b, target_ids_n,
+                        depth_rtol=args.depth_rtol,
+                    )
+
+                hit_rate = float(diag["pool_hit_rate"][b])
+
+                ov_cpu = ov_b.unsqueeze(0).float().cpu()
+                cp_cpu = cp_b.unsqueeze(0).float().cpu()
+                fwd_cd = float(chamfer_distance(
+                    cp_cpu, ov_cpu, squared=False, reduction="mean", single_directional=True,
+                ).item())
+                bwd_cd = float(chamfer_distance(
+                    ov_cpu, cp_cpu, squared=False, reduction="mean", single_directional=True,
+                ).item())
+                ov_np  = ov_b.float().cpu().numpy()
+                fps_cv = _fps_spread_cv(ov_np)
+
+                rec = {
+                    "uid":           uid_b,
+                    "purity":        purity,
+                    "pool_hit_rate": hit_rate,
+                    "chamfer_fwd":   fwd_cd,
+                    "chamfer_bwd":   bwd_cd,
+                    "fps_spread_cv": fps_cv,
+                    "n_obj_pts_raw": int(diag["n_obj_pts_raw"][b]),
+                }
+                results.append(rec)
+                n = len(results)
+                with per_sample_path.open("a") as f:
+                    f.write(json.dumps({"index": n, **rec}) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                print(
+                    f"  [{n:4d}] {uid_b[:24]:<24}  "
+                    f"purity={purity:.3f}  hit={hit_rate:.3f}  "
+                    f"fwd={fwd_cd:.4f}  bwd={bwd_cd:.4f}  cv={fps_cv:.3f}"
                 )
 
-            # 2. Pool hit rate (from diagnostics)
-            hit_rate = float(diag["pool_hit_rate"][b])
+                if not args.no_ply:
+                    cv_np = cv_b.float().cpu().numpy()
+                    pts   = np.concatenate([ov_np, cv_np], axis=0)
+                    colors = np.concatenate([
+                        np.tile([0, 200, 0],     (len(ov_np), 1)),
+                        np.tile([150, 150, 150], (len(cv_np), 1)),
+                    ], axis=0)
+                    trimesh.PointCloud(vertices=pts, colors=colors).export(
+                        str(out_dir / f"{uid_b}_voxels.ply")
+                    )
 
-            # 3. Directional Chamfer (scene space, unsquared)
-            ov_cpu = ov_b.unsqueeze(0).float().cpu()
-            cp_cpu = cp_b.unsqueeze(0).float().cpu()
-            # Forward: seed → voxels (coverage — are seed points covered by voxels?)
-            fwd_cd = float(chamfer_distance(
-                cp_cpu, ov_cpu, squared=False, reduction="mean", single_directional=True,
-            ).item())
-            # Backward: voxels → seed (precision — do voxels stray far from seed?)
-            bwd_cd = float(chamfer_distance(
-                ov_cpu, cp_cpu, squared=False, reduction="mean", single_directional=True,
-            ).item())
-
-            # 4. FPS spread CV
-            ov_np  = ov_b.float().cpu().numpy()
-            fps_cv = _fps_spread_cv(ov_np)
-
-            rec = {
-                "uid":           uid_b,
-                "purity":        purity,
-                "pool_hit_rate": hit_rate,
-                "chamfer_fwd":   fwd_cd,
-                "chamfer_bwd":   bwd_cd,
-                "fps_spread_cv": fps_cv,
-                "n_obj_pts_raw": int(diag["n_obj_pts_raw"][b]),
+    # --- Sweep summary (early return) ---
+    if sweep_rtols:
+        print("\n=== Sweep Summary ===")
+        print(f"  {'rtol':>10}  {'n':>6}  {'purity':>8}  {'hit_rate':>10}  {'fwd_cd':>8}  {'bwd_cd':>8}")
+        agg_by_rtol = {}
+        for rtol in sweep_rtols:
+            recs = rtol_results[rtol]
+            if not recs:
+                print(f"  rtol={rtol:.3g}: no samples")
+                continue
+            p_arr = np.array([r["purity"]        for r in recs])
+            h_arr = np.array([r["pool_hit_rate"]  for r in recs])
+            f_arr = np.array([r["chamfer_fwd"]    for r in recs])
+            b_arr = np.array([r["chamfer_bwd"]    for r in recs])
+            agg = {
+                "purity":        float(p_arr.mean()),
+                "pool_hit_rate": float(h_arr.mean()),
+                "chamfer_fwd":   float(f_arr.mean()),
+                "chamfer_bwd":   float(b_arr.mean()),
+                "n":             len(recs),
             }
-            results.append(rec)
-            n = len(results)
-            rec_with_index = {"index": n, **rec}
-            with per_sample_path.open("a") as f:
-                f.write(json.dumps(rec_with_index) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            agg_by_rtol[rtol] = agg
             print(
-                f"  [{n:4d}] {uid_b[:24]:<24}  "
-                f"purity={purity:.3f}  hit={hit_rate:.3f}  "
-                f"fwd={fwd_cd:.4f}  bwd={bwd_cd:.4f}  cv={fps_cv:.3f}"
+                f"  {rtol:>10.3g}  {len(recs):>6}  "
+                f"{agg['purity']:>8.4f}  {agg['pool_hit_rate']:>10.4f}  "
+                f"{agg['chamfer_fwd']:>8.4f}  {agg['chamfer_bwd']:>8.4f}"
             )
 
-            # PLY: obj_voxels green, ctx_voxels grey
-            if not args.no_ply:
-                cv_np = cv_b.float().cpu().numpy()
-                pts   = np.concatenate([ov_np, cv_np], axis=0)
-                colors = np.concatenate([
-                    np.tile([0, 200, 0],     (len(ov_np), 1)),
-                    np.tile([150, 150, 150], (len(cv_np), 1)),
-                ], axis=0)
-                trimesh.PointCloud(vertices=pts, colors=colors).export(
-                    str(out_dir / f"{uid_b}_voxels.ply")
-                )
+        (out_dir / "sweep_summary.json").write_text(
+            json.dumps({str(rtol): v for rtol, v in agg_by_rtol.items()}, indent=2)
+        )
+
+        rtols_with_data = [rtol for rtol in sweep_rtols if rtol in agg_by_rtol]
+        purities  = [agg_by_rtol[r]["purity"]        for r in rtols_with_data]
+        hit_rates = [agg_by_rtol[r]["pool_hit_rate"]  for r in rtols_with_data]
+
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(hit_rates, purities, "o-", color="steelblue", lw=1.5, ms=7)
+        for rtol, pur, hit in zip(rtols_with_data, purities, hit_rates):
+            ax.annotate(f"rtol={rtol:g}", (hit, pur),
+                        textcoords="offset points", xytext=(5, 3), fontsize=7)
+        ax.set_xlabel("Pool hit rate (recall proxy)")
+        ax.set_ylabel("Purity  (measured at depth_rtol=0.10)")
+        ax.set_title("depth_rtol Sweep: Purity / Recall Tradeoff")
+        ax.set_xlim(0, 1.05)
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        _savefig(out_dir / "sweep_tradeoff.png")
+        print(f"\nAll sweep outputs in {out_dir}/")
+        return
 
     if not results:
         print("No samples evaluated.")

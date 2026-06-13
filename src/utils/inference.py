@@ -336,7 +336,12 @@ def initialize_depth_pro(ckpt_path="checkpoint/depth_pro.pt"):
     return get_depth_from_depth_pro
 
 
-def prepare_model_for_inference(is_bpt, checkpoint):
+def prepare_model_for_inference(
+    is_bpt,
+    checkpoint,
+    image_encoder=None,
+    image_preprocessor=None,
+):
     if is_bpt:
         cond_encoder_name = "miche-encoder-bpt"
         params = {
@@ -375,12 +380,14 @@ def prepare_model_for_inference(is_bpt, checkpoint):
             "indicator_token_id": 518,
             "pc_latent_len": 2048,
         }
+    _image_encoder = image_encoder or "facebook/dinov2-with-registers-base"
+    _image_preprocessor = image_preprocessor or "facebook/dinov2-with-registers-base"
     model_cfg = ModelConfig(
         cond=True,
         layout_tokenization_method="full",
         loss_layout_scale=None,
         img_cond=True,
-        image_encoder="facebook/dinov2-with-registers-base",
+        image_encoder=_image_encoder,
         local_cond_path=f"zx1239856/{cond_encoder_name}",
         local_path=checkpoint,
         high_res_image_encoder=False,
@@ -406,7 +413,7 @@ def prepare_model_for_inference(is_bpt, checkpoint):
         with_normals=is_bpt,
         random_jitter_point_clouds=False,
         load_images=True,
-        image_preprocessor="facebook/dinov2-with-registers-base",
+        image_preprocessor=_image_preprocessor,
         image_size_divisor=28,
         num_ctx_points=16384,
     )

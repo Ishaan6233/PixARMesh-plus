@@ -489,6 +489,48 @@ def _get_per_view_target_ids(
     return target_ids
 
 
+def _seed_biased_pool(
+    all_pts: torch.Tensor,
+    all_conf: torch.Tensor | None,
+    seed_f: torch.Tensor,
+    pool_size: int,
+    conf_threshold: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Half FPS from 2× seed-radius neighbourhood, half global FPS."""
+    pool_size_b = min(pool_size, all_pts.shape[0])
+    if seed_f.shape[0] > 0:
+        seed_center = seed_f.mean(0)
+        seed_radius = (seed_f - seed_center).norm(dim=-1).max().clamp(min=1e-4)
+        near_mask = (all_pts - seed_center).norm(dim=-1) < 2.0 * seed_radius
+        near_pts  = all_pts[near_mask]
+        near_conf = all_conf[near_mask] if all_conf is not None else None
+    else:
+        near_pts  = torch.empty(0, 3, device=device)
+        near_conf = None
+
+    if near_pts.shape[0] >= 4:
+        n_near   = min(pool_size_b // 2, near_pts.shape[0])
+        n_global = pool_size_b - n_near
+        pool_near = adaptive_fps_voxelize(
+            near_pts.unsqueeze(0),
+            near_conf.unsqueeze(0) if near_conf is not None else None,
+            n_near, conf_threshold=conf_threshold,
+        ).squeeze(0)
+        pool_global = adaptive_fps_voxelize(
+            all_pts.unsqueeze(0),
+            all_conf.unsqueeze(0) if all_conf is not None else None,
+            n_global, conf_threshold=conf_threshold,
+        ).squeeze(0)
+        return torch.cat([pool_near, pool_global], dim=0)
+    else:
+        return adaptive_fps_voxelize(
+            all_pts.unsqueeze(0),
+            all_conf.unsqueeze(0) if all_conf is not None else None,
+            pool_size_b, conf_threshold=conf_threshold,
+        ).squeeze(0)
+
+
 def discover_instance_points_mv(
     local_points: torch.Tensor,        # (B, N, H, W, 3)  Pi3X per-view camera frame
     scene_transforms: torch.Tensor,    # (B, N, 4, 4)  cam_n → scene
@@ -501,9 +543,13 @@ def discover_instance_points_mv(
     conf: torch.Tensor | None = None,  # (B, N, H, W, 1) Pi3X per-pixel confidence
     pool_size: int = 8192,
     depth_rtol: float = 0.10,
+    adaptive_fallback: bool = True,
     conf_threshold: float = 0.3,
     min_views: int = 2,
+    mask_seeded_pool: bool = False,
+    boundary_bias_alpha: float = 0.0,
     return_diagnostics: bool = False,
+    return_pool_diagnostics: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """Grounded-SAM direct-mask instance discovery with adaptive voxelization.
 
@@ -531,6 +577,12 @@ def discover_instance_points_mv(
         conf_threshold:  minimum confidence to include a point
         min_views:       a pool point must match the target mask in this many views
                          (clamped to the number of views with a valid target ID)
+        mask_seeded_pool: if True, build pool by back-projecting target SAM mask pixels
+                         from all N views instead of seed-biased FPS.  Directly addresses
+                         the pool-coverage bottleneck identified by Gate-0 v2 (87.9% of
+                         missed pool points are on-surface — they were never sampled).
+        boundary_bias_alpha: weight added to boundary pixels when mask_seeded_pool=True.
+                         0.0 = uniform; 0.5 = boundary pixels get 1.5× weight in FPS.
         return_diagnostics: if True, return third element dict with per-sample lists
     Returns:
         obj_voxels: (B, num_obj_voxels, 3)
@@ -541,10 +593,16 @@ def discover_instance_points_mv(
     device    = local_points.device
     out_dtype = local_points.dtype
 
+    if return_pool_diagnostics:
+        return_diagnostics = True  # pool diag implies base diag
+
     obj_list: list[torch.Tensor] = []
     ctx_list: list[torch.Tensor] = []
     diag_pool_hit_rate: list[float] = []
     diag_n_obj_raw: list[int] = []
+    diag_pool_pts: list[torch.Tensor] = []
+    diag_pool_hit_strict: list[torch.Tensor] = []
+    diag_pool_hit_2d: list[torch.Tensor] = []
 
     for b in range(B):
         st_b = scene_transforms[b]           # (N, 4, 4)
@@ -575,48 +633,92 @@ def discover_instance_points_mv(
             ctx_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_ctx_voxels).squeeze(0))
             diag_pool_hit_rate.append(0.0)
             diag_n_obj_raw.append(0)
+            if return_pool_diagnostics:
+                diag_pool_pts.append(torch.empty(0, 3))
+                diag_pool_hit_strict.append(torch.empty(0, dtype=torch.bool))
+                diag_pool_hit_2d.append(torch.empty(0, dtype=torch.bool))
             continue
 
         all_pts  = torch.cat(pts_scene_list, dim=0)
         all_conf = torch.cat(conf_list, dim=0) if conf_list else None
 
-        # --- 2a. Seed-biased pool: half from seed neighbourhood, half global.
-        # This concentrates pool density on the target object regardless of how
-        # small it is relative to the scene, pushing hit_rate without touching purity.
-        pool_size_b = min(pool_size, all_pts.shape[0])
-        seed_f = seed_pcs[b].float()
-        if seed_f.shape[0] > 0:
-            seed_center = seed_f.mean(0)
-            seed_radius = (seed_f - seed_center).norm(dim=-1).max().clamp(min=1e-4)
-            near_mask = (all_pts - seed_center).norm(dim=-1) < 2.0 * seed_radius
-            near_pts  = all_pts[near_mask]
-            near_conf = all_conf[near_mask] if all_conf is not None else None
-        else:
-            near_pts  = torch.empty(0, 3, device=device)
-            near_conf = None
+        # --- 3 (moved up). Per-view target instance ID from seed projection ---
+        # Must precede pool construction when mask_seeded_pool=True so the pool loop
+        # knows which SAM ID to back-project per view.  _get_per_view_target_ids only
+        # depends on seed_pcs and scene geometry — no pool dependency.
+        seed_b = seed_pcs[b].float()
+        target_ids_n = _get_per_view_target_ids(
+            seed_b, st_b, K_b, pm_b, lp_z, vm_b, depth_rtol
+        ) if seed_b.shape[0] > 0 else torch.full((N,), -1, dtype=torch.long, device=device)
+        # target_ids_n: (N,) long, -1 = no valid seed visible in this view
 
-        if near_pts.shape[0] >= 4:
-            n_near   = min(pool_size_b // 2, near_pts.shape[0])
-            n_global = pool_size_b - n_near
-            pool_near = adaptive_fps_voxelize(
-                near_pts.unsqueeze(0),
-                near_conf.unsqueeze(0) if near_conf is not None else None,
-                n_near, conf_threshold=conf_threshold,
-            ).squeeze(0)
-            pool_global = adaptive_fps_voxelize(
-                all_pts.unsqueeze(0),
-                all_conf.unsqueeze(0) if all_conf is not None else None,
-                n_global, conf_threshold=conf_threshold,
-            ).squeeze(0)
-            pool_pts = torch.cat([pool_near, pool_global], dim=0)
-        else:
-            pool_pts = adaptive_fps_voxelize(
-                all_pts.unsqueeze(0),
-                all_conf.unsqueeze(0) if all_conf is not None else None,
-                pool_size_b, conf_threshold=conf_threshold,
-            ).squeeze(0)
+        # --- 2a. Pool construction ---
+        if mask_seeded_pool:
+            # Direct back-projection of target SAM mask pixels from all N views.
+            # Fixes the pool-coverage bottleneck: the seed-biased FPS approach only
+            # samples ~5% of scene cloud slots for a small object, leaving 87.9% of
+            # object-surface points unsampled (Gate-0 v2 finding).
+            mask_pool_list: list[torch.Tensor] = []
+            mask_conf_list: list[torch.Tensor] = []
+            mask_weight_list: list[torch.Tensor] = []
+            for n in range(N):
+                if not vm_b[n] or target_ids_n[n] <= 0:
+                    continue
+                lp_n = local_points[b, n]            # (H_lp, W_lp, 3)
+                H_lp, W_lp = lp_n.shape[:2]
+                # Resize panoptic_masks (original res e.g. 484×648) to match
+                # local_points resolution (Pi3X pads to size_divisor=28, e.g. 504×672).
+                pm_n_rs = F.interpolate(
+                    pm_b[n].float().unsqueeze(0).unsqueeze(0),
+                    size=(H_lp, W_lp), mode="nearest",
+                ).squeeze().long()
+                obj_mask_n = pm_n_rs == target_ids_n[n]   # (H_lp, W_lp) bool
+                valid_n    = lp_n[..., 2] > 0
+                combined   = obj_mask_n & valid_n
+                pts_c = lp_n[combined].float()
+                if pts_c.shape[0] == 0:
+                    continue
+                pts_s = _apply_scene_transform(
+                    pts_c.unsqueeze(0), st_b[n:n+1]
+                ).squeeze(0)
+                mask_pool_list.append(pts_s)
+                if conf is not None:
+                    mask_conf_list.append(conf[b, n, :, :, 0][combined].float())
+                if boundary_bias_alpha > 0.0:
+                    # Boundary = dilated mask & ~eroded mask (approximate via max_pool2d).
+                    # Erosion: -max_pool2d(-mask) with kernel 3.
+                    m_f = obj_mask_n.float().unsqueeze(0).unsqueeze(0)
+                    eroded = (-F.max_pool2d(-m_f, kernel_size=3, stride=1, padding=1)).squeeze().bool()
+                    boundary = obj_mask_n & ~eroded
+                    w = torch.ones(pts_c.shape[0], device=device)
+                    w[boundary[combined]] = 1.0 + boundary_bias_alpha
+                    mask_weight_list.append(w)
 
-        # --- 2b. Context voxels: AnySplat directly from full cloud to num_ctx_voxels ---
+            if mask_pool_list:
+                raw_pts  = torch.cat(mask_pool_list, dim=0)
+                raw_conf = torch.cat(mask_conf_list, dim=0) if mask_conf_list else None
+                # Boundary bias: multiply conf by weight so boundary pixels are
+                # less likely to be discarded by the conf threshold.
+                if raw_conf is not None and mask_weight_list:
+                    raw_w    = torch.cat(mask_weight_list, dim=0)
+                    raw_conf = (raw_conf * raw_w).clamp(max=1.0)
+                pool_size_b = min(pool_size, raw_pts.shape[0])
+                pool_pts = adaptive_fps_voxelize(
+                    raw_pts.unsqueeze(0),
+                    raw_conf.unsqueeze(0) if raw_conf is not None else None,
+                    pool_size_b, conf_threshold=conf_threshold,
+                ).squeeze(0)
+            else:
+                # All target_ids_n == -1 (degenerate scene): fall back to seed-biased pool.
+                pool_pts = _seed_biased_pool(
+                    all_pts, all_conf, seed_b, pool_size, conf_threshold, device
+                )
+        else:
+            pool_pts = _seed_biased_pool(
+                all_pts, all_conf, seed_b, pool_size, conf_threshold, device
+            )
+
+        # --- 2b. Context voxels: directly from full cloud to num_ctx_voxels ---
         # Avoids the redundant pool→ctx re-downsampling; confidence property applies end-to-end.
         ctx_voxels_b = adaptive_fps_voxelize(
             all_pts.unsqueeze(0),
@@ -624,13 +726,6 @@ def discover_instance_points_mv(
             num_ctx_voxels,
             conf_threshold=conf_threshold,
         ).squeeze(0)   # (num_ctx_voxels, 3)
-
-        # --- 3. Per-view target instance ID from seed projection ---
-        seed_b = seed_pcs[b].float()
-        target_ids_n = _get_per_view_target_ids(
-            seed_b, st_b, K_b, pm_b, lp_z, vm_b, depth_rtol
-        ) if seed_b.shape[0] > 0 else torch.full((N,), -1, dtype=torch.long, device=device)
-        # target_ids_n: (N,) long, -1 = no valid seed visible in this view
 
         # --- 4. Direct Grounded-SAM masking ---
         # A pool point is labelled as object if it matches the target mask in
@@ -654,7 +749,7 @@ def discover_instance_points_mv(
                 return hc
 
             hit_count = _pool_mask(depth_rtol)
-            if hit_count.max() < threshold:
+            if adaptive_fallback and hit_count.max() < threshold:
                 # Fallback: Pi3X depth maps are not globally consistent across wide-
                 # baseline views (same 3D point can be 0.5+ scene units apart in
                 # different views).  depth_rtol=100.0 skips the depth check entirely;
@@ -666,11 +761,23 @@ def discover_instance_points_mv(
             obj_scores = hit_count[is_obj].float() / n_valid_views  # (n_obj,) in [0,1]
             diag_pool_hit_rate.append(is_obj.float().mean().item())
             diag_n_obj_raw.append(int(is_obj.sum().item()))
+            if return_pool_diagnostics:
+                # Strict = at depth_rtol; 2D-only = at rtol=100 (no depth check)
+                hc_strict = _pool_mask(depth_rtol)
+                hc_2d     = _pool_mask(100.0)
+                diag_pool_pts.append(pool_pts.cpu())
+                diag_pool_hit_strict.append((hc_strict >= threshold).cpu())
+                diag_pool_hit_2d.append((hc_2d >= threshold).cpu())
         else:
             obj_pts    = torch.empty(0, 3, device=device)
             obj_scores = torch.empty(0, device=device)
             diag_pool_hit_rate.append(0.0)  # no valid target view
             diag_n_obj_raw.append(0)
+            if return_pool_diagnostics:
+                P_b = pool_pts.shape[0]
+                diag_pool_pts.append(pool_pts.cpu())
+                diag_pool_hit_strict.append(torch.zeros(P_b, dtype=torch.bool))
+                diag_pool_hit_2d.append(torch.zeros(P_b, dtype=torch.bool))
 
         # --- 5. Fallback + FPS to fixed obj size ---
         if obj_pts.shape[0] == 0:
@@ -691,5 +798,10 @@ def discover_instance_points_mv(
     obj_t = torch.stack(obj_list, dim=0).to(out_dtype)
     ctx_t = torch.stack(ctx_list, dim=0).to(out_dtype)
     if return_diagnostics:
-        return obj_t, ctx_t, {"pool_hit_rate": diag_pool_hit_rate, "n_obj_pts_raw": diag_n_obj_raw}
+        diag: dict = {"pool_hit_rate": diag_pool_hit_rate, "n_obj_pts_raw": diag_n_obj_raw}
+        if return_pool_diagnostics:
+            diag["pool_pts"]        = diag_pool_pts         # list of (pool_size_b, 3) cpu tensors
+            diag["pool_hit_strict"] = diag_pool_hit_strict  # list of (pool_size_b,) bool tensors
+            diag["pool_hit_2d"]     = diag_pool_hit_2d      # list of (pool_size_b,) bool tensors
+        return obj_t, ctx_t, diag
     return obj_t, ctx_t

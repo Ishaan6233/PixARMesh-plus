@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from tensorboard.backend.event_processing import event_accumulator
 
-ROOT = Path(__file__).parent.parent
+ROOT = Path(__file__).parent.parent.parent
 OUT_DIR = ROOT / "figures"
 OUT_DIR.mkdir(exist_ok=True)
 
@@ -34,20 +34,20 @@ RUNS = {
     ],
     "img-ctx": [
         {
-            "label": "Run 1 (May 28)",
+            "label": "Run 1 (May 28, baseline)",
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260528-125338/checkpoints/runs/May28_12-54-11_gpu-h200-204",
         },
         {
-            "label": "Run 2 (Jun 05)",
+            "label": "Run 2 (Jun 05, pre-fix)",
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260605-055027/checkpoints/runs/Jun05_05-51-06_gpu-h200-204",
         },
         {
-            "label": "Run 3 (Jun 07)",
+            "label": "Run 3 (Jun 07, extra_feat fix)",
             "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260607-184311/checkpoints/runs/Jun07_18-43-48_gpu-h200-204",
         },
         {
-            "label": "Run 4 (Jun 10, in-progress)",
-            "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260610-015711/checkpoints/runs/Jun10_01-57-46_gpu-h200-204",
+            "label": "Run 4 (Jun 10, dinov2-base) ◀ current",
+            "tb_dir": ROOT / "outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260610-155657/checkpoints/runs/Jun10_15-57-33_gpu-h200-204",
         },
     ],
 }
@@ -171,7 +171,7 @@ def main():
 
     fig2, axes2 = plt.subplots(3, 4, figsize=(18, 12))
     fig2.suptitle("Stage-2 Training Curves (img-ctx, joint pose+mesh)\n"
-                  "Run 1=May28 (pre-fix) · Run 2=Jun05 (pre-fix) · Run 3=Jun07 (extra_feat fix) · Run 4=Jun10 (in-progress)",
+                  "Run 1=May28 (baseline) · Run 2=Jun05 (pre-fix) · Run 3=Jun07 (extra_feat fix) · Run 4=Jun10 (dinov2-base) ◀ current",
                   fontsize=12, fontweight="bold", y=1.01)
     axes2_flat = axes2.flatten()
 
@@ -213,11 +213,13 @@ def main():
 
     # ---- Figure 3: Stage-1 vs Stage-2 loss comparison (best complete run each) ----
     fig3, axes3 = plt.subplots(2, 3, figsize=(16, 9))
-    fig3.suptitle("Stage-1 (layout-only) vs. Stage-2 (img-ctx) — Best Run Comparison", fontsize=13, fontweight="bold", y=1.01)
+    fig3.suptitle("Stage-1 vs. Stage-2 — Run Comparison (incl. current Jun10 dinov2-base)", fontsize=13, fontweight="bold", y=1.01)
 
     best = {
-        "Stage-1 layout-only (Jun 04)": (RUNS["layout-only"][2], PALETTE["layout-only"][2]),
-        "Stage-2 img-ctx (Jun 05)":     (RUNS["img-ctx"][1],      PALETTE["img-ctx"][1]),
+        "Stage-1 layout-only (Jun 04)":           (RUNS["layout-only"][2], PALETTE["layout-only"][2]),
+        "Stage-2 Jun05 (pre-fix)":                (RUNS["img-ctx"][1],     PALETTE["img-ctx"][1]),
+        "Stage-2 Jun07 (extra_feat fix)":         (RUNS["img-ctx"][2],     PALETTE["img-ctx"][2]),
+        "Stage-2 Jun10 (dinov2-base) ◀ current": (RUNS["img-ctx"][3],     PALETTE["img-ctx"][3]),
     }
 
     compare_pairs = [
