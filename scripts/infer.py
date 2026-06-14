@@ -338,13 +338,16 @@ def main():
                     eos_idx = (tokens == model.config.eos_token_id).nonzero()[0]
                     if len(eos_idx) > 0:
                         tokens = tokens[: eos_idx[0]]
-                    if is_bpt:
-                        mesh = decode_bpt(tokens)
-                    else:
-                        mesh = decode_mesh_edgerunner(
-                            tokens, collator.tokenizer, clean=True, verbose=False
-                        )
-                    mesh.export(out_dir / f"{uid}.ply")
+                    try:
+                        if is_bpt:
+                            mesh = decode_bpt(tokens)
+                        else:
+                            mesh = decode_mesh_edgerunner(
+                                tokens, collator.tokenizer, clean=True, verbose=False
+                            )
+                        mesh.export(out_dir / f"{uid}.ply")
+                    except Exception as e:
+                        print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
 
 
 if __name__ == "__main__":

@@ -286,10 +286,16 @@ class BPTModel(PreTrainedModel):
                 cache = output.past_key_values
 
             # sample code from logits
-            logits = logits[:, -1]
+            # cast to fp32 and sanitize: bfloat16 softmax overflows with low temperature;
+            # NaN can also propagate from degenerate cond_embeds on some examples.
+            logits = logits[:, -1].float().nan_to_num(0.0, posinf=100.0, neginf=-100.0)
             if do_sample:
                 filtered_logits = filter_logits_fn(logits, **filter_kwargs)
                 probs = F.softmax(filtered_logits / temperature, dim=-1)
+                # guard: degenerate rows (all-zero after filtering) → uniform
+                probs = probs.clamp(min=0).nan_to_num(0.0)
+                zero_rows = probs.sum(-1, keepdim=True) == 0
+                probs = probs + zero_rows.float() * (1.0 / probs.shape[-1])
                 sample = torch.multinomial(probs, 1)
             else:
                 sample = logits.argmax(dim=-1, keepdim=True)
