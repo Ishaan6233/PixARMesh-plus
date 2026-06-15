@@ -148,7 +148,6 @@ def get_model(
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
     # when loading from a stage-2 checkpoint that already contains them.
     _fix_uninit_params(model)
-    model.config._attn_implementation = "flash_attention_2"
     if config.vocab_size != model_cfg.vocab_size:
         model.resize_token_embeddings(model_cfg.vocab_size, pad_to_multiple_of=64)
     return model

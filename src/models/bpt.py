@@ -53,6 +53,7 @@ class BPTConfig(PretrainedConfig):
         with_ctx_pc=False,
         img_cond_drop_prob=0.0,
         loss_layout_scale: Optional[float] = None,
+        use_flash_attn=True,
         **kwargs,
     ):
         super().__init__(
@@ -84,6 +85,7 @@ class BPTConfig(PretrainedConfig):
         self.with_ctx_pc = with_ctx_pc
         self.img_cond_drop_prob = img_cond_drop_prob
         self.loss_layout_scale = loss_layout_scale
+        self.use_flash_attn = use_flash_attn
 
 
 class BPTModel(PreTrainedModel):
@@ -128,10 +130,9 @@ class BPTModel(PreTrainedModel):
         self.cond_encoder_img = cond_encoder_img
 
         attn_dim_head = config.hidden_size // config.num_attention_heads
-        flash_attn = config._attn_implementation in (
-            "flash_attention_2",
-            "flash_attention_3",
-        )
+        # Use BPT-specific flag; avoids triggering HF transformers' flash-attn validator
+        # which is designed for HF attention layers, not x-transformers.
+        flash_attn = getattr(config, "use_flash_attn", True)
 
         self.decoder = Decoder(
             dim=config.hidden_size,
