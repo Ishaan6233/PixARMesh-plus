@@ -116,6 +116,7 @@ def get_model(
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
         ignore_mismatched_sizes=True,
+        torch_dtype=torch.float32,
     )
     # Restore pretrained cond_encoder keys that the checkpoint did NOT supply.
     # We detect which keys the checkpoint provided by comparing the post-load model state
@@ -142,7 +143,6 @@ def get_model(
     # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
     if pi3x_encoder is not None and hasattr(model, "pi3x_encoder"):
         model.pi3x_encoder = pi3x_encoder
-    model = model.to(torch.bfloat16)
     # Catch NaN/Inf params left by no_init_weights (absent checkpoint keys → garbage memory
     # → bfloat16 NaN).  This covers ctx_aggregator when loading from the original edgerunner
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
@@ -169,7 +169,6 @@ def get_condition_encoder(
         extra_args["with_extra_feat"] = True
         extra_args["extra_feat_dim"] = cond_encoder_img.output_dim
     model = model_class.from_pretrained(local_model_path, **extra_args)
-    model = model.to(torch.bfloat16)
     _fix_uninit_params(model)
     # extra_feat_proj is never in the base HF encoder checkpoint, so it always
     # comes out of from_pretrained as zeros (our __init__ zeros_ safety net).
@@ -195,4 +194,4 @@ def get_image_condition_encoder(model_cfg: ModelConfig):
         )
     else:
         model = ImageConditionEncoder(model_name=model_cfg.image_encoder)
-    return model.to(torch.bfloat16)
+    return model

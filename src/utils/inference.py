@@ -420,4 +420,5 @@ def prepare_model_for_inference(is_bpt, checkpoint):
         cond_encoder=cond_encoder,
         cond_encoder_img=cond_encoder_img,
     )
+    model = model.to(torch.bfloat16)
     return model, model_cfg, data_cfg
