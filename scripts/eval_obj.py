@@ -141,8 +141,8 @@ def main():
 
         gt_mesh = get_mesh(gt_mesh_path)
         pred_mesh = get_mesh(pred_mesh_path)
-        has_gt = gt_mesh is not None
-        has_pred = pred_mesh is not None
+        has_gt = gt_mesh is not None and gt_mesh.get_surface_area() > 0
+        has_pred = pred_mesh is not None and pred_mesh.get_surface_area() > 0
 
         record = {
             "uid": uid,
