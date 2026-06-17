@@ -1,4 +1,7 @@
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 os.environ["OMP_NUM_THREADS"] = "1"
 import warnings
