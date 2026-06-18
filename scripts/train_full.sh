@@ -16,6 +16,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+PYTHON="${PYTHON:-micromamba run -n pixarmesh124 python}"
+
 # ── Argument parsing ─────────────────────────────────────────────────────────
 USE_PI3X=false
 USE_BPT=false
@@ -77,7 +79,7 @@ elif [[ -n "$STAGE1_CKPT" ]] && [[ "$FORCE_STAGE1" == "false" ]]; then
     echo "[train_full] Skipping Stage 1. (pass --force-stage1 to override)"
 else
     echo "[train_full] ── Stage 1: layout-only training ──"
-    python launch.py train.py --config-name="${STAGE1_CFG}"
+    $PYTHON launch.py train.py --config-name="${STAGE1_CFG}"
 
     STAGE1_CKPT=$(ls -td "${S1_OUT_PREFIX}"/*/checkpoints/final 2>/dev/null | head -1 || true)
     if [[ -z "$STAGE1_CKPT" ]]; then
@@ -98,7 +100,7 @@ fi
 # ── Stage 2 ──────────────────────────────────────────────────────────────────
 echo "[train_full] ── Stage 2: full training (init from Stage 1) ──"
 echo "[train_full] Stage 1 checkpoint: $STAGE1_CKPT"
-python launch.py train.py \
+$PYTHON launch.py train.py \
     --config-name="${STAGE2_CFG}" \
     "model.local_path=${STAGE1_CKPT}"
 
