@@ -101,11 +101,12 @@ def get_model(
             raise ValueError(f"Unknown model type: {model_type}")
 
     config = config_class.from_pretrained(local_model_path, **extra_args)
-    # Snapshot the pre-loaded cond_encoder state before from_pretrained, because
-    # from_pretrained detects cond_encoder.* as "MISSING" from the main checkpoint
-    # and re-initializes them with random weights, discarding the pretrained values.
+    # Snapshot cond_encoder weights via named_parameters (NOT state_dict): ConditionEncoder
+    # overrides state_dict() to return {} for frozen encoders, so state_dict is useless here.
+    # transformers 5.x re-initializes ALL cond_encoder.* params after loading the BPT base
+    # checkpoint (which has no cond_encoder.* keys), discarding the MICHE pretrained weights.
     cond_enc_state = (
-        {k: v.clone() for k, v in cond_encoder.state_dict().items()}
+        {n: p.data.clone() for n, p in cond_encoder.named_parameters()}
         if cond_encoder is not None
         else None
     )
@@ -118,26 +119,15 @@ def get_model(
         ignore_mismatched_sizes=True,
         torch_dtype=torch.float32,
     )
-    # Restore pretrained cond_encoder keys that the checkpoint did NOT supply.
-    # We detect which keys the checkpoint provided by comparing the post-load model state
-    # against the pre-load snapshot: keys that now differ were loaded from the checkpoint
-    # and must be kept; keys still matching the snapshot were absent from the checkpoint
-    # and need the pretrained values restored (to undo any no_init_weights corruption).
-    # This works for both local paths and HuggingFace model IDs.
+    # Restore MICHE pretrained weights directly into the model's cond_encoder.
+    # Bypass ConditionEncoder.load_state_dict (also a no-op for frozen encoders) by
+    # writing tensor data in-place via named_parameters().
     if cond_enc_state is not None:
-        loaded_state = model.cond_encoder.state_dict()
-
-        def _is_garbage(t):
-            f = t.float()
-            return bool(f.isnan().any() or f.isinf().any() or f.abs().max() > 1e6)
-
-        restore = {
-            k: v for k, v in cond_enc_state.items()
-            if k not in loaded_state
-            or _is_garbage(loaded_state[k])  # from_pretrained replaced with uninit garbage
-            or torch.equal(loaded_state[k].float().cpu(), v.float().cpu())
-        }
-        model.cond_encoder.load_state_dict(restore, strict=False)
+        with torch.no_grad():
+            model_enc_params = dict(model.cond_encoder.named_parameters())
+            for name, pretrained_val in cond_enc_state.items():
+                if name in model_enc_params:
+                    model_enc_params[name].data.copy_(pretrained_val)
     # Attach frozen encoders post-from_pretrained.
     # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
     # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
