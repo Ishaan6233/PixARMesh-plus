@@ -311,7 +311,7 @@ def main():
                         temperature=0.5,
                         filter_logits_fn=joint_filter,
                         filter_kwargs=dict(k=50, p=0.95),
-                        do_sample=args.do_sample,
+                        do_sample=True,
                         tqdm_position=state.process_index,
                     )
                     results = results[:, seq_len:]
