@@ -46,11 +46,14 @@ def get_model(
             raise ValueError(f"Unknown model type: {model_type}")
 
     config = config_class.from_pretrained(local_model_path, **extra_args)
+    # BPT uses x_transformers internally and manages its own attention;
+    # HF's flash_attention_2 dispatch check rejects it in newer transformers versions.
+    attn_impl = "eager" if model_type == "bpt" else "flash_attention_2"
     model = model_class.from_pretrained(
         local_model_path,
         config=config,
         torch_dtype=torch.float32,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
         cond_encoder=cond_encoder,
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
