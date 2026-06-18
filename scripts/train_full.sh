@@ -79,6 +79,8 @@ elif [[ -n "$STAGE1_CKPT" ]] && [[ "$FORCE_STAGE1" == "false" ]]; then
     echo "[train_full] Skipping Stage 1. (pass --force-stage1 to override)"
 else
     echo "[train_full] ── Stage 1: layout-only training ──"
+    export RUN_TS=$(date +%Y%m%d-%H%M%S)
+    echo "[train_full] Stage 1 run dir: ${S1_OUT_PREFIX}/${RUN_TS}"
     $PYTHON launch.py train.py --config-name="${STAGE1_CFG}"
 
     STAGE1_CKPT=$(ls -td "${S1_OUT_PREFIX}"/*/checkpoints/final 2>/dev/null | head -1 || true)
@@ -100,6 +102,7 @@ fi
 # ── Stage 2 ──────────────────────────────────────────────────────────────────
 echo "[train_full] ── Stage 2: full training (init from Stage 1) ──"
 echo "[train_full] Stage 1 checkpoint: $STAGE1_CKPT"
+export RUN_TS=$(date +%Y%m%d-%H%M%S)
 $PYTHON launch.py train.py \
     --config-name="${STAGE2_CFG}" \
     "model.local_path=${STAGE1_CKPT}"
