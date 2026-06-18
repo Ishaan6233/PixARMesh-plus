@@ -119,14 +119,30 @@ def get_model(
         ignore_mismatched_sizes=True,
         torch_dtype=torch.float32,
     )
-    # Restore MICHE pretrained weights directly into the model's cond_encoder.
-    # Bypass ConditionEncoder.load_state_dict (also a no-op for frozen encoders) by
-    # writing tensor data in-place via named_parameters().
+    # Restore MICHE pretrained weights into cond_encoder after from_pretrained corruption.
+    # Strategy:
+    #   Frozen encoder params (never saved to checkpoint): always restore from MICHE snapshot.
+    #   Trainable params like extra_feat_proj (saved to checkpoint): only restore if garbage,
+    #   so that a correctly-loaded stage-1-trained extra_feat_proj is preserved for stage-2.
     if cond_enc_state is not None:
         with torch.no_grad():
             model_enc_params = dict(model.cond_encoder.named_parameters())
+            trainable_keys = set(getattr(model.cond_encoder, "extra_feat_proj_keys", []))
             for name, pretrained_val in cond_enc_state.items():
-                if name in model_enc_params:
+                if name not in model_enc_params:
+                    continue
+                current = model_enc_params[name].data.float()
+                is_garbage = (
+                    current.isnan().any()
+                    or current.isinf().any()
+                    or current.abs().max() > 1e6
+                )
+                if name in trainable_keys:
+                    # Only fix garbage; keep stage-1 trained values when loading for stage-2
+                    if is_garbage:
+                        model_enc_params[name].data.copy_(pretrained_val)
+                else:
+                    # Frozen params are never in checkpoint → always restore from MICHE
                     model_enc_params[name].data.copy_(pretrained_val)
     # Attach frozen encoders post-from_pretrained.
     # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
