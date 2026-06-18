@@ -148,6 +148,13 @@ def get_model(
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
     # when loading from a stage-2 checkpoint that already contains them.
     _fix_uninit_params(model)
+    # Train in bfloat16 to match the paper's "bf16 precision" training setup.
+    # With a float32 model + bf16 AMP, gradient norms are ~0.5 (below the 1.0 clip),
+    # leading to tiny updates and loss stuck at ~1.93. With a bf16 model, gradient
+    # norms are 10–18 (clipped to 1.0 every step) and the model converges properly.
+    # This cast is safe here: cond_encoder restore and _fix_uninit_params have
+    # already run on float32 values, so no garbage values are introduced.
+    model = model.to(torch.bfloat16)
     if config.vocab_size != model_cfg.vocab_size:
         model.resize_token_embeddings(model_cfg.vocab_size, pad_to_multiple_of=64)
     return model
