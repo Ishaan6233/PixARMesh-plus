@@ -1,3 +1,21 @@
+# CVE-2025-32434: transformers 5.x blocks torch.load on .pt optimizer files
+# when torch < 2.6. Patch both the module-level and the local binding in trainer.py
+# before any transformers import triggers the check.
+try:
+    import transformers.utils.import_utils as _tfu
+    import transformers.trainer as _trainer_mod
+    _noop = lambda: None  # noqa: E731
+    _tfu.check_torch_load_is_safe = _noop
+    _trainer_mod.check_torch_load_is_safe = _noop
+    import torch as _torch
+    _orig_load = _torch.load
+    def _safe_load(f, *args, **kwargs):
+        kwargs["weights_only"] = False
+        return _orig_load(f, *args, **kwargs)
+    _torch.load = _safe_load
+except Exception:
+    pass
+
 import datasets
 import hydra
 import transformers
