@@ -78,41 +78,55 @@ def main():
         help="Whether to overwrite existing eval results",
     )
     parser.add_argument("--save-dir", type=str, default="outputs/evaluations-obj")
+    parser.add_argument(
+        "--mv-dataset",
+        action="store_true",
+        help="Evaluate multi-view PLYs named <uid>.ply against GT via the "
+             "3d-front-multiview uid->model_id map (one item per object).",
+    )
+    parser.add_argument("--mv-path", type=str, default="datasets/3d-front-multiview")
     args = parser.parse_args()
 
-    with jsonlines.open(args.metadata, "r") as reader:
-        valid_uids = {line["image_id"] for line in reader}
-
     accelerator = Accelerator()
-
-    with accelerator.local_main_process_first():
-        dataset = datasets.load_dataset(args.dataset, split="test", num_proc=16)
-
-    all_uids = dataset["uid"]
-    valid_indices = []
-    for i, uid in enumerate(all_uids):
-        if str(uid) in valid_uids:
-            valid_indices.append(i)
-
-    subset = dataset.select(valid_indices)
 
     gt_dir = Path(args.gt_dir)
     pred_dir = Path(args.pred_dir)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    with accelerator.local_main_process_first():
-        subset = subset.map(
-            flatten_3d_front_for_eval,
-            batched=True,
-            batch_size=4,
-            remove_columns=subset.column_names,
-        )
+    if args.mv_dataset:
+        # Multi-view: one item per object PLY (<uid>.ply); GT via uid->model_id map.
+        from src.utils.inference import build_mv_uid_to_model_id
+        from src.utils.config import DataConfig
 
-    sharded_subset = subset.shard(
-        num_shards=accelerator.num_processes,
-        index=accelerator.process_index,
-    )
+        uid2mid = build_mv_uid_to_model_id(
+            DataConfig(type="3d-front-multiview", path=args.mv_path)
+        )
+        subset = [
+            {"uid": uid, "obj_id": None, "model_id": mid, "mask_area": 10**9}
+            for uid, mid in uid2mid.items()
+        ]
+        sharded_subset = subset[accelerator.process_index :: accelerator.num_processes]
+    else:
+        with jsonlines.open(args.metadata, "r") as reader:
+            valid_uids = {line["image_id"] for line in reader}
+        with accelerator.local_main_process_first():
+            dataset = datasets.load_dataset(args.dataset, split="test", num_proc=16)
+        valid_indices = [
+            i for i, uid in enumerate(dataset["uid"]) if str(uid) in valid_uids
+        ]
+        subset = dataset.select(valid_indices)
+        with accelerator.local_main_process_first():
+            subset = subset.map(
+                flatten_3d_front_for_eval,
+                batched=True,
+                batch_size=4,
+                remove_columns=subset.column_names,
+            )
+        sharded_subset = subset.shard(
+            num_shards=accelerator.num_processes,
+            index=accelerator.process_index,
+        )
 
     for item in tqdm(sharded_subset):
         uid = item["uid"]
@@ -122,9 +136,10 @@ def main():
         if mask_area < args.mask_area_thresh:
             continue
 
+        stem = f"{uid}" if obj_id is None else f"{uid}_{obj_id}"
         gt_mesh_path = gt_dir / f"{model_id}.ply"
-        pred_mesh_path = pred_dir / f"{uid}_{obj_id}.ply"
-        out_json_path = save_dir / f"{uid}_{obj_id}.json"
+        pred_mesh_path = pred_dir / f"{stem}.ply"
+        out_json_path = save_dir / f"{stem}.json"
 
         if out_json_path.exists() and not args.overwrite:
             continue
@@ -182,7 +197,8 @@ def main():
         for item in subset:
             uid = item["uid"]
             obj_id = item["obj_id"]
-            out_json_path = save_dir / f"{uid}_{obj_id}.json"
+            stem = f"{uid}" if obj_id is None else f"{uid}_{obj_id}"
+            out_json_path = save_dir / f"{stem}.json"
             mask_area = item["mask_area"]
             if mask_area < args.mask_area_thresh:
                 continue
