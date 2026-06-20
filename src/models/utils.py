@@ -26,7 +26,14 @@ def _fix_uninit_params(model):
     init_std = getattr(getattr(model, "config", None), "init_std", 0.02)
     for module in model.modules():
         has_bad = any(
-            p.is_floating_point() and (torch.isnan(p.data).any() or torch.isinf(p.data).any())
+            p.is_floating_point() and (
+                torch.isnan(p.data).any() or torch.isinf(p.data).any()
+                # Uninitialized GPU memory is finite-but-huge (e.g. ~1e31) and does NOT
+                # become NaN/inf — the mv_voxel_encoder (absent from single-view
+                # checkpoints) hits exactly this. Scope the magnitude test to trainable
+                # params so frozen Pi3X/DINOv2 real weights are never touched.
+                or (p.requires_grad and p.data.abs().max() > 1e4)
+            )
             for p in module.parameters(recurse=False)
         )
         if not has_bad:
