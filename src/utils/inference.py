@@ -206,7 +206,43 @@ def get_prefix_allowed_tokens_fn_edgerunner(model, batch_size=1):
     return prefix_allowed_tokens_fn
 
 
-def decode_mesh_edgerunner(tokens, tokenizer, clean=True, verbose=False):
+def _remove_small_components(mesh, area_ratio=0.01, verbose=False):
+    """Drop disconnected components whose surface area is below area_ratio × total.
+
+    Removes the spurious floaters the autoregressive decoder occasionally emits. A
+    single stray component would otherwise inflate the mesh bounding box and distort
+    the downstream bbox-normalization (and CD/F) far beyond its own few points.
+
+    Conservative by design: keeps *every* substantial component (not just the largest),
+    so genuinely disconnected object parts (e.g. chair legs) survive. area_ratio <= 0
+    disables it; if all components fall below the threshold (degenerate), the single
+    largest component is kept.
+    """
+    if area_ratio <= 0.0 or len(mesh.faces) == 0:
+        return mesh
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception:
+        return mesh
+    if len(components) <= 1:
+        return mesh
+    areas = np.array([float(c.area) for c in components])
+    total = float(areas.sum())
+    if total <= 0.0:
+        return mesh
+    keep = [c for c, a in zip(components, areas) if a >= area_ratio * total]
+    if not keep:
+        keep = [components[int(areas.argmax())]]
+    cleaned = trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0]
+    if verbose:
+        print(
+            f"[INFO] components: {len(components)} → kept {len(keep)} "
+            f"(removed {len(components) - len(keep)} floaters)"
+        )
+    return cleaned
+
+
+def decode_mesh_edgerunner(tokens, tokenizer, clean=True, verbose=False, floater_area_ratio=0.0):
     tokens = tokens - 3
     vertices, faces, face_type = tokenizer.decode(tokens)
 
@@ -220,6 +256,9 @@ def decode_mesh_edgerunner(tokens, tokenizer, clean=True, verbose=False):
         mesh.merge_vertices()
         mesh.update_faces(mesh.unique_faces())
         mesh.fix_normals()
+
+        # Drop tiny disconnected floaters (opt-in; preserves multi-part objects).
+        mesh = _remove_small_components(mesh, area_ratio=floater_area_ratio, verbose=verbose)
 
         if verbose:
             print(
@@ -428,3 +467,135 @@ def prepare_model_for_inference(
         cond_encoder_img=cond_encoder_img,
     )
     return model, model_cfg, data_cfg
+
+
+def _filter_dataclass_kwargs(dataclass_type, values):
+    from dataclasses import fields
+
+    allowed = {f.name for f in fields(dataclass_type)}
+    return {k: v for k, v in values.items() if k in allowed}
+
+
+def prepare_mv_model_for_inference(
+    checkpoint=None, config_name="edgerunner_3d_front_multiview"
+):
+    """Build the multi-view EdgeRunner model + configs for inference.
+
+    Mirrors train.py's construction (Hydra-composed config → get_model with a
+    pi3x_encoder + cond encoders) so the architecture exactly matches training.
+    `checkpoint` overrides model.local_path (e.g. a trained MV checkpoint); when
+    None the config's local_path is used (the single-view init checkpoint).
+    """
+    import os
+    from pathlib import Path
+    from omegaconf import OmegaConf
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+    from src.models.utils import get_pi3x_encoder
+
+    # train_full.sh injects RUN_TS into output-dir fields we don't use at inference;
+    # set a default so resolving model/dataset interpolations doesn't KeyError.
+    os.environ.setdefault("RUN_TS", "inference")
+
+    overrides = []
+    if checkpoint is not None:
+        overrides.append(f"model.local_path={checkpoint}")
+
+    config_dir = Path("configs").absolute().as_posix()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(config_name=config_name, overrides=overrides)
+
+    data_values = OmegaConf.to_container(cfg.dataset.src_data, resolve=True)
+    data_cfg = DataConfig(**_filter_dataclass_kwargs(DataConfig, data_values))
+
+    # The multi-view dataset config (dataset/canonical_3d_front_multiview.yaml) carries
+    # the MV model overrides (prefix_len=322, mv_voxel_encoder=True, mv_num_*_queries,
+    # ...) under cfg.dataset.model. Merge them over cfg.model so the MV encoder is
+    # actually constructed (cfg.model alone holds only single-view defaults).
+    model_values = OmegaConf.to_container(cfg.model, resolve=True)
+    ds_model = OmegaConf.select(cfg, "dataset.model")
+    if ds_model is not None:
+        model_values.update(OmegaConf.to_container(ds_model, resolve=True))
+    model_cfg = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+
+    cond_encoder_img = (
+        get_image_condition_encoder(model_cfg) if model_cfg.img_cond else None
+    )
+    cond_encoder = (
+        get_condition_encoder(
+            model_cfg.local_cond_path, model_cfg, cond_encoder_img=cond_encoder_img
+        )
+        if model_cfg.cond
+        else None
+    )
+    pi3x_enc = get_pi3x_encoder(model_cfg) if model_cfg.use_pi3x else None
+    model = get_model(
+        model_cfg.local_path,
+        model_cfg,
+        cond_encoder=cond_encoder,
+        cond_encoder_img=cond_encoder_img,
+        pi3x_encoder=pi3x_enc,
+    )
+    return model, model_cfg, data_cfg
+
+
+def prepare_mv_test_set(data_cfg):
+    """Load the multi-view dataset's evaluation split with the MV transform applied.
+
+    The 3d-front-multiview dataset is a save_to_disk DatasetDict whose only split
+    is `validation`; get_mesh_dataset's train/val/test logic does not handle it, so
+    we load and wrap the split directly here.
+    """
+    from pathlib import Path
+    from transformers import AutoImageProcessor
+    from src.data.mesh import transform_3d_front_multiview
+
+    path = Path(data_cfg.path).absolute().as_posix()
+    try:
+        data = datasets.load_from_disk(path)
+    except Exception:
+        data = datasets.load_dataset(path)
+    if isinstance(data, datasets.Dataset):
+        split_ds = data
+    else:
+        split = next(
+            s for s in ("validation", "val", "test") if s in data
+        )
+        split_ds = data[split]
+
+    image_preprocessor = AutoImageProcessor.from_pretrained(
+        data_cfg.image_preprocessor, size_divisor=data_cfg.image_size_divisor
+    )
+    split_ds = split_ds.with_transform(
+        partial(
+            transform_3d_front_multiview,
+            is_train=False,
+            data_cfg=data_cfg,
+            image_preprocessor=image_preprocessor,
+        )
+    )
+    return split_ds
+
+
+def build_mv_uid_to_model_id(data_cfg):
+    """Map MV row uid -> 3D-FUTURE model_id (objects.model_ids[0]) for eval GT lookup."""
+    from pathlib import Path
+
+    path = Path(data_cfg.path).absolute().as_posix()
+    try:
+        data = datasets.load_from_disk(path)
+    except Exception:
+        data = datasets.load_dataset(path)
+    if not isinstance(data, datasets.Dataset):
+        split = next(s for s in ("validation", "val", "test") if s in data)
+        data = data[split]
+    mapping = {}
+    cols = data.remove_columns(
+        [c for c in data.column_names if c not in ("uid", "objects")]
+    )
+    for row in cols:
+        mids = row["objects"].get("model_ids") if row.get("objects") else None
+        if mids:
+            mapping[row["uid"]] = mids[0]
+    return mapping

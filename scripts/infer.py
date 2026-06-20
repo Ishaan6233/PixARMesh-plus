@@ -14,6 +14,8 @@ from pathlib import Path
 from transformers import set_seed, AutoImageProcessor
 from src.utils.inference import (
     prepare_model_for_inference,
+    prepare_mv_model_for_inference,
+    prepare_mv_test_set,
     get_prefix_allowed_tokens_fn_edgerunner,
     decode_mesh_edgerunner,
     decode_bpt,
@@ -22,6 +24,120 @@ from src.utils.inference import (
 )
 from src.data.collator import get_mesh_data_collator
 from src.data import utils as data_utils, tokenize_bpt
+
+
+def run_multiview_inference(args):
+    """Multi-view EdgeRunner inference: build the conditioning prefix via the model's
+    get_mv_inputs_with_cond (Pi3X -> instance discovery -> MV voxel encoder), then
+    autoregressively decode the mesh. Writes <uid>.ply to the output dir."""
+    state = PartialState()
+    device = state.device
+    set_seed(args.seed)
+
+    model, model_cfg, data_cfg = prepare_mv_model_for_inference(
+        checkpoint=args.checkpoint, config_name=args.mv_config
+    )
+    model.to(device)
+    model.eval()
+
+    out_dir = Path(args.output_dir) / "obj" / "edgerunner" / "mv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    test_set = prepare_mv_test_set(data_cfg)
+    n_total = len(test_set)
+    if args.limit is not None:
+        n_total = min(n_total, args.limit)
+    indices = list(range(n_total))
+    shard = indices[state.process_index :: state.num_processes]
+
+    collator = get_mesh_data_collator(data_cfg, model_cfg)
+    prefix_len = collator.prefix_len
+    pc_token_id = collator.pc_token_id
+    bos_token_id = collator.bos_token_id
+    indicator_token_id = collator.indicator_token_id
+
+    bs = args.batch_size
+    n_iters = (len(shard) + bs - 1) // bs
+
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            for it in tqdm(range(n_iters), position=state.process_index, leave=False):
+                batch_idx = shard[it * bs : (it + 1) * bs]
+                examples = []
+                uids = []
+                for i in batch_idx:
+                    ex = test_set[i]
+                    uid = ex["uid"] if not isinstance(ex["uid"], list) else ex["uid"][0]
+                    if (out_dir / f"{uid}.ply").exists():
+                        continue
+                    examples.append(ex)
+                    uids.append(uid)
+                if not examples:
+                    continue
+
+                batch = collator(examples)
+
+                # Test-3 N-views ablation: restrict to the first K views.
+                if args.num_views is not None and "view_mask" in batch:
+                    vm = batch["view_mask"].clone()
+                    vm[:, args.num_views:] = False
+                    batch["view_mask"] = vm
+
+                # Build prefix-only input_ids: [pc]*prefix_len + [bos] + layout + [indicator]
+                prefix_ids = []
+                for ex in examples:
+                    bboxes = np.array(ex["bboxes"], dtype=np.float32)
+                    obj_index = int(ex["obj_indices"])
+                    layout_seq = collator._tokenize_bbox(bboxes[[obj_index]])
+                    seq = (
+                        [pc_token_id] * prefix_len
+                        + [bos_token_id]
+                        + layout_seq
+                        + [indicator_token_id]
+                    )
+                    prefix_ids.append(seq)
+                input_ids = torch.as_tensor(prefix_ids, dtype=torch.long, device=device)
+
+                def _to(x):
+                    return x.to(device) if torch.is_tensor(x) else x
+
+                inputs_embeds = model.get_mv_inputs_with_cond(
+                    input_ids=input_ids,
+                    pixel_values=_to(batch["pixel_values"]),
+                    scene_transforms=_to(batch["scene_transforms"]),
+                    K_per_view=_to(batch["K_per_view"]),
+                    view_mask=_to(batch["view_mask"]),
+                    panoptic_masks=_to(batch.get("panoptic_masks")),
+                    cond_pcs=_to(batch["cond_pcs"]),
+                    cond_pcs_2d=_to(batch["cond_pcs_2d"]),
+                    cond_num_faces=None,
+                )
+
+                max_new_tokens = min(
+                    collator.max_seq_length - inputs_embeds.shape[1], 40960
+                )
+                results = model.generate(
+                    inputs_embeds=inputs_embeds,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=True,
+                    do_sample=False,
+                    prefix_allowed_tokens_fn=get_prefix_allowed_tokens_fn_edgerunner(
+                        model, batch_size=len(examples)
+                    ),
+                )
+                results = results.cpu().numpy()
+                for uid, tokens in zip(uids, results):
+                    tokens = tokens[tokens != collator.pad_token_id]
+                    eos_idx = (tokens == model.config.eos_token_id).nonzero()[0]
+                    if len(eos_idx) > 0:
+                        tokens = tokens[: eos_idx[0]]
+                    try:
+                        mesh = decode_mesh_edgerunner(
+                            tokens, collator.tokenizer, clean=True, verbose=False
+                        )
+                        mesh.export(out_dir / f"{uid}.ply")
+                    except Exception as e:
+                        print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
 
 
 def main():
@@ -100,7 +216,54 @@ def main():
         help="Image preprocessor matching the encoder "
              "(e.g. facebook/dpt-dinov2-small-nyu for small).",
     )
+    parser.add_argument(
+        "--mv",
+        action="store_true",
+        help="Multi-view EdgeRunner inference (datasets/3d-front-multiview).",
+    )
+    parser.add_argument(
+        "--mv-config",
+        type=str,
+        default="edgerunner_3d_front_multiview",
+        help="Hydra config name for the multi-view model/data.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap number of objects (smoke tests).",
+    )
+    parser.add_argument(
+        "--gt-cond",
+        action="store_true",
+        help="Test-1 headroom: condition on a dense GT-mesh object PC (placed into "
+             "the conditioning frame via the object's transform) instead of the depth "
+             "point cloud. Isolates whether the frozen decoder can exploit complete "
+             "geometry.",
+    )
+    parser.add_argument(
+        "--drop-image",
+        action="store_true",
+        help="Geometry-only conditioning: pass pixel_values=None (no image features).",
+    )
+    parser.add_argument(
+        "--num-dense",
+        type=int,
+        default=8192,
+        help="Points sampled from the GT mesh for --gt-cond.",
+    )
+    parser.add_argument(
+        "--num-views",
+        type=int,
+        default=None,
+        help="Test-3 N-views ablation (MV path): restrict each object to the first K "
+             "views (view_mask[:, K:]=False) so discovery+conditioning use K views.",
+    )
     args = parser.parse_args()
+
+    if args.mv:
+        run_multiview_inference(args)
+        return
 
     is_bpt = args.model_type == "bpt"
 
@@ -155,6 +318,8 @@ def main():
         )
 
     sharded_data = test_set.shard(state.num_processes, state.process_index)
+    if args.limit is not None:
+        sharded_data = sharded_data.select(range(min(args.limit, len(sharded_data))))
 
     collator = get_mesh_data_collator(data_cfg, model_cfg)
     cond_prefix = [collator.pc_token_id] * collator.prefix_len
@@ -183,7 +348,7 @@ def main():
 
                 gt_pose_seqs = []
 
-                for uid, pcds, pcds_2d, bboxes, mask, transform, image in zip(
+                for uid, pcds, pcds_2d, bboxes, mask, transform, image, model_id in zip(
                     item["uid"],
                     all_pcds,
                     all_pcds_2d,
@@ -191,6 +356,7 @@ def main():
                     item["mask"],
                     item["transform"],
                     item["image"],
+                    item["model_id"],
                 ):
                     if (out_dir / f"{uid}.ply").exists():
                         continue
@@ -202,6 +368,33 @@ def main():
                     bboxes = np.array(bboxes, dtype=np.float32)
                     obj_pcd_in_global = pcds[mask]
                     obj_pcd_2d = pcds_2d[mask]
+
+                    if args.gt_cond:
+                        # Test-1 headroom: replace the depth object PC with a dense
+                        # GT-mesh sample placed into the conditioning frame via the
+                        # object's transform (canonical -> global/cond frame).
+                        import open3d as _o3d
+
+                        _gt = _o3d.io.read_triangle_mesh(
+                            f"datasets/3D-FUTURE-model-ply/{model_id}.ply"
+                        )
+                        _gp = np.asarray(
+                            _gt.sample_points_uniformly(args.num_dense).points,
+                            dtype=np.float32,
+                        )
+                        _gph = np.concatenate(
+                            [_gp, np.ones((len(_gp), 1), dtype=np.float32)], axis=1
+                        )
+                        _gt_global = (_gph @ np.asarray(transform, np.float32).T)[:, :3]
+                        if state.is_main_process and len(sampled_pcds) == 0:
+                            print(
+                                f"[gt-cond frame check {uid}] "
+                                f"depth bbox {obj_pcd_in_global.min(0)}..{obj_pcd_in_global.max(0)} | "
+                                f"gt bbox {_gt_global.min(0)}..{_gt_global.max(0)}",
+                                flush=True,
+                            )
+                        obj_pcd_in_global = _gt_global.astype(np.float32)
+                        obj_pcd_2d = np.zeros((len(_gt_global), 2), dtype=np.float32)
                     sampled_pcd, sample_inds = data_utils.random_sample_point_clouds(
                         obj_pcd_in_global,
                         data_cfg.num_points,
@@ -261,9 +454,12 @@ def main():
 
                 gt_pose_seqs = np.array(gt_pose_seqs)
 
-                cond_images = image_preprocessor(images, return_tensors="pt")[
-                    "pixel_values"
-                ].to(device)
+                if args.drop_image:
+                    cond_images = None
+                else:
+                    cond_images = image_preprocessor(images, return_tensors="pt")[
+                        "pixel_values"
+                    ].to(device)
                 bs = all_input_ids.shape[0]
 
                 if not use_gt_layout:
