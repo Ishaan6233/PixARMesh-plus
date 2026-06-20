@@ -186,3 +186,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Generated experiment figures/outputs (regenerable)
+figures/test*.png
+figures/test*.json
