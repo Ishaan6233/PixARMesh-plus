@@ -6,11 +6,13 @@ defaults:
 all:
   name: edgerunner-3d-front-multiview
 
-# Initialize backbone from best single-view Stage-2 checkpoint.
-# mv_voxel_encoder weights are absent in this checkpoint → randomly initialized
-# by get_model() then fixed by _fix_uninit_params().
+# Initialize backbone from the BEST single-view checkpoint (verified CD 4.06 / F 81.0
+# on an 80-object gt-depth eval ≈ the 4.55/80.3 full-set result) — the decoder quality
+# is the ceiling on MV mesh quality, so warm-start from the strongest available SV model.
+# mv_voxel_encoder weights are absent here → randomly initialized by get_model() then
+# fixed by _fix_uninit_params().
 model:
-  local_path: outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260610-155657-small-oldstage1-20260527-cd5p806-f76p349/checkpoints/final
+  local_path: outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260602-135736/checkpoints/final
   mv_mask_seeded_pool: true
   mv_boundary_bias_alpha: 0.0
 
