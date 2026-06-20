@@ -51,7 +51,12 @@ def get_pi3x_encoder(model_cfg: ModelConfig) -> "FrozenGeoEncoder":
     """Build the Pi3X frozen geometry encoder from ModelConfig."""
     from .pi3x_cond import Pi3XFrozenEncoder
     enc = Pi3XFrozenEncoder.from_model_cfg(model_cfg)
-    return enc.to(torch.bfloat16)
+    # Keep Pi3X in fp32: its forward_head deliberately upcasts features to fp32 and
+    # runs the point/conf conv heads under autocast(enabled=False) for numerical
+    # precision. Casting the whole module to bf16 makes those fp32 features meet
+    # bf16 conv weights -> dtype-mismatch crash. The enclosing autocast still runs
+    # the heavy transformer encode/decode in bf16, so fp32 here costs little.
+    return enc
 
 
 def get_model(
@@ -75,6 +80,16 @@ def get_model(
         extra_args["loss_layout_scale"] = model_cfg.loss_layout_scale
         if model_cfg.sep_token_id is not None:
             extra_args["sep_token_id"] = model_cfg.sep_token_id
+        # MV voxel encoder fields — override stale values in single-view checkpoints
+        # so that from_pretrained() creates mv_voxel_encoder when mv_voxel_encoder=True.
+        _mv_fields = [
+            "mv_voxel_encoder", "mv_num_obj_voxels", "mv_num_ctx_voxels",
+            "mv_voxel_dim", "mv_num_obj_queries", "mv_num_scene_queries",
+            "mv_num_heads", "mv_mask_seeded_pool", "mv_boundary_bias_alpha",
+        ]
+        for _f in _mv_fields:
+            if hasattr(model_cfg, _f):
+                extra_args[_f] = getattr(model_cfg, _f)
         model_type = model_cfg.ar_model_type
     else:
         model_type = "meshxl"
@@ -95,6 +110,14 @@ def get_model(
             raise ValueError(f"Unknown model type: {model_type}")
 
     config = config_class.from_pretrained(local_model_path, **extra_args)
+    # PretrainedConfig.from_pretrained discards kwargs that are not declared config
+    # attributes (e.g. the mv_* fields on ShapeOPTConfig), so force them onto the
+    # config here. Without this, config.mv_voxel_encoder is absent and ShapeOPT
+    # never builds the multi-view encoder.
+    if model_cfg is not None:
+        for _f in _mv_fields:
+            if _f in extra_args:
+                setattr(config, _f, extra_args[_f])
     # Snapshot the pre-loaded cond_encoder state before from_pretrained, because
     # from_pretrained detects cond_encoder.* as "MISSING" from the main checkpoint
     # and re-initializes them with random weights, discarding the pretrained values.
@@ -143,12 +166,16 @@ def get_model(
                 w_init = torch.empty(w.shape, dtype=torch.float32).normal_(std=0.02)
                 enc.extra_feat_proj.weight.data.copy_(w_init.to(w.dtype))
                 enc.extra_feat_proj.bias.data.zero_()
-    # Attach frozen encoders post-from_pretrained.
-    # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
-    # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
+    model = model.to(torch.bfloat16)
+    # Attach frozen Pi3X AFTER the bf16 cast so it stays fp32: Pi3X.forward_head
+    # upcasts features to fp32 and runs the point/conf conv heads under
+    # autocast(enabled=False); if those conv weights are bf16 they crash on the
+    # fp32 features. Pi3X manages its own internal autocast for the heavy
+    # transformer, so keeping it fp32 here is correct (and was the latent bug that
+    # prevented the multi-view path from ever running). Its state_dict() returns {}
+    # so from_pretrained never saw it as missing keys.
     if pi3x_encoder is not None and hasattr(model, "pi3x_encoder"):
         model.pi3x_encoder = pi3x_encoder
-    model = model.to(torch.bfloat16)
     # Catch NaN/Inf params left by no_init_weights (absent checkpoint keys → garbage memory
     # → bfloat16 NaN).  This covers ctx_aggregator when loading from the original edgerunner
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
