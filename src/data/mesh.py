@@ -575,6 +575,24 @@ def transform_3d_front_multiview(
         wrd2cam_rects_n  = example["wrd2cam_rects"][idx] # list of N (4,4)
         rect_invs_n      = example["rect_invs"][idx]     # list of N (3,3)
         Ks_n             = example["Ks"][idx]            # list of N (3,3)
+
+        # Scenes have variable view counts; fix every object to exactly num_views so
+        # the batch stacks. Truncate to the first num_views, or repeat-pad if fewer
+        # (padded views are flagged via view_valid -> view_mask=False, so the model
+        # and discovery ignore them).
+        _nv = getattr(data_cfg, "num_views", len(images_n)) or len(images_n)
+        _orig = len(images_n)
+        if _orig >= _nv:
+            _vidx = list(range(_nv))
+        else:
+            _vidx = list(range(_orig)) + [_orig - 1] * (_nv - _orig)
+        view_valid = np.array([i < _orig for i in _vidx], dtype=bool)
+        images_n        = [images_n[i] for i in _vidx]
+        depths_n        = [depths_n[i] for i in _vidx]
+        wrd2cam_rects_n = [wrd2cam_rects_n[i] for i in _vidx]
+        rect_invs_n     = [rect_invs_n[i] for i in _vidx]
+        Ks_n            = [Ks_n[i] for i in _vidx]
+        _pan_vidx       = _vidx
         N_views          = len(images_n)
 
         per_view_data = []   # gravity-aligned PCs, pixel data, etc.
@@ -737,7 +755,7 @@ def transform_3d_front_multiview(
 
             result_scene_transforms_all.append(np.stack(scene_transforms_n, axis=0))
             result_K_per_view.append(np.stack(K_per_view_n, axis=0))
-            result_view_masks.append(np.ones(N_views, dtype=bool))
+            result_view_masks.append(view_valid)
 
             # --- cond_pcs from reference view ---
             ref_pcd   = per_view_data[ref_view]["pcd_2d"]    # (H, W, 3) gravity-aligned
@@ -805,6 +823,7 @@ def transform_3d_front_multiview(
                     return (arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]).astype(np.int32)
                 return arr.astype(np.int32)  # already (H, W)
             if isinstance(raw_masks, list):
+                raw_masks = [raw_masks[i] for i in _pan_vidx]  # match the view selection
                 pan_stack = np.stack([_decode_pan(m) for m in raw_masks], axis=0)  # (N, H, W)
             else:
                 pan_stack = np.stack([_decode_pan(raw_masks)] * N_views, axis=0)
@@ -863,12 +882,16 @@ def get_mesh_dataset(data_cfg: DataConfig):
         kwargs["image_preprocessor"] = AutoImageProcessor.from_pretrained(
             data_cfg.image_preprocessor, size_divisor=data_cfg.image_size_divisor
         )
-    train_data = data["train"].with_transform(
+    # Robust split selection: the MV dataset may have only 'train' (val/test built
+    # separately) or use 'validation'. Fall back so train-only datasets still load.
+    avail = set(data.keys())
+    train_key = "train" if "train" in avail else next(iter(avail))
+    val_key = next((k for k in ("val", "validation", "test") if k in avail), train_key)
+    train_data = data[train_key].with_transform(
         partial(mapper, is_train=True, data_cfg=data_cfg, **kwargs)
     )
-    val_key = "val" if "val" in data else "test"
     val_data = data[val_key].with_transform(
         partial(mapper, is_train=False, data_cfg=data_cfg, **kwargs)
     )
-    test_data = data["test"]
+    test_data = data["test"] if "test" in avail else data[val_key]
     return train_data, val_data, test_data

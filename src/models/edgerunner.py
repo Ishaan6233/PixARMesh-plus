@@ -419,7 +419,11 @@ class ShapeOPT(OPTForCausalLM):
              num_face_embeds.to(inputs_embeds.dtype)],
             dim=1,
         ).flatten(0, 1)   # (B*(M+S+1), D)
-        inputs_embeds.masked_scatter_(cond_token_mask.unsqueeze(-1), all_cond)
+        # Out-of-place: when the decoder is frozen (overfit / frozen-decoder regime)
+        # inputs_embeds is a frozen leaf, and in-place masked_scatter_ on it errors.
+        inputs_embeds = inputs_embeds.masked_scatter(
+            cond_token_mask.unsqueeze(-1), all_cond
+        )
         return inputs_embeds
 
     def _forward_multiview(
