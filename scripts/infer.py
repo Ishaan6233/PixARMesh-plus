@@ -253,6 +253,19 @@ def main():
         help="Points sampled from the GT mesh for --gt-cond.",
     )
     parser.add_argument(
+        "--gt-cond-partial",
+        action="store_true",
+        help="De-confounded Test-1: keep only the GT-mesh points within --partial-eps "
+             "of the depth-visible surface (the reference-view front), so partial-vs-"
+             "complete share the GT distribution and differ ONLY in coverage.",
+    )
+    parser.add_argument(
+        "--partial-eps",
+        type=float,
+        default=0.05,
+        help="Distance (normalized cond frame) for --gt-cond-partial visibility.",
+    )
+    parser.add_argument(
         "--num-views",
         type=int,
         default=None,
@@ -375,6 +388,7 @@ def main():
                         # object's transform (canonical -> global/cond frame).
                         import open3d as _o3d
 
+                        _depth_pts = obj_pcd_in_global  # the reference-view visible surface
                         _gt = _o3d.io.read_triangle_mesh(
                             f"datasets/3D-FUTURE-model-ply/{model_id}.ply"
                         )
@@ -386,11 +400,24 @@ def main():
                             [_gp, np.ones((len(_gp), 1), dtype=np.float32)], axis=1
                         )
                         _gt_global = (_gph @ np.asarray(transform, np.float32).T)[:, :3]
+                        _full_n = len(_gt_global)
+                        if args.gt_cond_partial and len(_depth_pts) > 0:
+                            # De-confound: keep only GT points near the depth-visible
+                            # surface → partial vs complete share the GT distribution and
+                            # differ only in COVERAGE (front-only vs all sides).
+                            from scipy.spatial import cKDTree
+
+                            _d, _ = cKDTree(_depth_pts).query(_gt_global)
+                            _keep = _d < args.partial_eps
+                            if _keep.sum() >= 64:
+                                _gt_global = _gt_global[_keep]
                         if state.is_main_process and len(sampled_pcds) == 0:
                             print(
                                 f"[gt-cond frame check {uid}] "
-                                f"depth bbox {obj_pcd_in_global.min(0)}..{obj_pcd_in_global.max(0)} | "
-                                f"gt bbox {_gt_global.min(0)}..{_gt_global.max(0)}",
+                                f"depth bbox {_depth_pts.min(0)}..{_depth_pts.max(0)} | "
+                                f"gt bbox {_gt_global.min(0)}..{_gt_global.max(0)} | "
+                                f"kept {len(_gt_global)}/{_full_n} "
+                                f"({'partial' if args.gt_cond_partial else 'complete'})",
                                 flush=True,
                             )
                         obj_pcd_in_global = _gt_global.astype(np.float32)
