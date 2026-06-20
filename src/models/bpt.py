@@ -13,6 +13,8 @@ from src.data.typing import TokenType
 from .x_transformers_patch import Decoder
 from .cond import MicheProjectorBPT, ContextAggregator
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
+from .mv_voxel_encoder import MultiViewVoxelAlignedEncoder
+from .frozen_geo_encoder import discover_instance_points_mv
 
 
 def exists(v):
@@ -115,7 +117,9 @@ class BPTModel(PreTrainedModel):
         self.block_embed = nn.Parameter(torch.randn(1, config.hidden_size))
         self.offset_embed = nn.Parameter(torch.randn(1, config.hidden_size))
 
-        cross_attn = cond_encoder is not None
+        # Enable cross-attention when EITHER single-view cond_encoder OR mv_voxel_encoder
+        # is requested — so MV checkpoints initialized from single-view have compatible weights.
+        cross_attn = cond_encoder is not None or getattr(config, "mv_voxel_encoder", False)
 
         if cond_encoder is not None:
             self.projector = MicheProjectorBPT(
@@ -126,6 +130,26 @@ class BPTModel(PreTrainedModel):
 
         self.cond_encoder = cond_encoder
         self.cond_encoder_img = cond_encoder_img
+
+        # Frozen geometry encoder — declared so hasattr() is always reliable.
+        # Populated by get_model() after from_pretrained() (same pattern as EdgeRunner).
+        self.pi3x_encoder = None
+
+        # Multi-view voxel encoder: replaces single-view cond_encoder path when
+        # pixel_values.dim() == 5 (N views stacked).
+        self.mv_voxel_encoder = None
+        if getattr(config, "mv_voxel_encoder", False) and cond_encoder_img is not None:
+            img_feat_dim = getattr(cond_encoder_img, "output_feat_dim", 384)
+            self.mv_voxel_encoder = MultiViewVoxelAlignedEncoder(
+                feat_dim          = img_feat_dim,
+                voxel_dim         = getattr(config, "mv_voxel_dim",          512),
+                out_dim           = config.hidden_size,
+                num_obj_queries   = getattr(config, "mv_num_obj_queries",   257),
+                num_scene_queries = getattr(config, "mv_num_scene_queries",  64),
+                num_heads         = getattr(config, "mv_num_heads",           8),
+                use_geometry      = getattr(config, "mv_use_geometry",     True),
+            )
+            self.mv_voxel_encoder.apply(self._init_weights)
 
         attn_dim_head = config.hidden_size // config.num_attention_heads
         flash_attn = config._attn_implementation in (
@@ -187,7 +211,29 @@ class BPTModel(PreTrainedModel):
         ctx_pcs=None,
         ctx_pcs_2d=None,
         pixel_values=None,
+        scene_transforms=None,
+        K_per_view=None,
+        view_mask=None,
+        panoptic_masks=None,
     ):
+        # Multi-view dispatch: pixel_values is (B, N, C, H, W) when N views are stacked
+        if (
+            pixel_values is not None
+            and pixel_values.dim() == 5
+            and self.mv_voxel_encoder is not None
+            and self.pi3x_encoder is not None
+            and scene_transforms is not None
+        ):
+            return self._get_cond_multiview(
+                pixel_values=pixel_values,
+                scene_transforms=scene_transforms,
+                K_per_view=K_per_view,
+                view_mask=view_mask,
+                panoptic_masks=panoptic_masks,
+                cond_pcs=cond_pcs,
+                cond_pcs_2d=cond_pcs_2d,
+            )
+
         extra_feat_mask = None
         sampled_feats = None
         ctx_img_feats = None
@@ -225,6 +271,91 @@ class BPTModel(PreTrainedModel):
             latents = self.ctx_aggregator(latents, ctx_latents)
         cond_embeds = self.projector((shape_embed, latents, _dec_latents))
         return cond_embeds
+
+    def _get_cond_multiview(
+        self,
+        pixel_values,       # (B, N, C, H, W)
+        scene_transforms,   # (B, N, 4, 4)
+        K_per_view,         # (B, N, 3, 3)
+        view_mask,          # (B, N) bool or None
+        panoptic_masks,     # (B, N, H, W) long or None
+        cond_pcs,           # (B, P, 3)  seed object PC in scene space
+        cond_pcs_2d,        # (B, P, 2)  seed pixel coords (ref view)
+    ):
+        device = pixel_values.device
+        B, N, C, H, W = pixel_values.shape
+
+        if view_mask is None:
+            view_mask = torch.ones(B, N, dtype=torch.bool, device=device)
+
+        # Pi3X: all N views in one forward
+        pi3x_out = self.pi3x_encoder.forward_all_views_joint(pixel_values)
+        lp         = pi3x_out["local_points"]   # (B, N, Hp, Wp, 3)
+        pi3x_depth = lp[..., 2]                 # (B, N, Hp, Wp)
+        st  = scene_transforms.to(device, dtype=torch.float32)
+        K_f = K_per_view.float().to(device)
+
+        # Instance discovery
+        mv_num_obj_voxels = getattr(self.config, "mv_num_obj_voxels", 512)
+        mv_num_ctx_voxels = getattr(self.config, "mv_num_ctx_voxels", 1024)
+        seed_pcs = cond_pcs.float() if cond_pcs is not None else torch.zeros(B, 1, 3, device=device)
+
+        if panoptic_masks is not None:
+            obj_voxels, ctx_voxels = discover_instance_points_mv(
+                local_points        = lp,
+                scene_transforms    = st,
+                panoptic_masks      = panoptic_masks.to(device),
+                K_per_view          = K_f,
+                view_mask           = view_mask,
+                seed_pcs            = seed_pcs,
+                num_obj_voxels      = mv_num_obj_voxels,
+                num_ctx_voxels      = mv_num_ctx_voxels,
+                conf                = pi3x_out["conf"],
+                mask_seeded_pool    = getattr(self.config, "mv_mask_seeded_pool",    False),
+                boundary_bias_alpha = getattr(self.config, "mv_boundary_bias_alpha", 0.0),
+            )
+        else:
+            from .frozen_geo_encoder import _apply_scene_transform
+            from .voxelize import fps_centroid_seeded
+            obj_voxels = fps_centroid_seeded(seed_pcs, mv_num_obj_voxels)
+            ctx_list = []
+            for b in range(B):
+                pts_all = []
+                for n in range(N):
+                    if not view_mask[b, n]:
+                        continue
+                    lp_n  = lp[b, n]
+                    valid = lp_n[..., 2] > 0
+                    if valid.any():
+                        pts_s = _apply_scene_transform(
+                            lp_n[valid].float().unsqueeze(0), st[b:b+1, n]
+                        ).squeeze(0)
+                        pts_all.append(pts_s)
+                merged = torch.cat(pts_all, dim=0) if pts_all else seed_pcs[b].float()
+                ctx_list.append(fps_centroid_seeded(merged.unsqueeze(0), mv_num_ctx_voxels).squeeze(0))
+            ctx_voxels = torch.stack(ctx_list, dim=0)
+
+        obj_voxels = obj_voxels.to(lp.dtype)
+        ctx_voxels = ctx_voxels.to(lp.dtype)
+
+        # DINOv2 spatial feature maps for all views
+        pv_flat   = pixel_values.reshape(B * N, C, H, W)
+        dino_flat = self.cond_encoder_img(pixel_values=pv_flat)
+        _, C_d, Hf, Wf = dino_flat.shape
+        dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
+
+        # Multi-view voxel encoder → z_i (M tokens), z_scene (S tokens)
+        mv_out = self.mv_voxel_encoder(
+            obj_voxels, ctx_voxels,
+            dino_feats, None,
+            st, K_f, pi3x_depth, view_mask,
+        )
+        z_i     = mv_out["z_i"]      # (B, M, hidden_size)
+        z_scene = mv_out["z_scene"]  # (B, S, hidden_size)
+
+        # Concatenate → cond_embeds for BPT cross-attention decoder
+        cond_embeds = torch.cat([z_i, z_scene], dim=1)   # (B, M+S, hidden_size)
+        return cond_embeds.to(pixel_values.dtype)
 
     @eval_decorator
     @torch.no_grad()
@@ -325,6 +456,10 @@ class BPTModel(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.Tensor] = None,
         pixel_values=None,
+        scene_transforms=None,
+        K_per_view=None,
+        view_mask=None,
+        panoptic_masks=None,
         cache=None,
         cond_embeds=None,
         **kwargs,
@@ -332,7 +467,9 @@ class BPTModel(PreTrainedModel):
         if position_ids is not None or cache_position is not None:
             raise NotImplementedError
 
-        if cond_embeds is None and self.cond_encoder is not None:
+        if cond_embeds is None and (
+            self.cond_encoder is not None or self.mv_voxel_encoder is not None
+        ):
             cond_embeds = self.get_inputs_with_cond(
                 input_ids=input_ids,
                 cond_pcs=cond_pcs,
@@ -340,6 +477,10 @@ class BPTModel(PreTrainedModel):
                 ctx_pcs=ctx_pcs,
                 ctx_pcs_2d=ctx_pcs_2d,
                 pixel_values=pixel_values,
+                scene_transforms=scene_transforms,
+                K_per_view=K_per_view,
+                view_mask=view_mask,
+                panoptic_masks=panoptic_masks,
             )
 
         logits, (loss, loss_layout, loss_object), intermediates_with_cache = (
