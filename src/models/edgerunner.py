@@ -262,6 +262,9 @@ class ShapeOPT(OPTForCausalLM):
         cond_pcs,               # (B, P, 3)  data-loader seed PC in scene space
         cond_pcs_2d,            # (B, P, 2)  reference-view pixel coords
         cond_num_faces,
+        cached_local_points=None,  # (B, N, H, W, 3) precomputed Pi3X geometry
+        cached_conf=None,          # (B, N, H, W, 1) precomputed Pi3X confidence
+        cached_dino_feats=None,    # (B, N, C_d, H', W') precomputed DINOv2 features
     ):
         """Build the multi-view conditioning prefix embeddings.
 
@@ -270,6 +273,10 @@ class ShapeOPT(OPTForCausalLM):
         Returns inputs_embeds (B, L, D). Shared by the training forward
         (_forward_multiview) and by generation (infer.py passes the result to
         self.generate(inputs_embeds=...)).
+
+        Pi3X and DINOv2 are frozen and depend only on the (un-augmented) images, so
+        their outputs can be precomputed once and passed in via cached_local_points /
+        cached_conf / cached_dino_feats — skipping the two heavy ViT forwards per step.
         """
         B, N, C, H, W = pixel_values.shape
         device = pixel_values.device
@@ -277,9 +284,13 @@ class ShapeOPT(OPTForCausalLM):
         if view_mask is None:
             view_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
-        # --- Pi3X: all N views in one forward ---
-        pi3x_out   = self.pi3x_encoder.forward_all_views_joint(pixel_values)
-        lp         = pi3x_out["local_points"]   # (B, N, H, W, 3) camera frame
+        # --- Pi3X: all N views in one forward (or reuse cached features) ---
+        if cached_local_points is not None:
+            lp = cached_local_points.to(device)
+            pi3x_out = {"conf": cached_conf.to(device) if cached_conf is not None else None}
+        else:
+            pi3x_out = self.pi3x_encoder.forward_all_views_joint(pixel_values)
+            lp = pi3x_out["local_points"]       # (B, N, H, W, 3) camera frame
         pi3x_depth = lp[..., 2]                 # (B, N, H, W)
         st         = scene_transforms.to(device, dtype=torch.float32)
         K_f        = K_per_view.float().to(device)
@@ -360,13 +371,16 @@ class ShapeOPT(OPTForCausalLM):
         obj_voxels = obj_voxels.to(lp.dtype)
         ctx_voxels = ctx_voxels.to(lp.dtype)
 
-        # --- DINOv2 spatial feature maps ---
-        if self.cond_encoder_img is None:
-            raise RuntimeError("cond_encoder_img is required for multi-view path")
-        pv_flat    = pixel_values.reshape(B * N, C, H, W)
-        dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
-        _, C_d, Hf, Wf = dino_flat.shape
-        dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
+        # --- DINOv2 spatial feature maps (or reuse cached features) ---
+        if cached_dino_feats is not None:
+            dino_feats = cached_dino_feats.to(device)
+        else:
+            if self.cond_encoder_img is None:
+                raise RuntimeError("cond_encoder_img is required for multi-view path")
+            pv_flat    = pixel_values.reshape(B * N, C, H, W)
+            dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
+            _, C_d, Hf, Wf = dino_flat.shape
+            dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
 
         # --- Multi-view voxel encoder → z_i, z_scene (no mask_feats) ---
         # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
@@ -419,6 +433,9 @@ class ShapeOPT(OPTForCausalLM):
         cond_pcs,               # (B, P, 3)
         cond_pcs_2d,            # (B, P, 2)
         cond_num_faces,
+        cached_local_points=None,
+        cached_conf=None,
+        cached_dino_feats=None,
         **decoder_kwargs,
     ):
         inputs_embeds = self.get_mv_inputs_with_cond(
@@ -431,6 +448,9 @@ class ShapeOPT(OPTForCausalLM):
             cond_pcs=cond_pcs,
             cond_pcs_2d=cond_pcs_2d,
             cond_num_faces=cond_num_faces,
+            cached_local_points=cached_local_points,
+            cached_conf=cached_conf,
+            cached_dino_feats=cached_dino_feats,
         )
 
         # --- OPT decoder ---
@@ -515,6 +535,9 @@ class ShapeOPT(OPTForCausalLM):
         K_per_view=None,          # (B, N, 3, 3)
         view_mask=None,           # (B, N) bool
         panoptic_masks=None,      # (B, N, H, W) long — Grounded-SAM instance IDs
+        cached_local_points=None, # precomputed frozen-Pi3X geometry (skips Pi3X forward)
+        cached_conf=None,
+        cached_dino_feats=None,   # precomputed frozen-DINOv2 features (skips DINOv2 forward)
         **kwargs,
     ):
         # Multi-view path: pixel_values is (B, N, C, H, W) when N > 1.
@@ -536,6 +559,9 @@ class ShapeOPT(OPTForCausalLM):
                 cond_pcs=cond_pcs,
                 cond_pcs_2d=cond_pcs_2d,
                 cond_num_faces=cond_num_faces,
+                cached_local_points=cached_local_points,
+                cached_conf=cached_conf,
+                cached_dino_feats=cached_dino_feats,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 past_key_values=past_key_values,

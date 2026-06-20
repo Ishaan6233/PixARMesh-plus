@@ -381,6 +381,17 @@ class Front3DCollator(BaseCollator):
                 ret["panoptic_masks"] = torch.as_tensor(
                     np.array([ex["panoptic_masks"] for ex in examples]), dtype=torch.long
                 )  # (B, N, H, W)
+        # Precomputed frozen Pi3X + DINOv2 features (skip the ViT forwards at train time)
+        if "cached_local_points" in examples[0]:
+            ret["cached_local_points"] = torch.as_tensor(
+                np.array([ex["cached_local_points"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, H, W, 3)
+            ret["cached_conf"] = torch.as_tensor(
+                np.array([ex["cached_conf"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, H, W, 1)
+            ret["cached_dino_feats"] = torch.as_tensor(
+                np.array([ex["cached_dino_feats"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, C_d, H', W')
         return ret
 
 

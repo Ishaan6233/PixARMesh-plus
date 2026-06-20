@@ -43,6 +43,9 @@ class DataConfig:
     num_ctx_points: int = 0
     # Test-2 overfit: train+eval on the first N examples only (0 = full dataset).
     overfit_n: int = 0
+    # Multi-view frozen-feature cache dir (Pi3X local_points/conf + DINOv2 feats,
+    # precomputed by scripts/data/precompute_mv_features.py). "" = compute live.
+    mv_feature_cache: str = ""
     # Ablations
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False

@@ -190,3 +190,7 @@ cython_debug/
 # Generated experiment figures/outputs (regenerable)
 figures/test*.png
 figures/test*.json
+
+# Generated MV feature cache + built dataset (regenerable)
+datasets/mv-feature-cache/
+datasets/3d-front-multiview-full/

@@ -828,6 +828,19 @@ def transform_3d_front_multiview(
         ret["pixel_values"] = result_pixel_values   # list of (N, C, H, W) tensors
     if result_panoptic_masks:
         ret["panoptic_masks"] = result_panoptic_masks  # list of (N, H, W) int32
+
+    # --- Precomputed frozen Pi3X + DINOv2 features (skip the heavy ViT forwards) ---
+    cache_dir = getattr(data_cfg, "mv_feature_cache", "")
+    if cache_dir:
+        lp_l, cf_l, df_l = [], [], []
+        for _uid in example["uid"]:
+            _z = np.load(os.path.join(cache_dir, f"{_uid}.npz"))
+            lp_l.append(_z["local_points"].astype(np.float32))
+            cf_l.append(_z["conf"].astype(np.float32))
+            df_l.append(_z["dino_feats"].astype(np.float32))
+        ret["cached_local_points"] = lp_l   # list of (N, H, W, 3)
+        ret["cached_conf"]         = cf_l   # list of (N, H, W, 1)
+        ret["cached_dino_feats"]   = df_l   # list of (N, C_d, H', W')
     return ret
 
 
