@@ -50,6 +50,13 @@ def _build_data_config(cfg):
 
 def _build_model_config(cfg):
     model_values = _to_container(cfg.model)
+    # The multi-view dataset config (dataset/canonical_3d_front_multiview.yaml) carries
+    # the MV model overrides (prefix_len=322, mv_voxel_encoder=True, mv_num_*_queries...)
+    # under cfg.dataset.model. Merge them over cfg.model, otherwise training silently
+    # builds a single-view model (the MV encoder is never created).
+    ds_model = OmegaConf.select(cfg, "dataset.model")
+    if ds_model is not None:
+        model_values.update(_to_container(ds_model))
     return ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
 
 
@@ -114,7 +121,22 @@ def main(cfg):
             cond_encoder_img=cond_encoder_img,
             pi3x_encoder=pi3x_enc,
         )
+        if getattr(model_cfg, "freeze_decoder", False):
+            # Test-2 / frozen-decoder regime: train ONLY the mv_voxel_encoder.
+            n_train = 0
+            for name, p in model.named_parameters():
+                p.requires_grad_("mv_voxel_encoder" in name)
+                n_train += p.requires_grad
+            logger.info(
+                f"freeze_decoder=True: {n_train} mv_voxel_encoder tensors trainable, "
+                "rest frozen."
+            )
         train_set, val_set, _ = get_mesh_dataset(data_cfg)
+        if getattr(data_cfg, "overfit_n", 0):
+            # Test-2: overfit a tiny fixed subset; eval on the same objects.
+            train_set = train_set.select(range(data_cfg.overfit_n))
+            val_set = train_set
+            logger.info(f"overfit_n={data_cfg.overfit_n}: training on {len(train_set)} objects")
 
     sig_cb = SaveAndStopOnSignalCallback()
     trainer = CustomSFTTrainer(
