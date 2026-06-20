@@ -27,3 +27,8 @@ train:
     learning_rate: 5.0e-5
     bf16: true
     resume_from_checkpoint: false
+    # The MV path uses the mv_voxel_encoder and (with the feature cache) bypasses the
+    # frozen DINOv2/MICHE extractors, so those trainable-but-unused params trip DDP's
+    # reducer on iteration 2 ("parameters that were not used in producing loss").
+    # Required whenever the decoder is unfrozen (full train); harmless otherwise.
+    ddp_find_unused_parameters: true
