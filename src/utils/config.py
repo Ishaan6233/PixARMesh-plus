@@ -41,6 +41,8 @@ class DataConfig:
     image_size_divisor: int = 28
     # Context point clouds
     num_ctx_points: int = 0
+    # Test-2 overfit: train+eval on the first N examples only (0 = full dataset).
+    overfit_n: int = 0
     # Ablations
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False
@@ -67,6 +69,9 @@ class ModelConfig:
     local_cond_path: str = ""
     cond_enc_type: str = "miche"
     freeze_cond_encoder: bool = True
+    # Test-2 overfit / frozen-decoder regime: train ONLY the mv_voxel_encoder, freeze
+    # everything else (OPT decoder, lm_head, MICHE cond_encoder, embeddings).
+    freeze_decoder: bool = False
     ar_model_type: str = "meshxl"
     tokenization_method: str = "meshxl"
     max_seq_length: int = 8192
@@ -96,3 +101,5 @@ class ModelConfig:
     mv_num_obj_queries: int = 257
     mv_num_scene_queries: int = 64
     mv_num_heads: int = 8
+    mv_mask_seeded_pool: bool = False
+    mv_boundary_bias_alpha: float = 0.0

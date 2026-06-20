@@ -550,6 +550,7 @@ def discover_instance_points_mv(
     boundary_bias_alpha: float = 0.0,
     return_diagnostics: bool = False,
     return_pool_diagnostics: bool = False,
+    return_target_ids: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """Grounded-SAM direct-mask instance discovery with adaptive voxelization.
 
@@ -598,6 +599,7 @@ def discover_instance_points_mv(
 
     obj_list: list[torch.Tensor] = []
     ctx_list: list[torch.Tensor] = []
+    target_ids_list: list[torch.Tensor] = []
     diag_pool_hit_rate: list[float] = []
     diag_n_obj_raw: list[int] = []
     diag_pool_pts: list[torch.Tensor] = []
@@ -631,6 +633,7 @@ def discover_instance_points_mv(
         if len(pts_scene_list) == 0:
             obj_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_obj_voxels).squeeze(0))
             ctx_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_ctx_voxels).squeeze(0))
+            target_ids_list.append(torch.full((N,), -1, dtype=torch.long, device=device))
             diag_pool_hit_rate.append(0.0)
             diag_n_obj_raw.append(0)
             if return_pool_diagnostics:
@@ -651,6 +654,7 @@ def discover_instance_points_mv(
             seed_b, st_b, K_b, pm_b, lp_z, vm_b, depth_rtol
         ) if seed_b.shape[0] > 0 else torch.full((N,), -1, dtype=torch.long, device=device)
         # target_ids_n: (N,) long, -1 = no valid seed visible in this view
+        target_ids_list.append(target_ids_n)
 
         # --- 2a. Pool construction ---
         if mask_seeded_pool:
@@ -797,11 +801,16 @@ def discover_instance_points_mv(
 
     obj_t = torch.stack(obj_list, dim=0).to(out_dtype)
     ctx_t = torch.stack(ctx_list, dim=0).to(out_dtype)
+    target_ids_t = torch.stack(target_ids_list, dim=0) if return_target_ids else None  # (B, N) long
     if return_diagnostics:
         diag: dict = {"pool_hit_rate": diag_pool_hit_rate, "n_obj_pts_raw": diag_n_obj_raw}
         if return_pool_diagnostics:
             diag["pool_pts"]        = diag_pool_pts         # list of (pool_size_b, 3) cpu tensors
             diag["pool_hit_strict"] = diag_pool_hit_strict  # list of (pool_size_b,) bool tensors
             diag["pool_hit_2d"]     = diag_pool_hit_2d      # list of (pool_size_b,) bool tensors
+        if return_target_ids:
+            return obj_t, ctx_t, diag, target_ids_t
         return obj_t, ctx_t, diag
+    if return_target_ids:
+        return obj_t, ctx_t, target_ids_t
     return obj_t, ctx_t

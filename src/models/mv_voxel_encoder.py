@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .frozen_geo_encoder import _apply_scene_transform, fps_centroid_seeded
+from .pc_edgerunner.encoder import PointEmbed
 
 
 # ---------------------------------------------------------------------------
@@ -106,44 +107,83 @@ def _sample_features(
 
 
 def _compute_visibility_mask(
-    voxels_cam: torch.Tensor,   # (B, V, N, 3) camera-frame xyz
-    pi3x_depth: torch.Tensor,   # (B, N, H, W)
-    pix_coords: torch.Tensor,   # (B, V, N, 2)
-    view_mask: torch.Tensor,    # (B, N) bool
+    voxels_cam: torch.Tensor,            # (B, V, N, 3) camera-frame xyz
+    pi3x_depth: torch.Tensor,            # (B, N, H, W)
+    pix_coords: torch.Tensor,            # (B, V, N, 2)
+    view_mask: torch.Tensor,             # (B, N) bool
     depth_rtol: float = 0.05,
-) -> torch.Tensor:              # (B, V, N) bool
+    panoptic_masks: torch.Tensor | None = None,  # (B, N, Hp, Wp) long instance IDs
+    target_ids: torch.Tensor | None = None,      # (B, N) long per-view target instance ID
+    geometry_only: bool = False,
+) -> torch.Tensor:                       # (B, V, N) bool
+    """Per-voxel-per-view visibility.
+
+    Three modes (in priority order):
+      1. Mask consensus (panoptic_masks + target_ids given) — a voxel sees view n iff
+         it projects into the target instance's segmentation mask there. This is the
+         Experiment-3 mechanism; it replaces the Pi3X depth occlusion gate, which is
+         unreliable because Pi3X depth is not metrically consistent across wide-baseline
+         views (8-13% systematic error). Used for object voxels.
+      2. Geometry-only (geometry_only=True) — z>0 + valid Pi3X depth at the pixel, no
+         occlusion gate. Used for context voxels (no single target instance).
+      3. Soft depth occlusion gate (default) — backward-compatible behaviour.
+    """
     B, V, N, _ = voxels_cam.shape
     H, W = pi3x_depth.shape[-2:]
 
     # Test 1: positive z in camera frame (point is in front of camera)
     z_ok = voxels_cam[..., 2] > 0   # (B, V, N)
+    vm   = view_mask[:, None, :].expand(B, V, N)   # (B, V, N)
+    c_flat = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
+
+    if panoptic_masks is not None and target_ids is not None:
+        # Mask consensus: trust the segmentation mask, not the depth check.
+        Hp, Wp = panoptic_masks.shape[-2:]
+        p_flat = panoptic_masks.float().reshape(B * N, 1, Hp, Wp)
+        ids = F.grid_sample(p_flat, c_flat, mode="nearest",
+                            padding_mode="zeros", align_corners=False)
+        ids = ids.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1).round().long()  # (B, V, N)
+        tgt = target_ids[:, None, :].expand(B, V, N)
+        mask_ok = (ids == tgt) & (tgt > 0)   # out-of-frame → 0 → no match
+        return z_ok & mask_ok & vm
 
     # Sample Pi3X predicted depth at projected pixel locations
     d_flat = pi3x_depth.float().reshape(B * N, 1, H, W)
-    c_flat = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
     pi3x_d = F.grid_sample(d_flat, c_flat, mode="bilinear",
                             padding_mode="zeros", align_corners=False)
     pi3x_d = pi3x_d.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1)  # (B, V, N)
 
-    # Test 2: voxel depth ≤ Pi3X depth × (1 + rtol)  (soft occlusion test)
-    depth_ok = voxels_cam[..., 2] <= pi3x_d * (1.0 + depth_rtol)
-
-    # Test 3: Pi3X returned valid depth at this pixel (depth > 0)
+    # Pi3X returned valid depth at this pixel (depth > 0) → proxy for in-frame surface
     in_bounds = pi3x_d > 0
 
-    vm = view_mask[:, None, :].expand(B, V, N)   # (B, V, N)
+    if geometry_only:
+        return z_ok & in_bounds & vm
+
+    # Default: soft depth occlusion test (voxel depth ≤ Pi3X depth × (1 + rtol))
+    depth_ok = voxels_cam[..., 2] <= pi3x_d * (1.0 + depth_rtol)
     return z_ok & depth_ok & in_bounds & vm
 
 
 def _ibr_fusion(
-    per_view_feats: torch.Tensor,   # (B, V, N, C)
-    vis_mask: torch.Tensor,         # (B, V, N) bool
-) -> torch.Tensor:                  # (B, V, 2C)
-    """IBRNet-style mean + variance fusion across visible views."""
-    m   = vis_mask.unsqueeze(-1).float()
-    n_v = m.sum(dim=2).clamp(min=1.0)
-    mu  = (per_view_feats * m).sum(dim=2) / n_v           # (B, V, C)
-    mu2 = ((per_view_feats ** 2) * m).sum(dim=2) / n_v
+    per_view_feats: torch.Tensor,        # (B, V, N, C)
+    vis_mask: torch.Tensor,              # (B, V, N) bool
+    weights: torch.Tensor | None = None,  # (B, V, N) per-view confidence weights in [0, ∞)
+) -> torch.Tensor:                       # (B, V, 2C)
+    """IBRNet-style weighted mean + variance fusion across visible views.
+
+    When ``weights`` (e.g. Pi3X per-view confidence) is given, the fusion becomes a
+    confidence-weighted mean/variance — realising the "weighted residual (μ, σ²)" of
+    the architecture and down-weighting the systematically-inconsistent wide-baseline
+    views (Experiment 2: 8-13% depth error).
+    """
+    m = vis_mask.unsqueeze(-1).float()
+    if weights is not None:
+        m = m * weights.unsqueeze(-1).clamp(min=0.0)
+        denom = m.sum(dim=2).clamp(min=1e-6)
+    else:
+        denom = m.sum(dim=2).clamp(min=1.0)
+    mu  = (per_view_feats * m).sum(dim=2) / denom         # (B, V, C)
+    mu2 = ((per_view_feats ** 2) * m).sum(dim=2) / denom
     var = (mu2 - mu ** 2).clamp(min=0.0)
     return torch.cat([mu, var], dim=-1)                   # (B, V, 2C)
 
@@ -254,6 +294,7 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         num_obj_queries: int,
         num_scene_queries: int,
         num_heads: int,
+        use_geometry: bool = True,
     ):
         super().__init__()
         self.voxel_dim = voxel_dim
@@ -261,6 +302,14 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
 
         # IBRNet fusion: 2 * feat_dim → voxel_dim
         self.fusion_proj = nn.Linear(2 * feat_dim, voxel_dim)
+
+        # Explicit geometry stream: Fourier (PointEmbed) embedding of voxel XYZ, added as
+        # a residual to the DINO-fused voxel feature. Without this the query pooling is
+        # position-blind (appearance-only); with it, z_i / z_scene carry "point-cloud cues"
+        # — the geometry-centric conditioning that single-view PixARMesh relies on.
+        # Reuses EdgeRunner's PointEmbed so the geometry featurizer matches single-view.
+        self.use_geometry = use_geometry
+        self.point_embed = PointEmbed(dim=voxel_dim) if use_geometry else None
 
         # Variance-aware deformable offset predictor (zero-init → identity at start)
         self.offset_net = nn.Linear(voxel_dim, 2)
@@ -300,6 +349,10 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         K_per_view: torch.Tensor,          # (B, N, 3, 3)
         pi3x_depth: torch.Tensor,          # (B, N, H_full, W_full)
         view_mask: torch.Tensor,           # (B, N) bool
+        conf: torch.Tensor | None = None,           # (B, N, H_full, W_full) Pi3X confidence
+        panoptic_masks: torch.Tensor | None = None,  # (B, N, Hp, Wp) long
+        target_ids: torch.Tensor | None = None,      # (B, N) long
+        geometry_only: bool = False,
     ) -> torch.Tensor:                     # (B, V, voxel_dim)
         B, V, _ = voxels.shape
         N = scene_transforms.shape[1]
@@ -311,10 +364,23 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
             voxels, scene_transforms, K_per_view, H_full, W_full
         )  # pix_coords: (B, V, N, 2);  voxels_cam: (B, V, N, 3)
 
-        # Per-point-per-view visibility mask
+        # Per-point-per-view visibility mask:
+        #  - object voxels (panoptic + target_ids) → mask consensus (Experiment 3)
+        #  - context voxels (geometry_only)        → z>0 + valid depth, no occlusion gate
         vis_mask = _compute_visibility_mask(
-            voxels_cam, pi3x_depth, pix_coords, view_mask
+            voxels_cam, pi3x_depth, pix_coords, view_mask,
+            panoptic_masks=panoptic_masks, target_ids=target_ids,
+            geometry_only=geometry_only,
         )  # (B, V, N) bool
+
+        # Sample Pi3X confidence at projected coords → per-view fusion weights
+        conf_vox = None
+        if conf is not None:
+            c_flat   = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
+            conf_map = conf.float().reshape(B * N, 1, H_full, W_full)
+            conf_vox = F.grid_sample(conf_map, c_flat, mode="bilinear",
+                                     padding_mode="zeros", align_corners=False)
+            conf_vox = conf_vox.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1)  # (B, V, N)
 
         # Sample dino features; optionally also mask conv features
         dino_sampled = _sample_features(dino_feats, pix_coords)    # (B, V, N, C_d)
@@ -327,11 +393,16 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         else:
             per_view_feats = dino_sampled.to(voxels.dtype)         # (B, V, N, C_d)
 
-        # IBRNet permutation-invariant fusion
-        fused = _ibr_fusion(per_view_feats.float(), vis_mask)      # (B, V, 2*(C_d+C_m))
+        # IBRNet permutation-invariant confidence-weighted fusion
+        fused = _ibr_fusion(per_view_feats.float(), vis_mask, weights=conf_vox)  # (B, V, 2*(C_d+C_m))
         voxel_feats = self.fusion_proj(
             fused.to(next(self.fusion_proj.parameters()).dtype)
         )  # (B, V, D)
+
+        # Inject explicit voxel geometry (point-cloud cue) as a residual, so the
+        # deformable offsets, refinement, and query pooling are all position-aware.
+        if self.point_embed is not None:
+            voxel_feats = voxel_feats + self.point_embed(voxels.to(voxel_feats.dtype))  # (B, V, D)
 
         # Variance-aware deformable offsets
         offsets = torch.tanh(self.offset_net(voxel_feats)) * 0.1   # (B, V, 2)
@@ -376,17 +447,25 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         K_per_view: torch.Tensor,          # (B, N, 3, 3)
         pi3x_depth: torch.Tensor,          # (B, N, H, W)  full-resolution Pi3X depth
         view_mask: torch.Tensor,           # (B, N) bool
+        panoptic_masks: torch.Tensor | None = None,  # (B, N, Hp, Wp) long — enables mask consensus
+        target_ids: torch.Tensor | None = None,      # (B, N) long — per-view target instance ID
+        conf: torch.Tensor | None = None,            # (B, N, H, W) Pi3X confidence — weighted fusion
     ) -> dict:
         B = obj_voxels.shape[0]
 
+        # Object voxels: mask-consensus visibility (Experiment 3) when panoptic + target_ids
+        # are supplied; otherwise the depth-gate fallback inside _process_voxels.
         obj_voxel_feats = self._process_voxels(
             obj_voxels, dino_feats, mask_feats,
             scene_transforms, K_per_view, pi3x_depth, view_mask,
+            conf=conf, panoptic_masks=panoptic_masks, target_ids=target_ids,
         )   # (B, V_obj, D)
 
+        # Context voxels: no single target instance → geometry-only visibility.
         ctx_voxel_feats = self._process_voxels(
             ctx_voxels, dino_feats, mask_feats,
             scene_transforms, K_per_view, pi3x_depth, view_mask,
+            conf=conf, geometry_only=True,
         )   # (B, V_ctx, D)
 
         # Object latents: learnable queries cross-attend to object voxels

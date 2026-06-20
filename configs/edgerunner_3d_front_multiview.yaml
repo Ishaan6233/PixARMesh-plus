@@ -1,0 +1,27 @@
+defaults:
+  - edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x
+  - dataset/canonical_3d_front_multiview
+  - _self_
+
+all:
+  name: edgerunner-3d-front-multiview
+
+# Initialize backbone from best single-view Stage-2 checkpoint.
+# mv_voxel_encoder weights are absent in this checkpoint → randomly initialized
+# by get_model() then fixed by _fix_uninit_params().
+model:
+  local_path: outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260610-155657-small-oldstage1-20260527-cd5p806-f76p349/checkpoints/final
+  mv_mask_seeded_pool: true
+  mv_boundary_bias_alpha: 0.0
+
+train:
+  train_args:
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 4
+    max_steps: 30000
+    save_steps: 3000
+    eval_steps: 3000
+    learning_rate: 5.0e-5
+    bf16: true
+    resume_from_checkpoint: false

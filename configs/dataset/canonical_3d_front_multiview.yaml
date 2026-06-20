@@ -58,4 +58,12 @@ model:
   mv_voxel_dim: 512
   mv_mask_feat_dim: 64
   mv_num_heads: 8
+  # Instance-discovery operating point proven by Experiments 1-5:
+  # mask consensus with 3-view agreement and no depth gate (purity 0.974, hit 0.725).
+  mv_min_views: 3
+  mv_depth_rtol: 100.0
+  # Explicit geometry stream: PointEmbed(voxel xyz) added to the DINO-fused voxel
+  # features so z_i / z_scene carry point-cloud cues (geometry-aware conditioning).
+  # Set false to ablate appearance-only vs geometry+appearance.
+  mv_use_geometry: true
   img_cond: true

@@ -135,6 +135,7 @@ class ShapeOPT(OPTForCausalLM):
                 num_obj_queries   = getattr(config, "mv_num_obj_queries",   257),
                 num_scene_queries = getattr(config, "mv_num_scene_queries",  64),
                 num_heads         = getattr(config, "mv_num_heads",           8),
+                use_geometry      = getattr(config, "mv_use_geometry",     True),
             )
             self.mv_voxel_encoder.apply(self._init_weights)
 
@@ -250,7 +251,7 @@ class ShapeOPT(OPTForCausalLM):
             valid_count = valid_count * view_mask.float()
         return valid_count.argmax(dim=1)   # (B,)
 
-    def _forward_multiview(
+    def get_mv_inputs_with_cond(
         self,
         input_ids,
         pixel_values,           # (B, N, C, H, W)
@@ -261,8 +262,15 @@ class ShapeOPT(OPTForCausalLM):
         cond_pcs,               # (B, P, 3)  data-loader seed PC in scene space
         cond_pcs_2d,            # (B, P, 2)  reference-view pixel coords
         cond_num_faces,
-        **decoder_kwargs,
     ):
+        """Build the multi-view conditioning prefix embeddings.
+
+        Runs Pi3X → instance discovery → MV voxel encoder, then scatters
+        z_i + z_scene + num_face into the pc_token slots of the embedded prefix.
+        Returns inputs_embeds (B, L, D). Shared by the training forward
+        (_forward_multiview) and by generation (infer.py passes the result to
+        self.generate(inputs_embeds=...)).
+        """
         B, N, C, H, W = pixel_values.shape
         device = pixel_values.device
 
@@ -295,22 +303,31 @@ class ShapeOPT(OPTForCausalLM):
                 seed_list.append(pc_b)
             seed_pcs = torch.cat(seed_list, dim=0)   # (B, P, 3)
 
-            obj_voxels, ctx_voxels = discover_instance_points_mv(
-                local_points     = lp,
-                scene_transforms = st,
-                panoptic_masks   = panoptic_masks.to(device),
-                K_per_view       = K_f,
-                view_mask        = view_mask,
-                seed_pcs         = seed_pcs.float(),
-                num_obj_voxels   = mv_num_obj_voxels,
-                num_ctx_voxels   = mv_num_ctx_voxels,
-                conf             = pi3x_out["conf"],
-            )   # (B, V_obj, 3), (B, V_ctx, 3)
+            obj_voxels, ctx_voxels, mv_target_ids = discover_instance_points_mv(
+                local_points        = lp,
+                scene_transforms    = st,
+                panoptic_masks      = panoptic_masks.to(device),
+                K_per_view          = K_f,
+                view_mask           = view_mask,
+                seed_pcs            = seed_pcs.float(),
+                num_obj_voxels      = mv_num_obj_voxels,
+                num_ctx_voxels      = mv_num_ctx_voxels,
+                conf                = pi3x_out["conf"],
+                # Proven operating point (Experiments 1-5): mask consensus with 3-view
+                # agreement and no depth gate. min_views/depth_rtol must be passed
+                # explicitly — the function defaults (2 / 0.10) are the rejected config.
+                depth_rtol          = getattr(self.config, "mv_depth_rtol", 100.0),
+                min_views           = getattr(self.config, "mv_min_views", 3),
+                mask_seeded_pool    = getattr(self.config, "mv_mask_seeded_pool", True),
+                boundary_bias_alpha = getattr(self.config, "mv_boundary_bias_alpha", 0.0),
+                return_target_ids   = True,
+            )   # (B, V_obj, 3), (B, V_ctx, 3), (B, N)
         else:
             # Panoptic masks not available — fall back to FPS of Pi3X geometry
             logger.warning_once(
                 "panoptic_masks not provided; falling back to seed-FPS for obj_voxels."
             )
+            mv_target_ids = None  # no mask consensus possible without panoptic masks
             ref_idx = self._select_ref_view(lp, view_mask)
             seed_list = []
             for b in range(B):
@@ -352,10 +369,17 @@ class ShapeOPT(OPTForCausalLM):
         dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
 
         # --- Multi-view voxel encoder → z_i, z_scene (no mask_feats) ---
+        # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
+        # features by mask consensus (Experiment 3) instead of the Pi3X depth check,
+        # and Pi3X confidence so the IBRNet fusion is confidence-weighted.
+        mv_conf = pi3x_out["conf"][..., 0] if pi3x_out.get("conf") is not None else None
         mv_out  = self.mv_voxel_encoder(
             obj_voxels, ctx_voxels,
             dino_feats, None,                    # mask_feats=None (discovery handles localization)
             st, K_f, pi3x_depth, view_mask,
+            panoptic_masks = panoptic_masks.to(device) if panoptic_masks is not None else None,
+            target_ids     = mv_target_ids,
+            conf           = mv_conf,
         )
         z_i     = mv_out["z_i"]      # (B, M, out_dim)
         z_scene = mv_out["z_scene"]  # (B, S, out_dim)
@@ -382,6 +406,32 @@ class ShapeOPT(OPTForCausalLM):
             dim=1,
         ).flatten(0, 1)   # (B*(M+S+1), D)
         inputs_embeds.masked_scatter_(cond_token_mask.unsqueeze(-1), all_cond)
+        return inputs_embeds
+
+    def _forward_multiview(
+        self,
+        input_ids,
+        pixel_values,           # (B, N, C, H, W)
+        scene_transforms,       # (B, N, 4, 4)
+        K_per_view,             # (B, N, 3, 3)
+        view_mask,              # (B, N) bool
+        panoptic_masks,         # (B, N, H, W) long or None
+        cond_pcs,               # (B, P, 3)
+        cond_pcs_2d,            # (B, P, 2)
+        cond_num_faces,
+        **decoder_kwargs,
+    ):
+        inputs_embeds = self.get_mv_inputs_with_cond(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            scene_transforms=scene_transforms,
+            K_per_view=K_per_view,
+            view_mask=view_mask,
+            panoptic_masks=panoptic_masks,
+            cond_pcs=cond_pcs,
+            cond_pcs_2d=cond_pcs_2d,
+            cond_num_faces=cond_num_faces,
+        )
 
         # --- OPT decoder ---
         output_attentions    = decoder_kwargs.pop("output_attentions",    self.config.output_attentions)
