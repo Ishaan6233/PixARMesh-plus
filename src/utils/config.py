@@ -66,6 +66,8 @@ class ModelConfig:
     cond_enc_type: str = "miche"
     freeze_cond_encoder: bool = True
     ar_model_type: str = "meshxl"
+    attn_implementation: str = "kernels-community/flash-attn2"
+    torch_dtype: str = "bfloat16"
     tokenization_method: str = "meshxl"
     max_seq_length: int = 8192
     max_position_embeddings: int = 8192

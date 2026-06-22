@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,13 +7,28 @@ from einops import rearrange, repeat
 # import kiui
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from kernels import get_kernel
+
+    flash_attn_kernel = get_kernel(
+        os.environ.get("PIXARMESH_FLASH_ATTN_KERNEL", "kernels-community/flash-attn2")
+    )
+    flash_attn_func = flash_attn_kernel.flash_attn_func
+    flash_attn_varlen_func = flash_attn_kernel.flash_attn_varlen_func
 
     FLASH_ATTN_AVAILABLE = True
-except:
-    print("[WARN] flash_attn not available, using naive implementation")
+except Exception as err:
+    print(f"[WARN] flash attention kernel not available, using naive implementation: {err}")
     FLASH_ATTN_AVAILABLE = False
+
+
+def index_first_axis(hidden_states, indices):
+    return hidden_states.index_select(0, indices)
+
+
+def pad_input(hidden_states, indices, batch, seqlen):
+    output = hidden_states.new_zeros(batch * seqlen, *hidden_states.shape[1:])
+    output = output.index_copy(0, indices, hidden_states)
+    return output.reshape(batch, seqlen, *hidden_states.shape[1:])
 
 
 # flashattn 2.7.0 changes unpad_input API... we are overriding it here

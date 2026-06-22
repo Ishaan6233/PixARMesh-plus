@@ -22,6 +22,8 @@ model:
   local_cond_path: ""
   cond_enc_type: ""
   ar_model_type: ""
+  attn_implementation: kernels-community/flash-attn2
+  torch_dtype: bfloat16
   tokenization_method: ""
   max_seq_length: 8192
   max_position_embeddings: ${model.max_seq_length}

@@ -9,6 +9,16 @@ from .cond import ConditionEncoder
 from .img_cond import ImageConditionEncoder, HighResImageConditionEncoder
 
 
+def get_torch_dtype(dtype_name: str):
+    if dtype_name == "auto":
+        return dtype_name
+
+    dtype = getattr(torch, dtype_name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unknown torch dtype: {dtype_name}")
+    return dtype
+
+
 def get_model(
     local_model_path, model_cfg: ModelConfig, cond_encoder=None, cond_encoder_img=None
 ):
@@ -49,8 +59,8 @@ def get_model(
     model = model_class.from_pretrained(
         local_model_path,
         config=config,
-        torch_dtype=torch.float32,
-        attn_implementation="flash_attention_2",
+        torch_dtype=get_torch_dtype(model_cfg.torch_dtype),
+        attn_implementation=model_cfg.attn_implementation,
         cond_encoder=cond_encoder,
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
