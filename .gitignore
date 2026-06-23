@@ -194,3 +194,12 @@ figures/test*.json
 # Generated MV feature cache + built dataset (regenerable)
 datasets/mv-feature-cache/
 datasets/3d-front-multiview-full/
+
+# Pretrained model weights — download separately (see checkpoints/*/README.md).
+# Kept out of git: GitHub forbids LFS uploads to public forks, and these are
+# re-downloadable third-party weights (e.g. Pi3X from yyfz233/Pi3X on HF).
+checkpoints/**/*.safetensors
+checkpoints/**/*.bin
+checkpoints/**/*.ckpt
+checkpoints/**/*.pt
+checkpoints/**/*.pth
