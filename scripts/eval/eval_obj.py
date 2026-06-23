@@ -194,6 +194,8 @@ def main():
         results = []
         all_cds = []
         all_f_scores = []
+        n_total = 0          # objects above the mask threshold (the eval denominator)
+        n_has_pred = 0       # objects that produced a mesh prediction
         for item in subset:
             uid = item["uid"]
             obj_id = item["obj_id"]
@@ -202,20 +204,28 @@ def main():
             mask_area = item["mask_area"]
             if mask_area < args.mask_area_thresh:
                 continue
+            n_total += 1
             with out_json_path.open("r") as f:
                 record = json.load(f)
+            if record.get("has_pred"):
+                n_has_pred += 1
             if record["cd"] is not None:
                 all_cds.append(record["cd"])
                 all_f_scores.append(record["f_score"])
             results.append(record)
 
-        avg_cd = float(np.mean(all_cds))
-        avg_f_scores = float(np.mean(all_f_scores))
+        # Coverage makes silent misses (no PLY / decode failures) visible: a low CD over
+        # 10% of objects is not a real win. Report it alongside CD/F.
+        coverage = n_has_pred / max(n_total, 1)
+        avg_cd = float(np.mean(all_cds)) if all_cds else float("nan")
+        avg_f_scores = float(np.mean(all_f_scores)) if all_f_scores else float("nan")
         results.append(
             {
                 "avg_cd": avg_cd,
                 "avg_f_score": avg_f_scores,
                 "num_evaluated": len(all_cds),
+                "num_total": n_total,
+                "coverage": coverage,
             }
         )
         results_path = save_dir / "eval_obj_results.jsonl"
@@ -224,7 +234,8 @@ def main():
         print(
             f"""
 Evaluation results saved to {results_path}.
-Num valid objects: {len(all_cds)}
+Num valid objects (scored): {len(all_cds)} / {n_total} total
+Coverage (has_pred): {coverage * 100:.1f}%
 Average Chamfer Distance (x10^{-3}): {avg_cd * 1000:.3f}
 Average F-Score (%): {avg_f_scores:.3f}
 """

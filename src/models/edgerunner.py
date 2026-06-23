@@ -265,6 +265,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_local_points=None,  # (B, N, H, W, 3) precomputed Pi3X geometry
         cached_conf=None,          # (B, N, H, W, 1) precomputed Pi3X confidence
         cached_dino_feats=None,    # (B, N, C_d, H', W') precomputed DINOv2 features
+        obj_canon_transform=None,  # (B, 4, 4) scene -> per-object canonical (rotation used)
     ):
         """Build the multi-view conditioning prefix embeddings.
 
@@ -371,6 +372,23 @@ class ShapeOPT(OPTForCausalLM):
         obj_voxels = obj_voxels.to(lp.dtype)
         ctx_voxels = ctx_voxels.to(lp.dtype)
 
+        # --- Canonicalize object voxels for the geometry (PointEmbed) stream ---
+        # obj_voxels are scene-frame (required for view projection + feature sampling),
+        # but the decoder emits vertices in the per-object CANONICAL frame. Rotate by the
+        # data-derived scene->object rotation, then re-center/re-scale by the voxels' OWN
+        # observed extent — this cancels Pi3X's unknown global scale and reproduces
+        # normalize_vertices(bound=0.95) on the observed surface. Only the geometry stream
+        # sees these; projection/feature-sampling keep the scene-frame obj_voxels.
+        obj_geom_voxels = None
+        if obj_canon_transform is not None:
+            R = obj_canon_transform[:, :3, :3].to(device=obj_voxels.device, dtype=obj_voxels.dtype)
+            v = torch.bmm(obj_voxels, R.transpose(1, 2))   # (B, V, 3) rotate about origin
+            vmin = v.amin(dim=1, keepdim=True)
+            vmax = v.amax(dim=1, keepdim=True)
+            center = 0.5 * (vmin + vmax)
+            scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
+            obj_geom_voxels = (v - center) * scale          # (B, V, 3) canonical frame
+
         # --- DINOv2 spatial feature maps (or reuse cached features) ---
         if cached_dino_feats is not None:
             dino_feats = cached_dino_feats.to(device)
@@ -394,6 +412,7 @@ class ShapeOPT(OPTForCausalLM):
             panoptic_masks = panoptic_masks.to(device) if panoptic_masks is not None else None,
             target_ids     = mv_target_ids,
             conf           = mv_conf,
+            obj_geom_voxels = obj_geom_voxels,   # canonical-frame geometry for PointEmbed
         )
         z_i     = mv_out["z_i"]      # (B, M, out_dim)
         z_scene = mv_out["z_scene"]  # (B, S, out_dim)
@@ -440,6 +459,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_local_points=None,
         cached_conf=None,
         cached_dino_feats=None,
+        obj_canon_transform=None,
         **decoder_kwargs,
     ):
         inputs_embeds = self.get_mv_inputs_with_cond(
@@ -455,6 +475,7 @@ class ShapeOPT(OPTForCausalLM):
             cached_local_points=cached_local_points,
             cached_conf=cached_conf,
             cached_dino_feats=cached_dino_feats,
+            obj_canon_transform=obj_canon_transform,
         )
 
         # --- OPT decoder ---
@@ -542,6 +563,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_local_points=None, # precomputed frozen-Pi3X geometry (skips Pi3X forward)
         cached_conf=None,
         cached_dino_feats=None,   # precomputed frozen-DINOv2 features (skips DINOv2 forward)
+        obj_canon_transform=None, # (B, 4, 4) scene -> per-object canonical (geometry frame)
         **kwargs,
     ):
         # Multi-view path: pixel_values is (B, N, C, H, W) when N > 1.
@@ -566,6 +588,7 @@ class ShapeOPT(OPTForCausalLM):
                 cached_local_points=cached_local_points,
                 cached_conf=cached_conf,
                 cached_dino_feats=cached_dino_feats,
+                obj_canon_transform=obj_canon_transform,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 past_key_values=past_key_values,

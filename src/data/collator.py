@@ -377,6 +377,11 @@ class Front3DCollator(BaseCollator):
             ret["view_mask"] = torch.as_tensor(
                 np.array([ex["view_mask"] for ex in examples]), dtype=torch.bool
             )  # (B, N)
+            if "obj_canon_transform" in examples[0]:
+                ret["obj_canon_transform"] = torch.as_tensor(
+                    np.array([ex["obj_canon_transform"] for ex in examples]),
+                    dtype=torch.float32,
+                )  # (B, 4, 4) scene -> per-object canonical frame
             if "panoptic_masks" in examples[0]:
                 ret["panoptic_masks"] = torch.as_tensor(
                     np.array([ex["panoptic_masks"] for ex in examples]), dtype=torch.long

@@ -111,6 +111,7 @@ def run_multiview_inference(args):
                     cond_pcs=_to(batch["cond_pcs"]),
                     cond_pcs_2d=_to(batch["cond_pcs_2d"]),
                     cond_num_faces=None,
+                    obj_canon_transform=_to(batch.get("obj_canon_transform")),
                 )
 
                 max_new_tokens = min(
@@ -138,6 +139,15 @@ def run_multiview_inference(args):
                         mesh.export(out_dir / f"{uid}.ply")
                     except Exception as e:
                         print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
+                        # Write a degenerate placeholder so the miss COUNTS as a bad score
+                        # in eval (has_pred=True) instead of being silently dropped from
+                        # the CD/F mean — keeps coverage honest. See eval_obj.py coverage.
+                        import trimesh as _tm
+                        _tm.Trimesh(
+                            vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]],
+                                              dtype=np.float32),
+                            faces=np.array([[0, 1, 2]]),
+                        ).export(out_dir / f"{uid}.ply")
 
 
 def main():

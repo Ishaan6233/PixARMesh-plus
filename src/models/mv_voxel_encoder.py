@@ -353,7 +353,13 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         panoptic_masks: torch.Tensor | None = None,  # (B, N, Hp, Wp) long
         target_ids: torch.Tensor | None = None,      # (B, N) long
         geometry_only: bool = False,
+        geom_voxels: torch.Tensor | None = None,    # (B, V, 3) frame for the PointEmbed
     ) -> torch.Tensor:                     # (B, V, voxel_dim)
+        # `voxels` are SCENE-frame (used for view projection + feature sampling).
+        # `geom_voxels`, when given, supplies the frame for the geometry PointEmbed
+        # (per-object CANONICAL for object voxels, so it matches the decoder's output
+        # frame + the warm-started PointEmbed's training distribution). Defaults to
+        # `voxels` (scene frame) for context voxels.
         B, V, _ = voxels.shape
         N = scene_transforms.shape[1]
         H_full = pi3x_depth.shape[-2]
@@ -401,8 +407,11 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
 
         # Inject explicit voxel geometry (point-cloud cue) as a residual, so the
         # deformable offsets, refinement, and query pooling are all position-aware.
+        # Geometry uses the canonical frame (geom_voxels) when supplied so the decoder
+        # reads object shape in the SAME frame it must emit vertices in.
         if self.point_embed is not None:
-            voxel_feats = voxel_feats + self.point_embed(voxels.to(voxel_feats.dtype))  # (B, V, D)
+            pe_in = geom_voxels if geom_voxels is not None else voxels
+            voxel_feats = voxel_feats + self.point_embed(pe_in.to(voxel_feats.dtype))  # (B, V, D)
 
         # Variance-aware deformable offsets
         offsets = torch.tanh(self.offset_net(voxel_feats)) * 0.1   # (B, V, 2)
@@ -450,6 +459,7 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         panoptic_masks: torch.Tensor | None = None,  # (B, N, Hp, Wp) long — enables mask consensus
         target_ids: torch.Tensor | None = None,      # (B, N) long — per-view target instance ID
         conf: torch.Tensor | None = None,            # (B, N, H, W) Pi3X confidence — weighted fusion
+        obj_geom_voxels: torch.Tensor | None = None, # (B, V_obj, 3) canonical-frame obj voxels
     ) -> dict:
         B = obj_voxels.shape[0]
 
@@ -459,6 +469,7 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
             obj_voxels, dino_feats, mask_feats,
             scene_transforms, K_per_view, pi3x_depth, view_mask,
             conf=conf, panoptic_masks=panoptic_masks, target_ids=target_ids,
+            geom_voxels=obj_geom_voxels,   # canonical-frame geometry for PointEmbed
         )   # (B, V_obj, D)
 
         # Context voxels: no single target instance → geometry-only visibility.

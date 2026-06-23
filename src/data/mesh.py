@@ -552,6 +552,7 @@ def transform_3d_front_multiview(
     result_K_per_view = []             # per-sample list of (N, 3, 3)
     result_view_masks = []             # per-sample list of (N,)
     result_panoptic_masks = []         # per-sample list of (N, H, W) int32
+    result_obj_canon_transform = []    # per-sample (4, 4) scene -> per-object canonical frame
 
     num_points   = data_cfg.num_points
     with_normals = data_cfg.with_normals
@@ -757,6 +758,30 @@ def transform_3d_front_multiview(
             result_K_per_view.append(np.stack(K_per_view_n, axis=0))
             result_view_masks.append(view_valid)
 
+            # --- scene -> per-object canonical transform (rotation is metric-safe) ---
+            # The decoder emits vertices in the per-object canonical frame
+            # (normalize_vertices above), but obj_voxels live in the scene-normalized
+            # frame. We supply the ORIENTATION mapping scene -> object-local here.
+            #
+            # Frame chain (all anchored at the gravity-aligned world G):
+            #   object --obj_to_cam_ref--> G        (wrd2cam_rect @ transform_obj)
+            #   G       --S-------------->  scene    (S = M_shift @ normalize_matrix @ M_rot_4d)
+            #   scene_transform_n = S @ M_gravity_n  maps camera-raw_n -> scene
+            # Hence  scene -> object-local = inv(obj_to_cam_ref) @ inv(S).
+            #
+            # Only the ROTATION of this is trustworthy: the Pi3X point map (model-side
+            # geometry) and the GT object pose live in inconsistent metric worlds, so
+            # the translation/scale are metric-broken (the earlier "3-8x" failure of a
+            # full inv(obj_to_cam) composition). The model therefore applies just the
+            # rotation R = T[:3,:3] to the observed obj_voxels, then re-centers and
+            # re-scales by the voxels' OWN observed extent (which cancels Pi3X's unknown
+            # global scale) — reproducing normalize_vertices on the observed surface.
+            S = (M_shift @ normalize_matrix @ M_rot_4d).astype(np.float32)
+            scene_to_canon = (
+                np.linalg.inv(all_obj_to_cam_ref[inst_idx]) @ np.linalg.inv(S)
+            ).astype(np.float32)
+            result_obj_canon_transform.append(scene_to_canon)
+
             # --- cond_pcs from reference view ---
             ref_pcd   = per_view_data[ref_view]["pcd_2d"]    # (H, W, 3) gravity-aligned
             ref_valid = per_view_data[ref_view]["valid_mask"]
@@ -843,6 +868,7 @@ def transform_3d_front_multiview(
         ret["scene_transforms"]   = result_scene_transforms_all   # (N, 4, 4) per sample
         ret["K_per_view"]         = result_K_per_view             # (N, 3, 3) per sample
         ret["view_mask"]          = result_view_masks              # (N,) per sample
+        ret["obj_canon_transform"] = result_obj_canon_transform   # (4, 4) scene -> obj canonical
     if load_images:
         ret["pixel_values"] = result_pixel_values   # list of (N, C, H, W) tensors
     if result_panoptic_masks:
