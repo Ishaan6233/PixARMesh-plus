@@ -94,6 +94,7 @@ def get_model(
             "mv_voxel_dim", "mv_num_obj_queries", "mv_num_scene_queries",
             "mv_num_heads", "mv_mask_seeded_pool", "mv_boundary_bias_alpha",
             "mv_obj_pc_cond", "mv_use_voxel_encoder", "mv_obj_pc_appearance",
+            "mv_obj_pc_oracle",
         ]
         for _f in _mv_fields:
             if hasattr(model_cfg, _f):

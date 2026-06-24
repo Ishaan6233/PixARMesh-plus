@@ -316,6 +316,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_conf=None,          # (B, N, H, W, 1) precomputed Pi3X confidence
         cached_dino_feats=None,    # (B, N, C_d, H', W') precomputed DINOv2 features
         obj_canon_transform=None,  # (B, 4, 4) scene -> per-object canonical (rotation used)
+        gt_obj_vertices=None,      # (B, V, 3) DEBUG oracle: GT-canonical surface points
     ):
         """Build the multi-view conditioning prefix embeddings.
 
@@ -439,6 +440,16 @@ class ShapeOPT(OPTForCausalLM):
             scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
             obj_geom_voxels = (v - center) * scale          # (B, V, 3) canonical frame
 
+        # --- DEBUG oracle ceiling: bypass the observed self-norm and condition the
+        # geometry stream on GT-canonical surface points (full-extent, leak-by-design).
+        # Bounds whether perfect conditioning beats SV and isolates Finding 2's scale cost.
+        # NOTE: leave mv_obj_pc_appearance OFF under the oracle — the appearance feature is
+        # aligned to the observed obj_voxels, not these GT points.
+        if getattr(self.config, "mv_obj_pc_oracle", False) and gt_obj_vertices is not None:
+            obj_geom_voxels = gt_obj_vertices.to(
+                device=obj_voxels.device, dtype=obj_voxels.dtype
+            )
+
         # --- DINOv2 features (shared by the obj-PC appearance term + voxel encoder) ---
         # Computed once when either consumer needs it; frozen + depends only on the
         # un-augmented images, so the cache path is numerically identical.
@@ -552,6 +563,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_conf=None,
         cached_dino_feats=None,
         obj_canon_transform=None,
+        gt_obj_vertices=None,
         **decoder_kwargs,
     ):
         inputs_embeds = self.get_mv_inputs_with_cond(
@@ -568,6 +580,7 @@ class ShapeOPT(OPTForCausalLM):
             cached_conf=cached_conf,
             cached_dino_feats=cached_dino_feats,
             obj_canon_transform=obj_canon_transform,
+            gt_obj_vertices=gt_obj_vertices,
         )
 
         # --- OPT decoder ---
@@ -656,6 +669,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_conf=None,
         cached_dino_feats=None,   # precomputed frozen-DINOv2 features (skips DINOv2 forward)
         obj_canon_transform=None, # (B, 4, 4) scene -> per-object canonical (geometry frame)
+        gt_obj_vertices=None,     # (B, V, 3) DEBUG oracle: GT-canonical surface points
         **kwargs,
     ):
         # Multi-view path: pixel_values is (B, N, C, H, W) when N > 1.
@@ -681,6 +695,7 @@ class ShapeOPT(OPTForCausalLM):
                 cached_conf=cached_conf,
                 cached_dino_feats=cached_dino_feats,
                 obj_canon_transform=obj_canon_transform,
+                gt_obj_vertices=gt_obj_vertices,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 past_key_values=past_key_values,

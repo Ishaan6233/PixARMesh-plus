@@ -1,0 +1,20 @@
+defaults:
+  - edgerunner_3d_front_multiview_stage1
+  - _self_
+
+# DEBUG-ONLY oracle ceiling (CONTINGENT — run only if the real stage-1 loss_layout gate
+# fails to drop from ~1.78 toward ~0.82). Conditions the obj-PC geometry stream on
+# GT-canonical surface points (full-extent, leak-by-design) instead of the observed,
+# self-normalized Pi3X voxels. Purpose: separate "frame/protocol still wrong" from
+# "Pi3X conditioning content insufficient", and quantify Finding 2's self-norm scale cost
+# (oracle uses the full extent). This is NOT a shippable model — never warm-start a
+# deliverable from it and never set mv_obj_pc_oracle in a stage-2 final config.
+all:
+  name: edgerunner-3d-front-multiview-stage1-oracle
+
+dataset:
+  model:
+    mv_obj_pc_oracle: true
+    # Keep appearance OFF: _fuse_obj_view_features aligns to the observed obj_voxels, not
+    # the GT-canonical oracle points.
+    mv_obj_pc_appearance: false

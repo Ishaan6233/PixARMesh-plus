@@ -122,6 +122,7 @@ def run_multiview_inference(args):
                     cond_pcs_2d=_to(batch["cond_pcs_2d"]),
                     cond_num_faces=None,
                     obj_canon_transform=_to(batch.get("obj_canon_transform")),
+                    gt_obj_vertices=_to(batch.get("gt_obj_vertices")),
                 )
 
                 max_new_tokens = min(

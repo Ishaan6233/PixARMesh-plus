@@ -117,6 +117,11 @@ class ModelConfig:
     # appearance term; this restores it and adds the multi-view texture cue. prefix_len
     # is unchanged (extra_feat is added inside cond_encoder; latent count stays pc_latent_len).
     mv_obj_pc_appearance: bool = False
+    # DEBUG-ONLY oracle ceiling: replace the observed, self-normalized obj_geom_voxels with
+    # FPS-sampled points from the GT canonical mesh (full-extent, leak-by-design). Used to
+    # bound whether ANY conditioning fix can beat SV and to quantify the partial-observation
+    # self-norm scale cost (oracle uses full extent). MUST stay false in any shippable config.
+    mv_obj_pc_oracle: bool = False
 
 
 def mv_prefix_len(model_cfg) -> int:

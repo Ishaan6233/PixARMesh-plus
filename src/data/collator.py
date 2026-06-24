@@ -168,6 +168,9 @@ class Front3DCollator(BaseCollator):
         self.is_bpt = self.tokenization_method == "bpt"
         self.ignore_obj_seq = data_cfg.ignore_obj_seq
         self.ignore_layout_seq = data_cfg.ignore_layout_seq
+        # DEBUG-ONLY oracle ceiling: emit GT-canonical surface points as obj conditioning.
+        self.mv_obj_pc_oracle = getattr(model_cfg, "mv_obj_pc_oracle", False)
+        self.mv_num_obj_voxels = getattr(model_cfg, "mv_num_obj_voxels", 512)
 
     def _tokenize_bbox(self, rect_bboxes):
         quantized_bboxes, sort_inds = quantize_gravity_aligned_bboxes(
@@ -188,6 +191,31 @@ class Front3DCollator(BaseCollator):
         else:
             seq = tris.reshape(-1) + self.pos_token_offset
         return seq.tolist()
+
+    def _sample_canonical_surface(self, vertices, faces, n):
+        """DEBUG oracle: area-weighted uniform surface sampling of the GT canonical mesh
+        (already in normalize_vertices(0.95) frame). Returns (n, 3) float32. Falls back to
+        vertex resampling for missing / non-triangular faces."""
+        v = np.asarray(vertices, dtype=np.float64)
+        f = np.asarray(faces)
+        if v.ndim != 2 or len(v) == 0:
+            return np.zeros((n, 3), dtype=np.float32)
+        if f.ndim == 2 and f.shape[1] == 3 and len(f) > 0:
+            tris = v[f.astype(np.int64)]                       # (F, 3, 3)
+            cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+            areas = 0.5 * np.linalg.norm(cross, axis=1)
+            total = areas.sum()
+            if total > 0:
+                probs = areas / total
+                ti = np.random.choice(len(f), size=n, p=probs)
+                uu = np.random.rand(n, 1)
+                ww = np.random.rand(n, 1)
+                over = (uu + ww) > 1
+                uu[over], ww[over] = 1 - uu[over], 1 - ww[over]
+                a, b, c = tris[ti, 0], tris[ti, 1], tris[ti, 2]
+                return (a + uu * (b - a) + ww * (c - a)).astype(np.float32)
+        idx = np.random.randint(0, len(v), size=n)
+        return v[idx].astype(np.float32)
 
     def __call__(self, examples):
         all_input_ids = []
@@ -386,6 +414,17 @@ class Front3DCollator(BaseCollator):
                 ret["panoptic_masks"] = torch.as_tensor(
                     np.array([ex["panoptic_masks"] for ex in examples]), dtype=torch.long
                 )  # (B, N, H, W)
+            if self.mv_obj_pc_oracle:
+                # DEBUG ceiling: GT-canonical surface points as obj conditioning (leak-by-design).
+                gt_pts = [
+                    self._sample_canonical_surface(
+                        ex.get("vertices"), ex.get("faces"), self.mv_num_obj_voxels
+                    )
+                    for ex in examples
+                ]
+                ret["gt_obj_vertices"] = torch.as_tensor(
+                    np.stack(gt_pts, axis=0), dtype=torch.float32
+                )  # (B, mv_num_obj_voxels, 3) canonical frame
         # Precomputed frozen Pi3X + DINOv2 features (skip the ViT forwards at train time)
         if "cached_local_points" in examples[0]:
             ret["cached_local_points"] = torch.as_tensor(
