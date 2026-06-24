@@ -111,6 +111,12 @@ class ModelConfig:
     # obj-PC tokens. mv_use_voxel_encoder keeps the z_i/z_scene appearance-fusion channel.
     mv_obj_pc_cond: bool = False
     mv_use_voxel_encoder: bool = True
+    # Inject confidence-weighted multi-view DINO appearance into the obj-PC channel's
+    # cond_encoder via extra_feat. The SV cond_encoder was trained with extra_feat ALWAYS
+    # present (img_cond_drop_prob=0), so geometry-only obj-PC is off-distribution by the
+    # appearance term; this restores it and adds the multi-view texture cue. prefix_len
+    # is unchanged (extra_feat is added inside cond_encoder; latent count stays pc_latent_len).
+    mv_obj_pc_appearance: bool = False
 
 
 def mv_prefix_len(model_cfg) -> int:

@@ -74,3 +74,7 @@ model:
   # enable it and bump prefix_len to 2048 + 257 + 64 + 1 = 2370.
   mv_obj_pc_cond: false
   mv_use_voxel_encoder: true
+  # Inject confidence-weighted multi-view DINO appearance into the obj-PC channel's
+  # cond_encoder (extra_feat) — restores SV's always-on appearance term (img_cond_drop_prob=0).
+  # Default off; enabled only if the zero-shot probe confirms it improves CD. prefix_len unchanged.
+  mv_obj_pc_appearance: false
