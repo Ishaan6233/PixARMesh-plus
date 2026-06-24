@@ -69,6 +69,20 @@ def run_multiview_inference(args):
     bs = args.batch_size
     n_iters = (len(shard) + bs - 1) // bs
 
+    # View-count parity guard (Finding 2): the obj-PC geometry stream self-normalizes
+    # to the OBSERVED extent, so evaluating with fewer views than training shrinks that
+    # extent and inflates the conditioning scale (off-distribution). Warn loudly once
+    # rather than silently regress. Default (args.num_views=None) keeps all training views.
+    train_num_views = getattr(data_cfg, "num_views", None)
+    if args.num_views is not None and train_num_views and args.num_views < train_num_views:
+        warnings.warn(
+            f"--num-views={args.num_views} < training num_views={train_num_views}: the "
+            "obj-PC self-normalization was trained on the full-view observed extent; fewer "
+            "views inflate the conditioning scale and push it off-distribution. Use all "
+            "training views for a faithful eval.",
+            stacklevel=2,
+        )
+
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             for it in tqdm(range(n_iters), position=state.process_index, leave=False):
