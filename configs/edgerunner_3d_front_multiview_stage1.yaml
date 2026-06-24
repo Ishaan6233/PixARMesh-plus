@@ -6,10 +6,19 @@ all:
   name: edgerunner-3d-front-multiview-stage1
 
 # MV Stage 1 = layout-only, AUGMENT conditioning (obj-PC + z_i), decoder UNFROZEN.
-# Mirrors SV PixARMesh's layout-only stage1. Purpose: re-ground the warm-started decoder
-# on the NEW prefix composition (obj-PC 2048 + z_i 257 + z_scene 64 + num_face 1 = 2370)
-# and the Pi3X-discovered point distribution on the EASY pose-prediction task, before the
-# full mesh-generation task (Stage 2). Object-geometry tokens are dropped (ignore_obj_seq).
+# FULL 2-stage training analogous to SV PixARMesh: train FROM SCRATCH off the generic
+# EdgeRunner base (NOT warm-started from the 3D-FRONT SV final) for the full SV-length
+# 100k steps. We previously found that warm-starting from the SV final + a short re-ground
+# UNDERPERFORMS this full 2-stage recipe (the warm decoder sits in an SV canonical-frame
+# basin; from-scratch avoids it). Purpose: ground pose prediction on the NEW prefix
+# composition (obj-PC 2048 + z_i 257 + z_scene 64 + num_face 1 = 2370) and the
+# Pi3X-discovered point distribution on the EASY pose task, before full mesh-gen (Stage 2).
+# Object-geometry tokens are dropped (ignore_obj_seq).
+model:
+  # Override the MV base config's SV-final warm-start: init from the EdgeRunner base, the
+  # exact init SV stage-1 used (base_edgerunner.yaml). "From scratch" = no 3D-FRONT warm-start.
+  local_path: zx1239856/edgerunner
+
 dataset:
   src_data:
     ignore_obj_seq: true
@@ -20,7 +29,10 @@ dataset:
 
 train:
   train_args:
-    # Warm-started (vs SV's from-scratch 100k), so a shorter re-grounding suffices.
-    max_steps: 15000
+    # SV-matched stage-1 schedule (base_edgerunner_layout_only: 100k). NOTE: MV's effective
+    # batch (2/device, memory-bound by Pi3X + 4 views + voxel encoder) is below SV's, so
+    # 100k MV steps see less data than SV's 100k — raise gradient_accumulation_steps if the
+    # gate underperforms and memory allows.
+    max_steps: 100000
     save_steps: 5000
     eval_steps: 999999

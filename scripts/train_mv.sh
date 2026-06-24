@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Two-stage MV PixARMesh training (mirrors scripts/train_full.sh for SV).
-# Stage 1: layout-only re-grounding of the AUGMENT conditioning (obj-PC + z_i).
-# Stage 2: full mesh generation, warm-started from Stage 1.
-# Both stages: decoder UNFROZEN, LR 1e-4, effective batch 8 (matches SV) — on 4 GPUs.
+# Full two-stage MV PixARMesh training (mirrors scripts/train_full.sh for SV).
+# Stage 1: layout-only, FROM SCRATCH off the EdgeRunner base (NOT the 3D-FRONT SV final),
+#          100k steps — the full SV-length recipe. Warm-starting from the SV final + a short
+#          re-ground was found to UNDERPERFORM this.
+# Stage 2: full mesh generation, 30k steps, warm-started from Stage-1's final checkpoint.
+# Both stages: decoder UNFROZEN, LR 1e-4 — on 4 GPUs (effective batch 8, memory-bound).
 #
 # Usage (inside tmux):  bash scripts/train_mv.sh
 # Stage 1 is skipped automatically if a Stage-1 final/ checkpoint already exists.

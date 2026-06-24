@@ -18,3 +18,9 @@ dataset:
     # Keep appearance OFF: _fuse_obj_view_features aligns to the observed obj_voxels, not
     # the GT-canonical oracle points.
     mv_obj_pc_appearance: false
+
+train:
+  train_args:
+    # Diagnostic budget, not a full train: the loss_layout signal appears by ~1-3k. Inherits
+    # stage-1's from-scratch EdgeRunner-base init; shortened from the 100k stage-1 schedule.
+    max_steps: 30000
