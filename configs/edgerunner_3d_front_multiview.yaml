@@ -18,13 +18,16 @@ model:
 
 train:
   train_args:
+    # Match the SV recipe's optimization: effective batch 8 (2 x accum 1 x 4 GPUs) and
+    # LR 1e-4. The prior run used effective batch 32 at LR 5e-5 — 4x larger batch at half
+    # the LR, i.e. far fewer/smaller effective updates for the fresh encoder than SV got.
     per_device_train_batch_size: 2
     per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 4
+    gradient_accumulation_steps: 1
     max_steps: 30000
     save_steps: 3000
     eval_steps: 3000
-    learning_rate: 5.0e-5
+    learning_rate: 1.0e-4
     bf16: true
     resume_from_checkpoint: false
     # The MV path uses the mv_voxel_encoder and (with the feature cache) bypasses the
