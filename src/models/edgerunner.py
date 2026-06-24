@@ -12,7 +12,12 @@ from .frozen_geo_encoder import (
     build_geo_ctx_pc, build_geo_obj_pc,
     discover_instance_points_mv, fps_centroid_seeded,
 )
-from .mv_voxel_encoder import MultiViewVoxelAlignedEncoder
+from .mv_voxel_encoder import (
+    MultiViewVoxelAlignedEncoder,
+    _project_to_views,
+    _compute_visibility_mask,
+    _sample_features,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +256,51 @@ class ShapeOPT(OPTForCausalLM):
             valid_count = valid_count * view_mask.float()
         return valid_count.argmax(dim=1)   # (B,)
 
+    def _fuse_obj_view_features(
+        self,
+        voxels,            # (B, V, 3) scene frame (for projection)
+        dino_feats,        # (B, N, C_d, H', W')
+        scene_transforms,  # (B, N, 4, 4)
+        K_per_view,        # (B, N, 3, 3)
+        pi3x_depth,        # (B, N, H, W)
+        view_mask,         # (B, N) bool
+        panoptic_masks,    # (B, N, Hp, Wp) long or None
+        target_ids,        # (B, N) long or None
+        conf,              # (B, N, H, W) Pi3X confidence or None
+    ):
+        """Confidence-weighted multi-view MEAN of DINO features at the object voxels, in
+        the raw DINO feature space (C_d) — the appearance term the SV cond_encoder expects
+        as `extra_feat`. The SV cond_encoder was trained with extra_feat ALWAYS present
+        (img_cond_drop_prob=0), so the geometry-only obj-PC call is off-distribution by
+        exactly this term; supplying it restores the trained distribution and adds the
+        multi-view texture cue. Visibility reuses the obj voxels' mask-consensus gate
+        (Experiment 3); voxels visible in no view get a zero feature (== the img-drop case).
+        Returns (B, V, C_d) aligned 1:1 with the (canonical) obj_geom_voxels the encoder embeds.
+        """
+        B, V, _ = voxels.shape
+        H_full, W_full = pi3x_depth.shape[-2:]
+        pix_coords, voxels_cam = _project_to_views(
+            voxels, scene_transforms, K_per_view, H_full, W_full
+        )   # (B, V, N, 2), (B, V, N, 3)
+        vis_mask = _compute_visibility_mask(
+            voxels_cam, pi3x_depth, pix_coords, view_mask,
+            panoptic_masks=panoptic_masks, target_ids=target_ids,
+        )   # (B, V, N)
+        dino_sampled = _sample_features(dino_feats, pix_coords)   # (B, V, N, C_d)
+
+        m = vis_mask.unsqueeze(-1).float()   # (B, V, N, 1)
+        if conf is not None:
+            N = pix_coords.shape[2]
+            c_flat   = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
+            conf_map = conf.float().reshape(B * N, 1, H_full, W_full)
+            conf_vox = F.grid_sample(conf_map, c_flat, mode="bilinear",
+                                     padding_mode="zeros", align_corners=False)
+            conf_vox = conf_vox.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1)  # (B, V, N)
+            m = m * conf_vox.unsqueeze(-1).clamp(min=0.0)
+        denom = m.sum(dim=2).clamp(min=1e-6)                      # (B, V, 1)
+        mu = (dino_sampled.float() * m).sum(dim=2) / denom        # (B, V, C_d)
+        return mu.to(dino_feats.dtype)
+
     def get_mv_inputs_with_cond(
         self,
         input_ids,
@@ -389,25 +439,15 @@ class ShapeOPT(OPTForCausalLM):
             scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
             obj_geom_voxels = (v - center) * scale          # (B, V, 3) canonical frame
 
-        # --- Native obj-PC GEOMETRY channel (the decoder's exploited channel) ---
-        # Route the multi-view-discovered, canonical points through the SV cond_encoder
-        # (->2048 latents) + projector — the exact channel the decoder was trained on and
-        # provably exploits (Test-1: +17% from obj-PC completeness). "More views = a more
-        # complete point cloud" then flows through a channel the decoder actually uses.
-        # obj_geom_voxels is canonical / normalize_vertices(0.95), matching the output frame.
-        obj_pc_embeds = None
-        if getattr(self.config, "mv_obj_pc_cond", False):
-            if obj_geom_voxels is None:
-                raise RuntimeError("mv_obj_pc_cond=True requires obj_canon_transform")
-            obj_pc_conds  = self.cond_encoder(obj_geom_voxels)
-            obj_pc_embeds = self.projector(obj_pc_conds)   # (B, pc_latent_len, D)
-
-        # --- Multi-view voxel encoder → z_i, z_scene (appearance fusion; optional) ---
-        # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
-        # features by mask consensus (Experiment 3) instead of the Pi3X depth check,
-        # and Pi3X confidence so the IBRNet fusion is confidence-weighted.
-        z_i = z_scene = None
-        if getattr(self.config, "mv_use_voxel_encoder", True):
+        # --- DINOv2 features (shared by the obj-PC appearance term + voxel encoder) ---
+        # Computed once when either consumer needs it; frozen + depends only on the
+        # un-augmented images, so the cache path is numerically identical.
+        mv_conf = pi3x_out["conf"][..., 0] if pi3x_out.get("conf") is not None else None
+        need_dino = getattr(self.config, "mv_obj_pc_appearance", False) or getattr(
+            self.config, "mv_use_voxel_encoder", True
+        )
+        dino_feats = None
+        if need_dino:
             if cached_dino_feats is not None:
                 dino_feats = cached_dino_feats.to(device)
             else:
@@ -417,7 +457,36 @@ class ShapeOPT(OPTForCausalLM):
                 dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
                 _, C_d, Hf, Wf = dino_flat.shape
                 dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
-            mv_conf = pi3x_out["conf"][..., 0] if pi3x_out.get("conf") is not None else None
+
+        # --- Native obj-PC GEOMETRY channel (the decoder's exploited channel) ---
+        # Route the multi-view-discovered, canonical points through the SV cond_encoder
+        # (->2048 latents) + projector — the exact channel the decoder was trained on and
+        # provably exploits (Test-1: +17% from obj-PC completeness). "More views = a more
+        # complete point cloud" then flows through a channel the decoder actually uses.
+        # obj_geom_voxels is canonical / normalize_vertices(0.95), matching the output frame.
+        # When mv_obj_pc_appearance is on, supply the confidence-weighted multi-view DINO
+        # at the obj voxels as extra_feat — the SV cond_encoder was trained with extra_feat
+        # ALWAYS present (img_cond_drop_prob=0), so geometry-only is off-distribution.
+        obj_pc_embeds = None
+        if getattr(self.config, "mv_obj_pc_cond", False):
+            if obj_geom_voxels is None:
+                raise RuntimeError("mv_obj_pc_cond=True requires obj_canon_transform")
+            obj_pc_extra_feat = None
+            if getattr(self.config, "mv_obj_pc_appearance", False):
+                obj_pc_extra_feat = self._fuse_obj_view_features(
+                    obj_voxels, dino_feats, st, K_f, pi3x_depth, view_mask,
+                    panoptic_masks.to(device) if panoptic_masks is not None else None,
+                    mv_target_ids, mv_conf,
+                )   # (B, V_obj, C_d) aligned with obj_geom_voxels
+            obj_pc_conds  = self.cond_encoder(obj_geom_voxels, extra_feat=obj_pc_extra_feat)
+            obj_pc_embeds = self.projector(obj_pc_conds)   # (B, pc_latent_len, D)
+
+        # --- Multi-view voxel encoder → z_i, z_scene (appearance fusion; optional) ---
+        # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
+        # features by mask consensus (Experiment 3) instead of the Pi3X depth check,
+        # and Pi3X confidence so the IBRNet fusion is confidence-weighted.
+        z_i = z_scene = None
+        if getattr(self.config, "mv_use_voxel_encoder", True):
             mv_out  = self.mv_voxel_encoder(
                 obj_voxels, ctx_voxels,
                 dino_feats, None,                    # mask_feats=None (discovery handles localization)
