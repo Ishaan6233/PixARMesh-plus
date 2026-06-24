@@ -41,6 +41,8 @@ def run_multiview_inference(args):
         extra_overrides.append("dataset.model.mv_obj_pc_cond=true")
     if getattr(args, "no_voxel_encoder", False):
         extra_overrides.append("dataset.model.mv_use_voxel_encoder=false")
+    if getattr(args, "obj_pc_appearance", False):
+        extra_overrides.append("dataset.model.mv_obj_pc_appearance=true")
     model, model_cfg, data_cfg = prepare_mv_model_for_inference(
         checkpoint=args.checkpoint, config_name=args.mv_config,
         extra_overrides=extra_overrides or None,
@@ -301,6 +303,13 @@ def main():
         action="store_true",
         help="MV path: drop the mv_voxel_encoder z_i/z_scene (Stage-0 obj-PC-only test). "
              "Sets mv_use_voxel_encoder=false.",
+    )
+    parser.add_argument(
+        "--obj-pc-appearance",
+        action="store_true",
+        help="MV path: feed confidence-weighted multi-view DINO at the obj voxels as the "
+             "cond_encoder extra_feat (restores SV's always-on appearance term). "
+             "Sets mv_obj_pc_appearance=true; prefix_len unchanged.",
     )
     args = parser.parse_args()
 
