@@ -1,0 +1,26 @@
+defaults:
+  - edgerunner_3d_front_multiview
+  - _self_
+
+all:
+  name: edgerunner-3d-front-multiview-stage1
+
+# MV Stage 1 = layout-only, AUGMENT conditioning (obj-PC + z_i), decoder UNFROZEN.
+# Mirrors SV PixARMesh's layout-only stage1. Purpose: re-ground the warm-started decoder
+# on the NEW prefix composition (obj-PC 2048 + z_i 257 + z_scene 64 + num_face 1 = 2370)
+# and the Pi3X-discovered point distribution on the EASY pose-prediction task, before the
+# full mesh-generation task (Stage 2). Object-geometry tokens are dropped (ignore_obj_seq).
+dataset:
+  src_data:
+    ignore_obj_seq: true
+  model:
+    # prefix_len is derived from the active channels (mv_prefix_len): 2048 obj-PC +
+    # 257 z_i + 64 z_scene + 1 num_face = 2370.
+    mv_obj_pc_cond: true
+
+train:
+  train_args:
+    # Warm-started (vs SV's from-scratch 100k), so a shorter re-grounding suffices.
+    max_steps: 15000
+    save_steps: 5000
+    eval_steps: 999999

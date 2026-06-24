@@ -1,0 +1,24 @@
+defaults:
+  - edgerunner_3d_front_multiview
+  - _self_
+
+all:
+  name: edgerunner-3d-front-multiview-stage2
+
+# MV Stage 2 = full training (layout + object), AUGMENT conditioning, decoder UNFROZEN.
+# Warm-start from Stage-1's final checkpoint via model.local_path (set by train_mv.sh).
+# This is where the cond_encoder + decoder learn to GENERATE complete meshes from the
+# multi-view obj-PC + appearance conditioning — the step that must close the Stage-0
+# zero-shot gap (16.9e-3) toward the SV bar.
+dataset:
+  src_data:
+    ignore_obj_seq: false
+  model:
+    # prefix_len derived from active channels (mv_prefix_len) = 2370.
+    mv_obj_pc_cond: true
+
+train:
+  train_args:
+    max_steps: 30000
+    save_steps: 3000
+    eval_steps: 999999
