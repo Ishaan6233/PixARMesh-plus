@@ -17,7 +17,7 @@ from src.data.collator import get_mesh_data_collator
 from src.data.mesh import get_mesh_dataset, MeshProcessor
 from src.utils.logging import JsonlLoggerCallback
 from src.utils.trainer import CustomSFTTrainer, CustomSFTConfig
-from src.utils.config import DataConfig, ModelConfig
+from src.utils.config import DataConfig, ModelConfig, mv_prefix_len
 from src.utils.ckpt import get_last_checkpoint
 from src.utils.sig import SaveAndStopOnSignalCallback, install_sigusr1_handler
 
@@ -57,7 +57,13 @@ def _build_model_config(cfg):
     ds_model = OmegaConf.select(cfg, "dataset.model")
     if ds_model is not None:
         model_values.update(_to_container(ds_model))
-    return ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+    model_cfg = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+    # Derive prefix_len from the active conditioning channels (single source of truth
+    # in mv_prefix_len) so the collator matches what the model produces — avoids a
+    # hardcoded prefix_len drifting from pc_latent_len / query counts.
+    if getattr(model_cfg, "mv_voxel_encoder", False) or model_cfg.mv_obj_pc_cond:
+        model_cfg.prefix_len = mv_prefix_len(model_cfg)
+    return model_cfg
 
 
 def _build_train_args(cfg, model_cfg):

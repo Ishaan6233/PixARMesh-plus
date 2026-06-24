@@ -13,7 +13,7 @@ from src.models.utils import (
     get_condition_encoder,
     get_model,
 )
-from src.utils.config import ModelConfig, DataConfig
+from src.utils.config import ModelConfig, DataConfig, mv_prefix_len
 
 
 def _flatten_3d_front_for_inference(examples, data_cfg, use_predicted_mask):
@@ -477,7 +477,7 @@ def _filter_dataclass_kwargs(dataclass_type, values):
 
 
 def prepare_mv_model_for_inference(
-    checkpoint=None, config_name="edgerunner_3d_front_multiview"
+    checkpoint=None, config_name="edgerunner_3d_front_multiview", extra_overrides=None
 ):
     """Build the multi-view EdgeRunner model + configs for inference.
 
@@ -500,6 +500,8 @@ def prepare_mv_model_for_inference(
     overrides = []
     if checkpoint is not None:
         overrides.append(f"model.local_path={checkpoint}")
+    if extra_overrides:
+        overrides.extend(extra_overrides)
 
     config_dir = Path("configs").absolute().as_posix()
     GlobalHydra.instance().clear()
@@ -518,6 +520,13 @@ def prepare_mv_model_for_inference(
     if ds_model is not None:
         model_values.update(OmegaConf.to_container(ds_model, resolve=True))
     model_cfg = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+
+    # Derive prefix_len from the active conditioning channels so the collator emits
+    # exactly as many pc_token slots as the model produces (single source of truth in
+    # mv_prefix_len). Covers obj-PC-only / augment / voxel-only, including the degenerate
+    # both-off case. Only for the MV path; SV configs keep their own prefix_len.
+    if getattr(model_cfg, "mv_voxel_encoder", False) or model_cfg.mv_obj_pc_cond:
+        model_cfg.prefix_len = mv_prefix_len(model_cfg)
 
     cond_encoder_img = (
         get_image_condition_encoder(model_cfg) if model_cfg.img_cond else None

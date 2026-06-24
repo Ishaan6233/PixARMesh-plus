@@ -67,3 +67,10 @@ model:
   # Set false to ablate appearance-only vs geometry+appearance.
   mv_use_geometry: true
   img_cond: true
+  # AUGMENT (Stage 0/1): route the multi-view-discovered canonical points through the SV
+  # decoder's NATIVE obj-PC channel (cond_encoder -> 2048 latents) — the channel it was
+  # trained on and provably exploits (Test-1 +17%), so multi-view completeness flows
+  # through a channel the decoder actually uses. Default off here; the stage configs
+  # enable it and bump prefix_len to 2048 + 257 + 64 + 1 = 2370.
+  mv_obj_pc_cond: false
+  mv_use_voxel_encoder: true

@@ -106,3 +106,23 @@ class ModelConfig:
     mv_num_heads: int = 8
     mv_mask_seeded_pool: bool = False
     mv_boundary_bias_alpha: float = 0.0
+    # Route the multi-view-discovered canonical points through the SV cond_encoder
+    # (native obj-PC channel the decoder exploits). When True, prefix gains pc_latent_len
+    # obj-PC tokens. mv_use_voxel_encoder keeps the z_i/z_scene appearance-fusion channel.
+    mv_obj_pc_cond: bool = False
+    mv_use_voxel_encoder: bool = True
+
+
+def mv_prefix_len(model_cfg) -> int:
+    """Number of conditioning (pc_token) slots the MV path emits, in prefix order
+    [obj-PC latents] + [z_i, z_scene] + num_face. Single source of truth shared by
+    training (train.py) and inference (prepare_mv_model_for_inference) so the collator's
+    prefix_len always matches what the model produces (else masked_scatter mis-sizes)."""
+    n = 0
+    if getattr(model_cfg, "mv_obj_pc_cond", False):
+        n += model_cfg.pc_latent_len
+    if getattr(model_cfg, "mv_use_voxel_encoder", True) and getattr(
+        model_cfg, "mv_voxel_encoder", False
+    ):
+        n += model_cfg.mv_num_obj_queries + model_cfg.mv_num_scene_queries
+    return n + 1  # num_face

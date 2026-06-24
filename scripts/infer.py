@@ -34,8 +34,16 @@ def run_multiview_inference(args):
     device = state.device
     set_seed(args.seed)
 
+    # Plain overrides (no '+'): these keys exist in canonical_3d_front_multiview.yaml,
+    # so '+' (append) would raise ConfigCompositionException.
+    extra_overrides = []
+    if getattr(args, "obj_pc_cond", False):
+        extra_overrides.append("dataset.model.mv_obj_pc_cond=true")
+    if getattr(args, "no_voxel_encoder", False):
+        extra_overrides.append("dataset.model.mv_use_voxel_encoder=false")
     model, model_cfg, data_cfg = prepare_mv_model_for_inference(
-        checkpoint=args.checkpoint, config_name=args.mv_config
+        checkpoint=args.checkpoint, config_name=args.mv_config,
+        extra_overrides=extra_overrides or None,
     )
     model.to(device)
     model.eval()
@@ -281,6 +289,18 @@ def main():
         default=None,
         help="Test-3 N-views ablation (MV path): restrict each object to the first K "
              "views (view_mask[:, K:]=False) so discovery+conditioning use K views.",
+    )
+    parser.add_argument(
+        "--obj-pc-cond",
+        action="store_true",
+        help="MV path: route the multi-view-discovered canonical points through the SV "
+             "obj-PC channel (cond_encoder). Sets mv_obj_pc_cond=true; prefix_len auto-adjusts.",
+    )
+    parser.add_argument(
+        "--no-voxel-encoder",
+        action="store_true",
+        help="MV path: drop the mv_voxel_encoder z_i/z_scene (Stage-0 obj-PC-only test). "
+             "Sets mv_use_voxel_encoder=false.",
     )
     args = parser.parse_args()
 

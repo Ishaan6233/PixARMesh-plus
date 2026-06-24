@@ -389,33 +389,46 @@ class ShapeOPT(OPTForCausalLM):
             scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
             obj_geom_voxels = (v - center) * scale          # (B, V, 3) canonical frame
 
-        # --- DINOv2 spatial feature maps (or reuse cached features) ---
-        if cached_dino_feats is not None:
-            dino_feats = cached_dino_feats.to(device)
-        else:
-            if self.cond_encoder_img is None:
-                raise RuntimeError("cond_encoder_img is required for multi-view path")
-            pv_flat    = pixel_values.reshape(B * N, C, H, W)
-            dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
-            _, C_d, Hf, Wf = dino_flat.shape
-            dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
+        # --- Native obj-PC GEOMETRY channel (the decoder's exploited channel) ---
+        # Route the multi-view-discovered, canonical points through the SV cond_encoder
+        # (->2048 latents) + projector — the exact channel the decoder was trained on and
+        # provably exploits (Test-1: +17% from obj-PC completeness). "More views = a more
+        # complete point cloud" then flows through a channel the decoder actually uses.
+        # obj_geom_voxels is canonical / normalize_vertices(0.95), matching the output frame.
+        obj_pc_embeds = None
+        if getattr(self.config, "mv_obj_pc_cond", False):
+            if obj_geom_voxels is None:
+                raise RuntimeError("mv_obj_pc_cond=True requires obj_canon_transform")
+            obj_pc_conds  = self.cond_encoder(obj_geom_voxels)
+            obj_pc_embeds = self.projector(obj_pc_conds)   # (B, pc_latent_len, D)
 
-        # --- Multi-view voxel encoder → z_i, z_scene (no mask_feats) ---
+        # --- Multi-view voxel encoder → z_i, z_scene (appearance fusion; optional) ---
         # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
         # features by mask consensus (Experiment 3) instead of the Pi3X depth check,
         # and Pi3X confidence so the IBRNet fusion is confidence-weighted.
-        mv_conf = pi3x_out["conf"][..., 0] if pi3x_out.get("conf") is not None else None
-        mv_out  = self.mv_voxel_encoder(
-            obj_voxels, ctx_voxels,
-            dino_feats, None,                    # mask_feats=None (discovery handles localization)
-            st, K_f, pi3x_depth, view_mask,
-            panoptic_masks = panoptic_masks.to(device) if panoptic_masks is not None else None,
-            target_ids     = mv_target_ids,
-            conf           = mv_conf,
-            obj_geom_voxels = obj_geom_voxels,   # canonical-frame geometry for PointEmbed
-        )
-        z_i     = mv_out["z_i"]      # (B, M, out_dim)
-        z_scene = mv_out["z_scene"]  # (B, S, out_dim)
+        z_i = z_scene = None
+        if getattr(self.config, "mv_use_voxel_encoder", True):
+            if cached_dino_feats is not None:
+                dino_feats = cached_dino_feats.to(device)
+            else:
+                if self.cond_encoder_img is None:
+                    raise RuntimeError("cond_encoder_img is required for multi-view path")
+                pv_flat    = pixel_values.reshape(B * N, C, H, W)
+                dino_flat  = self.cond_encoder_img(pixel_values=pv_flat)
+                _, C_d, Hf, Wf = dino_flat.shape
+                dino_feats = dino_flat.reshape(B, N, C_d, Hf, Wf)
+            mv_conf = pi3x_out["conf"][..., 0] if pi3x_out.get("conf") is not None else None
+            mv_out  = self.mv_voxel_encoder(
+                obj_voxels, ctx_voxels,
+                dino_feats, None,                    # mask_feats=None (discovery handles localization)
+                st, K_f, pi3x_depth, view_mask,
+                panoptic_masks = panoptic_masks.to(device) if panoptic_masks is not None else None,
+                target_ids     = mv_target_ids,
+                conf           = mv_conf,
+                obj_geom_voxels = obj_geom_voxels,   # canonical-frame geometry for PointEmbed
+            )
+            z_i     = mv_out["z_i"]      # (B, M, out_dim)
+            z_scene = mv_out["z_scene"]  # (B, S, out_dim)
 
         # --- Assemble input embeddings ---
         if cond_num_faces is None:
@@ -431,13 +444,23 @@ class ShapeOPT(OPTForCausalLM):
         )
         inputs_embeds = self.model.decoder.embed_tokens(input_ids_clone)
 
-        # Fill pc_token slots: z_i (M tokens) + z_scene (S tokens) + num_face (1 token)
-        all_cond = torch.cat(
-            [z_i.to(inputs_embeds.dtype),
-             z_scene.to(inputs_embeds.dtype),
-             num_face_embeds.to(inputs_embeds.dtype)],
-            dim=1,
-        ).flatten(0, 1)   # (B*(M+S+1), D)
+        # Fill pc_token slots, in order: [obj-PC latents] + [z_i, z_scene] + num_face.
+        # Channels are included only when produced (see flags above); the total token
+        # count must equal prefix_len (the collator emits that many pc_token slots).
+        cond_parts = []
+        if obj_pc_embeds is not None:
+            cond_parts.append(obj_pc_embeds.to(inputs_embeds.dtype))   # (B, pc_latent_len, D)
+        if z_i is not None:
+            cond_parts.append(z_i.to(inputs_embeds.dtype))             # (B, M, D)
+            cond_parts.append(z_scene.to(inputs_embeds.dtype))         # (B, S, D)
+        cond_parts.append(num_face_embeds.to(inputs_embeds.dtype))     # (B, 1, D)
+        all_cond = torch.cat(cond_parts, dim=1).flatten(0, 1)          # (B*prefix_cond, D)
+        # Guard the prefix_len <-> produced-token invariant: masked_scatter silently
+        # mis-fills when sizes differ, so assert rather than emit garbage conditioning.
+        assert all_cond.shape[0] == int(cond_token_mask.sum()), (
+            f"MV cond token count {all_cond.shape[0]} != pc_token slots "
+            f"{int(cond_token_mask.sum())}; prefix_len must equal mv_prefix_len(config)."
+        )
         # Out-of-place: when the decoder is frozen (overfit / frozen-decoder regime)
         # inputs_embeds is a frozen leaf, and in-place masked_scatter_ on it errors.
         inputs_embeds = inputs_embeds.masked_scatter(
