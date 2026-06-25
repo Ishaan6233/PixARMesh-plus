@@ -13,35 +13,30 @@ class PointEmbed(nn.Module):
         # frequency embedding
         assert freq_embed_dim % 6 == 0
         self.freq_embed_dim = freq_embed_dim
-        e = torch.pow(2, torch.arange(self.freq_embed_dim // 6)).float() * np.pi
-        e = torch.stack(
-            [
-                torch.cat(
-                    [
-                        e,
-                        torch.zeros(self.freq_embed_dim // 6),
-                        torch.zeros(self.freq_embed_dim // 6),
-                    ]
-                ),
-                torch.cat(
-                    [
-                        torch.zeros(self.freq_embed_dim // 6),
-                        e,
-                        torch.zeros(self.freq_embed_dim // 6),
-                    ]
-                ),
-                torch.cat(
-                    [
-                        torch.zeros(self.freq_embed_dim // 6),
-                        torch.zeros(self.freq_embed_dim // 6),
-                        e,
-                    ]
-                ),
-            ]
-        )
-        self.register_buffer("basis", e)  # [3, 48]
+        # `basis` is a deterministic Fourier-frequency constant. Register it NON-persistent
+        # so from_pretrained never expects it in the checkpoint: a persistent buffer that is
+        # absent from the checkpoint gets materialized as uninitialized (NaN) memory under
+        # low_cpu_mem_usage/meta init — which silently corrupts the whole forward. It is
+        # recomputed in __init__ and re-sanitized post-load by reset_basis() (see utils.py).
+        self.register_buffer("basis", self._build_basis(), persistent=False)  # [3, freq_embed_dim//2]
 
         self.mlp = nn.Linear(self.freq_embed_dim + 3, dim)
+
+    def _build_basis(self):
+        e = torch.pow(2, torch.arange(self.freq_embed_dim // 6)).float() * np.pi
+        z = torch.zeros(self.freq_embed_dim // 6)
+        return torch.stack([
+            torch.cat([e, z, z]),
+            torch.cat([z, e, z]),
+            torch.cat([z, z, e]),
+        ])
+
+    @torch.no_grad()
+    def reset_basis(self):
+        """Recompute the constant Fourier basis on the module's real device — undoes the
+        garbage left when from_pretrained materializes the (non-persistent / missing) buffer
+        from meta. Idempotent and numerically identical to __init__."""
+        self.basis = self._build_basis().to(self.basis.device, self.basis.dtype)
 
     @staticmethod
     def embed(input, basis):

@@ -54,6 +54,26 @@ def _fix_uninit_params(model):
                     nn.init.normal_(p.data, mean=0.0, std=init_std)
 
 
+def _fix_pointembed_basis(model):
+    """Recompute every PointEmbed Fourier `basis` buffer after from_pretrained.
+
+    `basis` is a deterministic constant, but a buffer absent from the checkpoint is
+    materialized as GARBAGE memory under low_cpu_mem_usage/meta init. That garbage is NOT
+    reliably NaN/Inf — it is often finite-but-huge (observed ~2.8e38), which a finiteness
+    check passes; `x @ huge` then overflows bf16 to inf and `sin(inf)` = NaN, corrupting the
+    conditioning forward data-dependently. Since the basis is a constant, recompute it
+    UNCONDITIONALLY (targets BUFFERS, which _fix_uninit_params does not). Only the
+    from-scratch path hits this; a warm checkpoint carries a valid saved basis but
+    recomputing it is identical and harmless."""
+    n = 0
+    for module in model.modules():
+        if hasattr(module, "reset_basis") and hasattr(module, "basis"):
+            module.reset_basis()
+            n += 1
+    if n:
+        logger.info(f"_fix_pointembed_basis: recomputed {n} PointEmbed basis buffer(s)")
+
+
 def get_pi3x_encoder(model_cfg: ModelConfig) -> "FrozenGeoEncoder":
     """Build the Pi3X frozen geometry encoder from ModelConfig."""
     from .pi3x_cond import Pi3XFrozenEncoder
@@ -190,6 +210,7 @@ def get_model(
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
     # when loading from a stage-2 checkpoint that already contains them.
     _fix_uninit_params(model)
+    _fix_pointembed_basis(model)
     model.config._attn_implementation = "flash_attention_2"
     if config.vocab_size != model_cfg.vocab_size:
         model.resize_token_embeddings(model_cfg.vocab_size, pad_to_multiple_of=64)
@@ -214,6 +235,7 @@ def get_condition_encoder(
     model = model_class.from_pretrained(local_model_path, **extra_args)
     model = model.to(torch.bfloat16)
     _fix_uninit_params(model)
+    _fix_pointembed_basis(model)
     # extra_feat_proj is zero-initialized in encoder.__init__ (to survive no_init_weights).
     # Re-initialize with Normal(0, 0.02) here — outside no_init_weights — so image features
     # contribute from training step 1 instead of gradually turning on from zero.
