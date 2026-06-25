@@ -29,10 +29,12 @@ dataset:
 
 train:
   train_args:
-    # SV-matched stage-1 schedule (base_edgerunner_layout_only: 100k). NOTE: MV's effective
-    # batch (2/device, memory-bound by Pi3X + 4 views + voxel encoder) is below SV's, so
-    # 100k MV steps see less data than SV's 100k — raise gradient_accumulation_steps if the
-    # gate underperforms and memory allows.
+    # SV-matched Stage-1: 100k steps AND effective batch 64 on 4 GPUs (train_mv.sh NP=4):
+    # per_device 16 x accum 1 x 4 GPUs = 64. A measured probe shows per_device 16 + 8192 obj
+    # voxels peaks at ~25 GB / 143 GB, so it fits with room to spare. Overrides the base
+    # config's Stage-2 batching (8 x accum 2).
+    per_device_train_batch_size: 16
+    gradient_accumulation_steps: 1
     max_steps: 100000
     save_steps: 5000
     eval_steps: 999999

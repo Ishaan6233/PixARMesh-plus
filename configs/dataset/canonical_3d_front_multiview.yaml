@@ -53,7 +53,12 @@ model:
   mv_voxel_encoder: true
   mv_num_obj_queries: 257
   mv_num_scene_queries: 64
-  mv_num_obj_voxels: 512
+  # Obj-PC conditioning density. SV-PixARMesh conditions its obj-PC channel on 8192 surface
+  # points; the cond_encoder (-> 2048 latents) was trained at that density. Match it so the
+  # multi-view-discovered points are fed in-distribution to the channel the decoder actually
+  # exploits. Drop-in: cond_encoder pools any count to pc_latent_len, so prefix_len is
+  # unchanged; a probe showed per_device 8 @ 8192 voxels peaks ~15 GB / 143 GB.
+  mv_num_obj_voxels: 8192
   mv_num_ctx_voxels: 1024
   mv_voxel_dim: 512
   mv_mask_feat_dim: 64
