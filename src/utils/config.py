@@ -106,6 +106,10 @@ class ModelConfig:
     mv_num_heads: int = 8
     mv_mask_seeded_pool: bool = False
     mv_boundary_bias_alpha: float = 0.0
+    # Instance-discovery method (MV segmentation tournament). Resolved via
+    # src.models.discovery.get_discovery_fn; "consensus" = current mask-consensus
+    # voting baseline. New Family-A candidates register under their own name.
+    mv_discovery_method: str = "consensus"
     # Route the multi-view-discovered canonical points through the SV cond_encoder
     # (native obj-PC channel the decoder exploits). When True, prefix gains pc_latent_len
     # obj-PC tokens. mv_use_voxel_encoder keeps the z_i/z_scene appearance-fusion channel.
