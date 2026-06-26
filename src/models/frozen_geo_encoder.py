@@ -189,11 +189,23 @@ def build_geo_obj_pc(
     return _apply_scene_transform(obj_cam, scene_transform).to(out_dtype)
 
 
+def _cap_points(pts: torch.Tensor, max_in: int) -> torch.Tensor:
+    """Deterministic even-stride downsample to <= max_in points. FPS cost is O(N*K),
+    so FPS over the full ~1M-point merged Pi3X cloud is prohibitive (and far slower
+    in pytorch3d than at small N); bounding the input keeps voxelization cheap with a
+    negligible coverage change for the 1024-2048 voxels we sample."""
+    n = pts.shape[0]
+    if n > max_in:
+        return pts[:: (n // max_in)][:max_in]
+    return pts
+
+
 def adaptive_fps_voxelize(
     pts: torch.Tensor,
     conf: torch.Tensor | None,
     n_voxels: int,
     conf_threshold: float = 0.3,
+    max_in: int = 65536,
 ) -> torch.Tensor:
     """AnySplat-style adaptive-size voxelization via confidence-filtered FPS.
 
@@ -208,11 +220,13 @@ def adaptive_fps_voxelize(
         conf:             (B, M)  per-point confidence, or None (fall back to plain FPS)
         n_voxels:         target number of voxels
         conf_threshold:   minimum confidence to include a point (default 0.3)
+        max_in:           cap the per-item FPS input (stride-subsample above this)
     Returns:
         (B, n_voxels, 3)
     """
     if conf is None:
-        return fps_centroid_seeded(pts, n_voxels)
+        return fps_centroid_seeded(_cap_points(pts[0], max_in).unsqueeze(0)
+                                   if pts.shape[0] == 1 else pts, n_voxels)
 
     B, M, _ = pts.shape
     results = []
@@ -221,6 +235,7 @@ def adaptive_fps_voxelize(
         pts_keep = pts[b][keep]
         if pts_keep.shape[0] < max(n_voxels, 4):
             pts_keep = pts[b]   # fall back to all points if too few pass threshold
+        pts_keep = _cap_points(pts_keep, max_in)
         vox = fps_centroid_seeded(pts_keep.unsqueeze(0), n_voxels).squeeze(0)
         results.append(vox)
     return torch.stack(results, dim=0)
