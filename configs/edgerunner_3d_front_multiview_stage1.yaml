@@ -29,12 +29,13 @@ dataset:
 
 train:
   train_args:
-    # SV-matched Stage-1: 100k steps AND effective batch 64 on 4 GPUs (train_mv.sh NP=4):
-    # per_device 16 x accum 1 x 4 GPUs = 64. A measured probe shows per_device 16 + 8192 obj
-    # voxels peaks at ~25 GB / 143 GB, so it fits with room to spare. Overrides the base
-    # config's Stage-2 batching (8 x accum 2).
+    # Effective batch 64 on 4 GPUs (train_mv.sh NP=4): per_device 16 x accum 1 x 4 = 64.
+    # Stage-1 is layout-only and exists ONLY to warm-start Stage-2; the eval gives gt_layout,
+    # so layout quality is never scored. Measured loss_layout converges by ~2k steps
+    # (8.0 -> 2.1 by ~300, flat ~1.74-1.78 from ~1.8k onward), so the SV-matched 100k is ~50x
+    # overkill. 5k (~13h at ~10 s/step) is 2.5x past the plateau for a comfortable warm-start.
     per_device_train_batch_size: 16
     gradient_accumulation_steps: 1
-    max_steps: 100000
+    max_steps: 5000
     save_steps: 5000
     eval_steps: 999999
