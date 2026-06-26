@@ -37,5 +37,13 @@ train:
     per_device_train_batch_size: 16
     gradient_accumulation_steps: 1
     max_steps: 5000
-    save_steps: 5000
+    # Save every 1k steps (5 intermediate checkpoints) instead of only at the end:
+    # a crash/pre-emption near the finish then still leaves a usable Stage-2 warm-start,
+    # rather than losing the whole run (which is what happened when save_steps==max_steps).
+    save_steps: 1000
+    # Disable eval entirely for Stage-1: it is layout-only and scored with gt_layout, so
+    # eval is never used — it is pure wasted compute AND it ran the conditioning forward on
+    # the val split (the prior run aborted there). HF evaluates BEFORE the periodic save, so
+    # an eval crash also takes down that step's checkpoint; "no" removes the vector outright.
+    eval_strategy: "no"
     eval_steps: 999999
