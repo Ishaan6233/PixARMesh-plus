@@ -10,8 +10,9 @@ from .embed import CoordEmbed
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
 from .frozen_geo_encoder import (
     build_geo_ctx_pc, build_geo_obj_pc,
-    discover_instance_points_mv, fps_centroid_seeded,
+    fps_centroid_seeded,
 )
+from .discovery import get_discovery_fn
 from .mv_voxel_encoder import (
     MultiViewVoxelAlignedEncoder,
     _project_to_views,
@@ -367,7 +368,8 @@ class ShapeOPT(OPTForCausalLM):
                 seed_list.append(pc_b)
             seed_pcs = torch.cat(seed_list, dim=0)   # (B, P, 3)
 
-            obj_voxels, ctx_voxels, mv_target_ids, obj_voxels_geom = discover_instance_points_mv(
+            discover_fn = get_discovery_fn(getattr(self.config, "mv_discovery_method", "consensus"))
+            obj_voxels, ctx_voxels, mv_target_ids, obj_voxels_geom = discover_fn(
                 local_points        = lp,
                 scene_transforms    = st,
                 panoptic_masks      = panoptic_masks.to(device),

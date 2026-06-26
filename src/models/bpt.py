@@ -14,7 +14,7 @@ from .x_transformers_patch import Decoder
 from .cond import MicheProjectorBPT, ContextAggregator
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
 from .mv_voxel_encoder import MultiViewVoxelAlignedEncoder
-from .frozen_geo_encoder import discover_instance_points_mv
+from .discovery import get_discovery_fn
 
 
 def exists(v):
@@ -301,7 +301,8 @@ class BPTModel(PreTrainedModel):
         seed_pcs = cond_pcs.float() if cond_pcs is not None else torch.zeros(B, 1, 3, device=device)
 
         if panoptic_masks is not None:
-            obj_voxels, ctx_voxels = discover_instance_points_mv(
+            discover_fn = get_discovery_fn(getattr(self.config, "mv_discovery_method", "consensus"))
+            obj_voxels, ctx_voxels = discover_fn(
                 local_points        = lp,
                 scene_transforms    = st,
                 panoptic_masks      = panoptic_masks.to(device),
