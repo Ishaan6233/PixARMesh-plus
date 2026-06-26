@@ -60,8 +60,8 @@ from src.models.frozen_geo_encoder import (
     _project_pts_to_views,
     _sample_mask_ids,
     build_geo_obj_pc,
-    discover_instance_points_mv,
 )
+from src.models.discovery import available_methods, get_discovery_fn
 from src.models.utils import get_pi3x_encoder
 from src.utils.config import DataConfig, ModelConfig
 from scripts.eval.eval_voxels import _eval_collate, _select_ref_view
@@ -80,6 +80,10 @@ def parse_args():
     p.add_argument("--mask-seeded-pool",   action="store_true")
     p.add_argument("--boundary-bias-alpha",type=float, default=0.0)
     p.add_argument("--batch-size",         type=int,   default=1)
+    p.add_argument("--method",             default="consensus",
+                   help="Instance-discovery method to diagnose (MV segmentation "
+                        f"tournament). One of: {available_methods()}. "
+                        "Default = consensus baseline.")
     return p.parse_args()
 
 
@@ -95,6 +99,9 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+
+    discover_fn = get_discovery_fn(args.method)
+    print(f"Instance-discovery method: {args.method}")
 
     # --- Dataset (identical config to eval_voxels.py) ---
     data_cfg = DataConfig(
@@ -177,7 +184,7 @@ def main():
                 seed_list.append(build_geo_obj_pc(lp[b:b+1, rv], cond_pcs_2d[b:b+1], st[b:b+1, rv]))
             seed_pcs = torch.cat(seed_list, dim=0).float()
 
-            _, _, diag = discover_instance_points_mv(
+            _, _, diag = discover_fn(
                 local_points            = lp,
                 scene_transforms        = st,
                 panoptic_masks          = panoptic_masks,

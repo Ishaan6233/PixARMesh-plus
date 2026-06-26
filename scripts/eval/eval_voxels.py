@@ -44,8 +44,8 @@ from src.models.frozen_geo_encoder import (
     _project_pts_to_views,
     _sample_mask_ids,
     build_geo_obj_pc,
-    discover_instance_points_mv,
 )
+from src.models.discovery import available_methods, get_discovery_fn
 from src.models.utils import get_pi3x_encoder
 from src.utils.config import DataConfig, ModelConfig
 from metrics.chamfer import chamfer_distance
@@ -79,6 +79,10 @@ def parse_args():
     p.add_argument("--boundary-bias-alpha", type=float, default=0.0,
                    help="Over-weight mask boundary pixels in mask-seeded pool FPS (0=uniform)")
     p.add_argument("--batch-size",     type=int, default=1)
+    p.add_argument("--method",         default="consensus",
+                   help="Instance-discovery method to screen (MV segmentation "
+                        "tournament). One of: registry names "
+                        f"{available_methods()}. Default = consensus baseline.")
     p.add_argument("--no-ply",         action="store_true",
                    help="Skip per-sample PLY export (recommended for large runs)")
     return p.parse_args()
@@ -202,6 +206,9 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+
+    discover_fn = get_discovery_fn(args.method)
+    print(f"Instance-discovery method: {args.method}")
 
     sweep_rtols = None
     if args.sweep_rtols:
@@ -348,7 +355,7 @@ def main():
 
             for rtol in sweep_rtols:
                 with torch.no_grad():
-                    obj_voxels, _ctx, diag = discover_instance_points_mv(
+                    obj_voxels, _ctx, diag = discover_fn(
                         local_points        = lp,
                         scene_transforms    = st,
                         panoptic_masks      = panoptic_masks,
@@ -416,7 +423,7 @@ def main():
 
         else:
             with torch.no_grad():
-                obj_voxels, ctx_voxels, diag = discover_instance_points_mv(
+                obj_voxels, ctx_voxels, diag = discover_fn(
                     local_points        = lp,
                     scene_transforms    = st,
                     panoptic_masks      = panoptic_masks,
