@@ -306,7 +306,20 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
                  else torch.arange(m, device=device))
         padded[b, :m] = p[order].float()
         orders.append((order, m))
-    _, idx_pad = sample_farthest_points(padded, lengths, K=n_sample, random_start_point=False)
+    # pytorch3d's FPS CUDA kernel reads out of bounds (an intermittent illegal memory
+    # access — it only faults when the OOB address hits an unmapped page) when K exceeds
+    # the padded point count P=Mmax; the Python wrapper validates lengths<=P but NOT K<=P.
+    # Small/occluded objects routinely yield fewer candidate points than num_obj_voxels, so
+    # cap K to Mmax and pad each item back up to n_sample by repetition below — the same
+    # small-cloud guard fps_centroid_seeded already applies.
+    K_eff = min(n_sample, Mmax)
+    _, idx_pad = sample_farthest_points(padded, lengths, K=K_eff, random_start_point=False)
+
+    def _pad_to(x):   # (k, 3) -> (n_sample, 3), repeating the last row when short
+        if x.shape[0] >= n_sample:
+            return x[:n_sample]
+        return torch.cat([x, x[-1:].expand(n_sample - x.shape[0], 3)], dim=0)
+
     obj_out, geom_out = [], []
     for b in range(B):
         order, m = orders[b]
@@ -316,10 +329,10 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
             geom_out.append(z)
             continue
         orig = order[idx_pad[b].clamp(0, m - 1)]      # padded(ordered) -> original idx
-        sel = pts_list[b][orig]                        # (n_sample, 3)
+        sel = _pad_to(pts_list[b][orig])               # (n_sample, 3)
         obj_out.append(sel)
         g = geom_list[b]
-        geom_out.append(g[orig] if g is not None else sel)
+        geom_out.append(_pad_to(g[orig]) if g is not None else sel)
     obj_t = torch.stack(obj_out, dim=0).to(out_dtype)
     geom_t = torch.stack(geom_out, dim=0).to(out_dtype)
     return obj_t, geom_t
