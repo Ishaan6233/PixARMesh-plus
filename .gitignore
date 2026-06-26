@@ -203,3 +203,6 @@ checkpoints/**/*.bin
 checkpoints/**/*.ckpt
 checkpoints/**/*.pt
 checkpoints/**/*.pth
+
+#CLAUDE
+CLAUDE.md
