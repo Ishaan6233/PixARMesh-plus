@@ -25,30 +25,33 @@ from collections import defaultdict
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
+from functools import partial
+
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.spatial
 import torch
-import datasets as hf_datasets
 import trimesh
-from functools import partial
 from torch.utils.data import DataLoader
 from transformers import AutoImageProcessor
 
+import datasets as hf_datasets
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from metrics.chamfer import chamfer_distance
 from src.data.mesh import transform_3d_front_multiview
+from src.models.discovery import available_methods, get_discovery_fn
 from src.models.frozen_geo_encoder import (
     _get_per_view_target_ids,
     _project_pts_to_views,
     _sample_mask_ids,
     build_geo_obj_pc,
 )
-from src.models.discovery import available_methods, get_discovery_fn
 from src.models.utils import get_pi3x_encoder
 from src.utils.config import DataConfig, ModelConfig
-from metrics.chamfer import chamfer_distance
 
 
 def parse_args():
@@ -199,6 +202,74 @@ def _fps_spread_cv(pts: np.ndarray) -> float:
     if mean_d < 1e-9:
         return 0.0
     return float(nn_dists.std() / mean_d)
+
+
+def _cloud_fingerprint(pts: np.ndarray) -> tuple[list, list]:
+    """Centroid + axis-aligned extent of obj_voxels — a cheap identity hash for the
+    discovered cloud. Two objects in a scene with the same fingerprint share a cloud
+    (target-ID collapse)."""
+    if pts.shape[0] == 0:
+        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    c = pts.mean(0)
+    e = pts.max(0) - pts.min(0)
+    return [round(float(x), 5) for x in c], [round(float(x), 5) for x in e]
+
+
+def compute_object_discrimination(
+    results: list,
+    agg: dict,
+    cloud_metrics: tuple = ("purity", "pool_hit_rate", "fps_spread_cv"),
+) -> dict:
+    """Does discovery emit a *different* cloud per requested object, or one shared
+    scene cloud (target-ID collapse)?
+
+    Reads within-scene spread on **cloud-intrinsic** metrics only — NOT ``chamfer_fwd``,
+    whose within-scene variance is GT-driven (the same shared cloud scored against a
+    different per-object GT) and so spuriously looks per-object. For each metric: mean
+    within-scene std over multi-object scenes, and a discrimination ratio
+    (within / global std). A direct identical-cloud-scene fraction is reported when the
+    per-sample cloud fingerprint is present. Collapsed baseline ⇒ ratios ≈ 0.
+    """
+    by = defaultdict(list)
+    for r in results:
+        by[r["uid"].split("__")[0]].append(r)
+    multi = {s: o for s, o in by.items() if len(o) > 1}
+
+    per_metric = {}
+    for k in cloud_metrics:
+        if multi:
+            wstds = [float(np.std([o[k] for o in objs])) for objs in multi.values()]
+            msw = float(np.mean(wstds))
+        else:
+            msw = 0.0
+        gstd = agg[k]["std"] if k in agg else float(np.std([r[k] for r in results]))
+        per_metric[k] = {
+            "mean_within_scene_std": msw,
+            "discrimination_ratio": float(msw / gstd) if gstd > 1e-12 else 0.0,
+        }
+
+    # Direct collapse check via cloud fingerprint (when emitted).
+    if multi and all("obj_centroid" in o for objs in multi.values() for o in objs):
+        identical = 0
+        for objs in multi.values():
+            fps = {
+                (tuple(o["obj_centroid"]), tuple(o["obj_extent"])) for o in objs
+            }
+            if len(fps) == 1:
+                identical += 1
+        identical_cloud_scene_frac = identical / len(multi)
+    else:
+        identical_cloud_scene_frac = None
+
+    ratios = [per_metric[k]["discrimination_ratio"] for k in cloud_metrics]
+    mean_ratio = float(np.mean(ratios)) if ratios else 0.0
+    return {
+        "n_multi_object_scenes": len(multi),
+        "per_metric": per_metric,
+        "identical_cloud_scene_frac": identical_cloud_scene_frac,
+        "mean_discrimination_ratio": mean_ratio,
+        "collapse": mean_ratio < 0.05,
+    }
 
 
 def main():
@@ -395,7 +466,9 @@ def main():
                     bwd_cd = float(chamfer_distance(
                         ov_cpu, cp_cpu, squared=False, reduction="mean", single_directional=True,
                     ).item())
-                    fps_cv = _fps_spread_cv(ov_b.float().cpu().numpy())
+                    ov_np_sweep = ov_b.float().cpu().numpy()
+                    fps_cv = _fps_spread_cv(ov_np_sweep)
+                    obj_centroid, obj_extent = _cloud_fingerprint(ov_np_sweep)
 
                     rec = {
                         "uid":           uid_b,
@@ -405,6 +478,8 @@ def main():
                         "chamfer_bwd":   bwd_cd,
                         "fps_spread_cv": fps_cv,
                         "n_obj_pts_raw": int(diag["n_obj_pts_raw"][b]),
+                        "obj_centroid":  obj_centroid,
+                        "obj_extent":    obj_extent,
                     }
                     rtol_results[rtol].append(rec)
                     n_r = len(rtol_results[rtol])
@@ -475,6 +550,7 @@ def main():
                 ).item())
                 ov_np  = ov_b.float().cpu().numpy()
                 fps_cv = _fps_spread_cv(ov_np)
+                obj_centroid, obj_extent = _cloud_fingerprint(ov_np)
 
                 rec = {
                     "uid":           uid_b,
@@ -484,6 +560,8 @@ def main():
                     "chamfer_bwd":   bwd_cd,
                     "fps_spread_cv": fps_cv,
                     "n_obj_pts_raw": int(diag["n_obj_pts_raw"][b]),
+                    "obj_centroid":  obj_centroid,
+                    "obj_extent":    obj_extent,
                 }
                 results.append(rec)
                 n = len(results)
@@ -598,6 +676,9 @@ def main():
             "p75":  float(np.percentile(vals, 75)),
         }
 
+    # --- Object-discrimination: per-object vs scene-shared cloud (target-ID collapse) ---
+    agg["object_discrimination"] = compute_object_discrimination(results, agg)
+
     report = {"per_sample": results, "per_scene": per_scene, "aggregate": agg}
     report_path = out_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2))
@@ -609,6 +690,20 @@ def main():
         a = agg[k]
         print(f"  {k:<18}  mean={a['mean']:.4f}  std={a['std']:.4f}  "
               f"[{a['min']:.4f}, {a['max']:.4f}]")
+
+    # --- Object-discrimination verdict (cloud-intrinsic metrics; chamfer_fwd excluded) ---
+    od = agg["object_discrimination"]
+    print(f"\nObject-discrimination  ({od['n_multi_object_scenes']} multi-object scenes; "
+          f"chamfer_fwd excluded — GT-driven):")
+    print(f"  {'metric':<16}{'within-scene std':>18}{'disc ratio':>13}")
+    for k in ("purity", "pool_hit_rate", "fps_spread_cv"):
+        d = od["per_metric"][k]
+        print(f"  {k:<16}{d['mean_within_scene_std']:>18.5f}{d['discrimination_ratio']:>13.3f}")
+    icf = od["identical_cloud_scene_frac"]
+    icf_str = "n/a (no fingerprint)" if icf is None else f"{icf:.1%}"
+    print(f"  identical-cloud scenes: {icf_str}   "
+          f"mean disc ratio={od['mean_discrimination_ratio']:.3f}   "
+          f"=> {'COLLAPSE' if od['collapse'] else 'OK (per-object)'}")
 
     # --- Per-scene summary table to stdout ---
     if n_scenes > 1:
