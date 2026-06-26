@@ -173,36 +173,45 @@ def joint_filter(logits, k=50, p=0.95):
 
 
 def get_prefix_allowed_tokens_fn_edgerunner(model, batch_size=1):
-    def prefix_allowed_tokens_fn_with_state(batch_id, input_ids, states):
-        state = states[batch_id]
-        idx = input_ids.shape[0]
-        # print(f'=== prefix idx: {idx} ===')
-        # BOS is always provided, so the first token must be BOM
-        # 0=PAD, 1=BOS, 2=EOS, 3=L, 4=R, 5=BOM, 6~=coords
-        if idx == 0:
+    """Return a stateless EdgeRunner grammar mask usable by greedy or beam search.
+
+    Token grammar:
+    - 5 (BOM) starts a face patch and must be followed by 9 coordinate tokens.
+    - 3/4 (L/R) extend the patch and must be followed by 3 coordinate tokens.
+    - After a complete patch/extension, the next token can be L/R/BOM/EOS.
+
+    The old implementation kept one mutable counter per batch item. Beam search calls this
+    function independently for each live beam, so shared mutable state corrupts divergent
+    beams. Recomputing the state from `input_ids` keeps the grammar beam-safe.
+    """
+    del batch_size  # Kept for API compatibility with existing call sites.
+    structure_tokens = {3, 4, 5}
+    coord_start = 6
+
+    def prefix_allowed_tokens_fn(batch_id, input_ids):
+        del batch_id
+        tokens = input_ids.tolist()
+        if len(tokens) == 0:
+            return [5]
+        if tokens[-1] == model.config.eos_token_id:
+            return [model.config.eos_token_id]
+
+        last_struct_idx = None
+        for i in range(len(tokens) - 1, -1, -1):
+            if tokens[i] in structure_tokens:
+                last_struct_idx = i
+                break
+
+        if last_struct_idx is None:
             return [5]
 
-        # update state based on the last token
-        if input_ids[-1] == 5:
-            state["counter"] = 9  # after BOM, there must be 9 coords tokens
-        elif input_ids[-1] in [3, 4]:
-            state["counter"] = 3  # after LR, there must be 3 coords tokens
-        elif input_ids[-1] >= 6:
-            state["counter"] -= 1  # after coords, counter -1
+        last_struct = tokens[last_struct_idx]
+        required_coords = 9 if last_struct == 5 else 3
+        consumed_coords = len(tokens) - last_struct_idx - 1
+        if consumed_coords < required_coords:
+            return list(range(coord_start, model.config.vocab_size))
+        return [3, 4, 5, model.config.eos_token_id]
 
-        # set rules for the next token
-        # counter > 0 means there are still coords to be filled
-        if state["counter"] > 0:
-            return list(range(6, model.config.vocab_size))
-        # otherwise, it could be L/R/BOM/EOS
-        else:
-            return [3, 4, 5, model.config.eos_token_id]
-
-    # keep a persistent state during generation
-    states = [{"counter": 0} for _ in range(batch_size)]
-    prefix_allowed_tokens_fn = partial(
-        prefix_allowed_tokens_fn_with_state, states=states
-    )
     return prefix_allowed_tokens_fn
 
 

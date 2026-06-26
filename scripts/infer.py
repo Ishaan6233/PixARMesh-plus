@@ -8,6 +8,7 @@ warnings.filterwarnings("ignore")
 import argparse
 import torch
 import numpy as np
+import trimesh
 from tqdm import tqdm
 from accelerate import PartialState
 from pathlib import Path
@@ -24,6 +25,93 @@ from src.utils.inference import (
 )
 from src.data.collator import get_mesh_data_collator
 from src.data import utils as data_utils, tokenize_bpt
+
+
+EDGERUNNER_DEFAULT_MAX_FACES = 4096
+EDGERUNNER_DEFAULT_MIN_FACES = 8
+
+
+def _max_tokens_for_edgerunner_faces(max_faces: int) -> int:
+    # Worst case: every face starts a new patch, BOM + 9 coordinate tokens.
+    return max(1, int(max_faces) * 10)
+
+
+def _min_tokens_for_edgerunner_faces(min_faces: int) -> int:
+    if min_faces <= 0:
+        return 0
+    # Best case: one BOM face, then linked faces as L/R + 3 coordinate tokens.
+    return 10 + max(0, int(min_faces) - 1) * 4
+
+
+def _edgerunner_generation_kwargs(args, prompt_len, collator, model, batch_size):
+    position_budget = collator.max_seq_length - int(prompt_len)
+    if position_budget <= 0:
+        raise RuntimeError(
+            f"Prompt length {prompt_len} leaves no room under max_seq_length="
+            f"{collator.max_seq_length}"
+        )
+
+    face_cap_tokens = _max_tokens_for_edgerunner_faces(args.max_faces)
+    requested_cap = (
+        int(args.max_new_tokens)
+        if args.max_new_tokens is not None
+        else face_cap_tokens
+    )
+    max_new_tokens = max(1, min(position_budget, requested_cap, face_cap_tokens))
+    min_new_tokens = min(
+        max_new_tokens,
+        _min_tokens_for_edgerunner_faces(args.min_faces),
+    )
+
+    kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "use_cache": True,
+        "do_sample": False,
+        "prefix_allowed_tokens_fn": get_prefix_allowed_tokens_fn_edgerunner(
+            model, batch_size=batch_size
+        ),
+    }
+    if min_new_tokens > 0:
+        kwargs["min_new_tokens"] = min_new_tokens
+    if args.num_beams > 1:
+        kwargs.update(
+            num_beams=args.num_beams,
+            early_stopping=True,
+            length_penalty=args.length_penalty,
+        )
+    if args.do_sample:
+        kwargs.update(do_sample=True, top_k=10)
+    return kwargs
+
+
+def _strip_padding_and_eos(tokens, pad_token_id, eos_token_id):
+    tokens = tokens[tokens != pad_token_id]
+    eos_idx = (tokens == eos_token_id).nonzero()[0]
+    if len(eos_idx) > 0:
+        tokens = tokens[: eos_idx[0]]
+    return tokens
+
+
+def _write_decode_failure_placeholder(out_path):
+    trimesh.Trimesh(
+        vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32),
+        faces=np.array([[0, 1, 2]]),
+    ).export(out_path)
+
+
+def _export_edgerunner_mesh(tokens, collator, model, out_path, uid):
+    tokens = _strip_padding_and_eos(
+        tokens, collator.pad_token_id, model.config.eos_token_id
+    )
+    try:
+        mesh = decode_mesh_edgerunner(
+            tokens, collator.tokenizer, clean=True, verbose=False
+        )
+        mesh.export(out_path)
+    except Exception as e:
+        print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
+        # Keep eval coverage honest: a decode failure should score badly, not disappear.
+        _write_decode_failure_placeholder(out_path)
 
 
 def run_multiview_inference(args):
@@ -139,40 +227,21 @@ def run_multiview_inference(args):
                     gt_obj_vertices=_to(batch.get("gt_obj_vertices")),
                 )
 
-                max_new_tokens = min(
-                    collator.max_seq_length - inputs_embeds.shape[1], 40960
-                )
                 results = model.generate(
                     inputs_embeds=inputs_embeds,
-                    max_new_tokens=max_new_tokens,
-                    use_cache=True,
-                    do_sample=False,
-                    prefix_allowed_tokens_fn=get_prefix_allowed_tokens_fn_edgerunner(
-                        model, batch_size=len(examples)
+                    **_edgerunner_generation_kwargs(
+                        args,
+                        prompt_len=inputs_embeds.shape[1],
+                        collator=collator,
+                        model=model,
+                        batch_size=len(examples),
                     ),
                 )
                 results = results.cpu().numpy()
                 for uid, tokens in zip(uids, results):
-                    tokens = tokens[tokens != collator.pad_token_id]
-                    eos_idx = (tokens == model.config.eos_token_id).nonzero()[0]
-                    if len(eos_idx) > 0:
-                        tokens = tokens[: eos_idx[0]]
-                    try:
-                        mesh = decode_mesh_edgerunner(
-                            tokens, collator.tokenizer, clean=True, verbose=False
-                        )
-                        mesh.export(out_dir / f"{uid}.ply")
-                    except Exception as e:
-                        print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
-                        # Write a degenerate placeholder so the miss COUNTS as a bad score
-                        # in eval (has_pred=True) instead of being silently dropped from
-                        # the CD/F mean — keeps coverage honest. See eval_obj.py coverage.
-                        import trimesh as _tm
-                        _tm.Trimesh(
-                            vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]],
-                                              dtype=np.float32),
-                            faces=np.array([[0, 1, 2]]),
-                        ).export(out_dir / f"{uid}.ply")
+                    _export_edgerunner_mesh(
+                        tokens, collator, model, out_dir / f"{uid}.ply", uid
+                    )
 
 
 def main():
@@ -325,6 +394,39 @@ def main():
         help="MV path: feed confidence-weighted multi-view DINO at the obj voxels as the "
              "cond_encoder extra_feat (restores SV's always-on appearance term). "
              "Sets mv_obj_pc_appearance=true; prefix_len unchanged.",
+    )
+    parser.add_argument(
+        "--max-faces",
+        type=int,
+        default=EDGERUNNER_DEFAULT_MAX_FACES,
+        help="EdgeRunner generation cap in training face-count units. The token cap is "
+             "10 * max_faces, matching the worst-case BOM+coords encoding.",
+    )
+    parser.add_argument(
+        "--min-faces",
+        type=int,
+        default=EDGERUNNER_DEFAULT_MIN_FACES,
+        help="EdgeRunner minimum decoded mesh size before EOS is allowed, expressed as "
+             "linked-face token length. Helps beam search avoid tiny early-EOS meshes.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="Optional stricter EdgeRunner token cap; still clipped by --max-faces and "
+             "the model's max_seq_length.",
+    )
+    parser.add_argument(
+        "--num-beams",
+        type=int,
+        default=4,
+        help="EdgeRunner beam count. Set to 1 to recover greedy decoding.",
+    )
+    parser.add_argument(
+        "--length-penalty",
+        type=float,
+        default=1.0,
+        help="Length penalty passed to EdgeRunner beam search.",
     )
     args = parser.parse_args()
 
@@ -595,9 +697,8 @@ def main():
                 )
 
                 seq_len = all_input_ids.shape[1]
-                max_new_tokens = min(collator.max_seq_length - seq_len, 40960)
-
                 if is_bpt:
+                    max_new_tokens = min(collator.max_seq_length - seq_len, 40960)
                     results = model.generate(
                         inputs=all_input_ids,
                         cond_embeds=inputs_embeds,
@@ -610,36 +711,28 @@ def main():
                     )
                     results = results[:, seq_len:]
                 else:
-                    extra_args = {"do_sample": False}
-                    if args.do_sample:
-                        extra_args = {
-                            "do_sample": True,
-                            "top_k": 10,
-                        }
                     results = model.generate(
                         inputs_embeds=inputs_embeds,
-                        max_new_tokens=max_new_tokens,
-                        use_cache=True,
-                        prefix_allowed_tokens_fn=get_prefix_allowed_tokens_fn_edgerunner(
-                            model,
+                        **_edgerunner_generation_kwargs(
+                            args,
+                            prompt_len=seq_len,
+                            collator=collator,
+                            model=model,
                             batch_size=bs,
                         ),
-                        **extra_args,
                     )
                 results = results.cpu().numpy()
                 for uid, tokens in zip(all_uids, results):
-                    # remove padding
-                    tokens = tokens[tokens != collator.pad_token_id]
-                    eos_idx = (tokens == model.config.eos_token_id).nonzero()[0]
-                    if len(eos_idx) > 0:
-                        tokens = tokens[: eos_idx[0]]
                     if is_bpt:
-                        mesh = decode_bpt(tokens)
-                    else:
-                        mesh = decode_mesh_edgerunner(
-                            tokens, collator.tokenizer, clean=True, verbose=False
+                        tokens = _strip_padding_and_eos(
+                            tokens, collator.pad_token_id, model.config.eos_token_id
                         )
-                    mesh.export(out_dir / f"{uid}.ply")
+                        mesh = decode_bpt(tokens)
+                        mesh.export(out_dir / f"{uid}.ply")
+                    else:
+                        _export_edgerunner_mesh(
+                            tokens, collator, model, out_dir / f"{uid}.ply", uid
+                        )
 
 
 if __name__ == "__main__":
