@@ -354,6 +354,7 @@ class ShapeOPT(OPTForCausalLM):
         mv_num_obj_voxels = getattr(self.config, "mv_num_obj_voxels", 512)
         mv_num_ctx_voxels = getattr(self.config, "mv_num_ctx_voxels", 1024)
 
+        obj_voxels_geom = None   # registered geometry-stream cloud (set in discover path)
         if panoptic_masks is not None:
             # Enhance seed first: use Pi3X geometry at reference-view obj pixels
             ref_idx = self._select_ref_view(lp, view_mask)
@@ -366,7 +367,7 @@ class ShapeOPT(OPTForCausalLM):
                 seed_list.append(pc_b)
             seed_pcs = torch.cat(seed_list, dim=0)   # (B, P, 3)
 
-            obj_voxels, ctx_voxels, mv_target_ids = discover_instance_points_mv(
+            obj_voxels, ctx_voxels, mv_target_ids, obj_voxels_geom = discover_instance_points_mv(
                 local_points        = lp,
                 scene_transforms    = st,
                 panoptic_masks      = panoptic_masks.to(device),
@@ -378,11 +379,13 @@ class ShapeOPT(OPTForCausalLM):
                 conf                = pi3x_out["conf"],
                 # Proven operating point (Experiments 1-5): mask consensus with 3-view
                 # agreement and no depth gate. min_views/depth_rtol must be passed
-                # explicitly — the function defaults (2 / 0.10) are the rejected config.
                 depth_rtol          = getattr(self.config, "mv_depth_rtol", 100.0),
                 min_views           = getattr(self.config, "mv_min_views", 3),
                 mask_seeded_pool    = getattr(self.config, "mv_mask_seeded_pool", True),
                 boundary_bias_alpha = getattr(self.config, "mv_boundary_bias_alpha", 0.0),
+                pool_size           = getattr(self.config, "mv_pool_size", 8192),
+                intra_obj_register  = getattr(self.config, "mv_intra_obj_register", False),
+                register_iters      = getattr(self.config, "mv_register_iters", 4),
                 return_target_ids   = True,
             )   # (B, V_obj, 3), (B, V_ctx, 3), (B, N)
         else:
@@ -432,10 +435,25 @@ class ShapeOPT(OPTForCausalLM):
         # sees these; projection/feature-sampling keep the scene-frame obj_voxels.
         obj_geom_voxels = None
         if obj_canon_transform is not None:
-            R = obj_canon_transform[:, :3, :3].to(device=obj_voxels.device, dtype=obj_voxels.dtype)
-            v = torch.bmm(obj_voxels, R.transpose(1, 2))   # (B, V, 3) rotate about origin
-            vmin = v.amin(dim=1, keepdim=True)
-            vmax = v.amax(dim=1, keepdim=True)
+            # Fix A: the geometry stream uses the cross-view-REGISTERED cloud when available
+            # (obj_voxels_geom), while obj_voxels stays scene-frame for projection/DINO.
+            src_voxels = obj_voxels_geom if obj_voxels_geom is not None else obj_voxels
+            R = obj_canon_transform[:, :3, :3].to(device=src_voxels.device, dtype=src_voxels.dtype)
+            v = torch.bmm(src_voxels, R.transpose(1, 2))   # (B, V, 3) rotate about origin
+            # Robust per-axis extent (MoGe-ROE style, Fix B): raw min/max lets a few
+            # partial-observation outliers / mask-bleed stragglers inflate the scale and
+            # blow up the aspect ratio (measured: ~1.4x inflation, anisotropy 4.24). Using
+            # the [q, 1-q] quantile box instead trims those tails. q=0 recovers the original
+            # min/max behaviour (clean A/B). Rotation stays from obj_canon_transform.
+            q = float(getattr(self.config, "mv_geom_norm_quantile", 0.0) or 0.0)
+            if q > 0.0:
+                qs = torch.tensor([q, 1.0 - q], device=v.device, dtype=torch.float32)
+                bounds = torch.quantile(v.float(), qs, dim=1)   # (2, B, 3)
+                vmin = bounds[0].unsqueeze(1).to(v.dtype)        # (B, 1, 3)
+                vmax = bounds[1].unsqueeze(1).to(v.dtype)
+            else:
+                vmin = v.amin(dim=1, keepdim=True)
+                vmax = v.amax(dim=1, keepdim=True)
             center = 0.5 * (vmin + vmax)
             scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
             obj_geom_voxels = (v - center) * scale          # (B, V, 3) canonical frame

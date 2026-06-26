@@ -14,10 +14,12 @@ Adding a new backbone:
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from abc import ABC, abstractmethod
+from pytorch3d.ops import sample_farthest_points
 
 logger = logging.getLogger(__name__)
 
@@ -241,65 +243,71 @@ def fps_centroid_seeded(pts: torch.Tensor, n_sample: int) -> torch.Tensor:
         pad = pts[:, -1:, :].expand(B, n_sample - M, 3)
         return torch.cat([pts, pad], dim=1)
 
-    pts_f = pts.float()
-    centroid = pts_f.mean(dim=1, keepdim=True)                   # (B, 1, 3)
-    seed_idx = (pts_f - centroid).norm(dim=-1).argmin(dim=1)     # (B,)
-
-    # Pure-PyTorch FPS (no pointnet2_ops dependency)
-    device = pts.device
-    selected = torch.zeros(B, n_sample, dtype=torch.long, device=device)
-    selected[:, 0] = seed_idx
-    dist = torch.full((B, M), float("inf"), device=device)
-
-    for i in range(1, n_sample):
-        prev = selected[:, i - 1]                                # (B,)
-        prev_pts = pts_f[torch.arange(B, device=device), prev]  # (B, 3)
-        d = (pts_f - prev_pts.unsqueeze(1)).norm(dim=-1)         # (B, M)
-        dist = torch.minimum(dist, d)
-        selected[:, i] = dist.argmax(dim=1)
-
-    idx = selected.unsqueeze(-1).expand(B, n_sample, 3)
-    return pts.gather(1, idx)
+    # CUDA farthest-point sampling (pytorch3d) — ~50x faster than the old pure-PyTorch
+    # n_sample-iteration Python loop, and batches across B in one call. Deterministic
+    # start (index 0); the centroid seed is dropped (FPS coverage is seed-robust; the
+    # dominant object FPS keeps its score seed in _batched_obj_fps).
+    _, idx = sample_farthest_points(pts.float(), K=n_sample, random_start_point=False)
+    return pts.gather(1, idx.unsqueeze(-1).expand(B, n_sample, 3))
 
 
-def fps_score_seeded(pts: torch.Tensor, scores: torch.Tensor, n_sample: int) -> torch.Tensor:
-    """FPS seeded from the highest-score point rather than the centroid.
+def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dtype,
+                     max_pts: int = 8192):
+    """One batched score-seeded FPS over B variable-length object clouds (Opt 2).
 
-    Biases uniform coverage toward the most-agreed geometry — points seen in
-    more views (higher hit_count) are preferred as the initial seed, so the
-    selected set starts from the confidently-reconstructed object core.
-
-    Args:
-        pts:      (B, M, 3)
-        scores:   (B, M)  per-point confidence; higher = seed first
-        n_sample: number of points to keep
-    Returns:
-        (B, n_sample, 3)
+    Replaces B serial per-item `fps_score_seeded` calls with a single padded pytorch3d
+    `sample_farthest_points(..., lengths=...)` call. Each item is reordered by descending
+    score so index 0 is the highest-score seed, the indices are mapped back to the original
+    ordering, and the index-aligned registered-geometry twin (geom_list[b], or None) is
+    gathered with the same indices. Returns (B, n_sample, 3) sampled points and twins.
     """
-    B, M, _ = pts.shape
-    if n_sample >= M:
-        if n_sample == M:
-            return pts
-        pad = pts[:, -1:, :].expand(B, n_sample - M, 3)
-        return torch.cat([pts, pad], dim=1)
+    # Cap each cloud to max_pts (deterministic even stride) so one huge object cannot
+    # inflate the padded (B, Mmax, 3) buffer + FPS compute for every item in the batch.
+    capped_pts, capped_scores, capped_geom = [], [], []
+    for p, s, g in zip(pts_list, scores_list, geom_list):
+        m = p.shape[0]
+        if m > max_pts:
+            sub = torch.arange(0, m, (m + max_pts - 1) // max_pts, device=device)[:max_pts]
+            p = p[sub]
+            s = s[sub] if s is not None else None
+            g = g[sub] if g is not None else None
+        capped_pts.append(p)
+        capped_scores.append(s)
+        capped_geom.append(g)
+    pts_list, scores_list, geom_list = capped_pts, capped_scores, capped_geom
 
-    pts_f   = pts.float()
-    seed_idx = scores.argmax(dim=1)   # (B,) — start from highest-confidence point
-
-    device   = pts.device
-    selected = torch.zeros(B, n_sample, dtype=torch.long, device=device)
-    selected[:, 0] = seed_idx
-    dist = torch.full((B, M), float("inf"), device=device)
-
-    for i in range(1, n_sample):
-        prev     = selected[:, i - 1]
-        prev_pts = pts_f[torch.arange(B, device=device), prev]   # (B, 3)
-        d        = (pts_f - prev_pts.unsqueeze(1)).norm(dim=-1)  # (B, M)
-        dist     = torch.minimum(dist, d)
-        selected[:, i] = dist.argmax(dim=1)
-
-    idx = selected.unsqueeze(-1).expand(B, n_sample, 3)
-    return pts.gather(1, idx)
+    B = len(pts_list)
+    lengths = torch.tensor([max(1, p.shape[0]) for p in pts_list], device=device, dtype=torch.long)
+    Mmax = int(lengths.max())
+    padded = torch.zeros(B, Mmax, 3, device=device, dtype=torch.float32)
+    orders: list = []
+    for b, (p, s) in enumerate(zip(pts_list, scores_list)):
+        m = p.shape[0]
+        if m == 0:
+            orders.append((None, 0))
+            continue
+        order = (s.argsort(descending=True)
+                 if (s is not None and s.shape[0] == m)
+                 else torch.arange(m, device=device))
+        padded[b, :m] = p[order].float()
+        orders.append((order, m))
+    _, idx_pad = sample_farthest_points(padded, lengths, K=n_sample, random_start_point=False)
+    obj_out, geom_out = [], []
+    for b in range(B):
+        order, m = orders[b]
+        if m == 0:
+            z = torch.zeros(n_sample, 3, device=device)
+            obj_out.append(z)
+            geom_out.append(z)
+            continue
+        orig = order[idx_pad[b].clamp(0, m - 1)]      # padded(ordered) -> original idx
+        sel = pts_list[b][orig]                        # (n_sample, 3)
+        obj_out.append(sel)
+        g = geom_list[b]
+        geom_out.append(g[orig] if g is not None else sel)
+    obj_t = torch.stack(obj_out, dim=0).to(out_dtype)
+    geom_t = torch.stack(geom_out, dim=0).to(out_dtype)
+    return obj_t, geom_t
 
 
 def build_geo_ctx_voxels_mv(
@@ -531,6 +539,73 @@ def _seed_biased_pool(
         ).squeeze(0)
 
 
+def _umeyama_sim3(src: torch.Tensor, tgt: torch.Tensor, w: torch.Tensor):
+    """Weighted similarity (scale, R, t) mapping paired src->tgt. Ports the proven
+    masked-Umeyama math from src/pi3x/pipe/pi3x_vo.py:_compute_sim3_umeyama_masked,
+    generalized from a 0/1 mask to continuous (confidence) weights. src,tgt: (M,3)
+    paired; w: (M,) >= 0."""
+    eps = 1e-6
+    # Identity fallback for degenerate inputs (too few/zero-weight or rank-deficient
+    # correspondences), mirroring the guard in the ported source — prevents a NaN/unstable
+    # Sim3 from corrupting the conditioning during training.
+    one = torch.ones((), device=src.device)
+    ident = (one, torch.eye(3, device=src.device), torch.zeros(3, device=src.device))
+    # SVD/matmul are not bf16-supported; force float32 and disable autocast since this
+    # runs inside the model's bf16 autocast region.
+    with torch.autocast(device_type=src.device.type, enabled=False):
+        src = src.float()
+        tgt = tgt.float()
+        w = w.float().clamp_min(0)
+        wsum = w.sum()
+        if src.shape[0] < 3 or wsum < eps:
+            return ident
+        wsum = wsum.clamp_min(eps)
+        mu_s = (src * w[:, None]).sum(0) / wsum
+        mu_t = (tgt * w[:, None]).sum(0) / wsum
+        sc = src - mu_s
+        tc = tgt - mu_t
+        H = (sc * w[:, None]).transpose(0, 1) @ tc / wsum            # (3,3)
+        if not torch.isfinite(H).all():
+            return ident
+        U, S, V = torch.svd(H)
+        d = torch.sign(torch.det(V @ U.transpose(0, 1)))
+        D = torch.diag(torch.stack([one, one, d]))
+        R = V @ D @ U.transpose(0, 1)
+        var_s = ((sc ** 2).sum(1) * w).sum() / wsum
+        S_corr = S.clone()
+        S_corr[2] = S_corr[2] * d
+        scale = (S_corr.sum() / var_s.clamp_min(eps)).clamp(0.3, 3.0)
+        t = mu_t - scale * (R @ mu_s)
+        if not (torch.isfinite(R).all() and torch.isfinite(scale) and torch.isfinite(t).all()):
+            return ident
+    return scale, R, t
+
+
+def _icp_align(src: torch.Tensor, tgt: torch.Tensor, w: torch.Tensor | None,
+               iters: int = 4, max_pts: int = 2048) -> torch.Tensor:
+    """Confidence-weighted Sim3 ICP aligning point cloud `src` onto `tgt` via
+    nearest-neighbour correspondences. Returns the full transformed `src`. Used to
+    register per-view object point clouds into a common object frame before merging,
+    removing Pi3X's 8-13% cross-view inconsistency (Fix A / CMVSA)."""
+    if src.shape[0] < 10 or tgt.shape[0] < 10:
+        return src
+    X = src.float()
+    tgt_f = tgt.float()
+    if tgt_f.shape[0] > max_pts:
+        tgt_f = tgt_f[torch.randperm(tgt_f.shape[0], device=tgt_f.device)[:max_pts]]
+    for _ in range(iters):
+        if X.shape[0] > max_pts:
+            idx = torch.randperm(X.shape[0], device=X.device)[:max_pts]
+        else:
+            idx = torch.arange(X.shape[0], device=X.device)
+        Xs = X[idx]
+        nn = torch.cdist(Xs, tgt_f).argmin(1)
+        ws = (w[idx] if w is not None else torch.ones(Xs.shape[0], device=X.device))
+        scale, R, t = _umeyama_sim3(Xs, tgt_f[nn], ws)
+        X = (scale * (R @ X.transpose(0, 1)).transpose(0, 1)) + t
+    return X.to(src.dtype)
+
+
 def discover_instance_points_mv(
     local_points: torch.Tensor,        # (B, N, H, W, 3)  Pi3X per-view camera frame
     scene_transforms: torch.Tensor,    # (B, N, 4, 4)  cam_n → scene
@@ -548,6 +623,8 @@ def discover_instance_points_mv(
     min_views: int = 2,
     mask_seeded_pool: bool = False,
     boundary_bias_alpha: float = 0.0,
+    intra_obj_register: bool = False,
+    register_iters: int = 4,
     return_diagnostics: bool = False,
     return_pool_diagnostics: bool = False,
     return_target_ids: bool = False,
@@ -597,7 +674,11 @@ def discover_instance_points_mv(
     if return_pool_diagnostics:
         return_diagnostics = True  # pool diag implies base diag
 
-    obj_list: list[torch.Tensor] = []
+    # Opt 2: collect the per-item raw object clouds and FPS them all in ONE batched
+    # pytorch3d call after the loop (instead of 16 serial per-item FPS calls).
+    obj_raw_list: list[torch.Tensor] = []       # (M_b, 3) candidate object points
+    obj_scores_list: list[torch.Tensor | None] = []  # (M_b,) score for seeding, or None
+    reg_geom_list: list[torch.Tensor | None] = []    # (M_b, 3) registered twin, or None
     ctx_list: list[torch.Tensor] = []
     target_ids_list: list[torch.Tensor] = []
     diag_pool_hit_rate: list[float] = []
@@ -631,7 +712,9 @@ def discover_instance_points_mv(
                 conf_list.append(conf_n[valid].float())
 
         if len(pts_scene_list) == 0:
-            obj_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_obj_voxels).squeeze(0))
+            obj_raw_list.append(seed_pcs[b].float())   # FPS deferred to batched post-loop
+            obj_scores_list.append(None)
+            reg_geom_list.append(None)
             ctx_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_ctx_voxels).squeeze(0))
             target_ids_list.append(torch.full((N,), -1, dtype=torch.long, device=device))
             diag_pool_hit_rate.append(0.0)
@@ -657,6 +740,8 @@ def discover_instance_points_mv(
         target_ids_list.append(target_ids_n)
 
         # --- 2a. Pool construction ---
+        reg_obj_geom = reg_obj_scene = reg_obj_conf = None  # set by Fix A (mask-seeded path)
+        reg_active = False   # True => skip the (discarded) consensus pool + labeling
         if mask_seeded_pool:
             # Direct back-projection of target SAM mask pixels from all N views.
             # Fixes the pool-coverage bottleneck: the seed-biased FPS approach only
@@ -698,7 +783,42 @@ def discover_instance_points_mv(
                     w[boundary[combined]] = 1.0 + boundary_bias_alpha
                     mask_weight_list.append(w)
 
-            if mask_pool_list:
+            # Fix: cross-view register the per-view object clouds before merge.
+            # Each list entry is one view's masked object surface in scene space; Pi3X's
+            # 8-13% cross-view inconsistency makes the naive concat blurry. Align every
+            # view to the most-confident reference view via confidence-weighted Sim3 ICP,
+            # then use the registered merge for the GEOMETRY stream only. The scene-frame
+            # twin (reg_obj_scene, index-aligned) is kept for view projection + DINO
+            # sampling so those stay self-consistent with the camera poses.
+            reg_obj_geom = reg_obj_scene = reg_obj_conf = None
+            if intra_obj_register and len(mask_pool_list) >= 2:
+                if mask_conf_list:
+                    ref_j = int(torch.stack([c.sum() for c in mask_conf_list]).argmax())
+                else:
+                    ref_j = int(max(range(len(mask_pool_list)),
+                                    key=lambda j: mask_pool_list[j].shape[0]))
+                ref_pc = mask_pool_list[ref_j]
+                aligned = []
+                for j, pc in enumerate(mask_pool_list):
+                    if j == ref_j:
+                        aligned.append(pc)
+                    else:
+                        wj = mask_conf_list[j] if mask_conf_list else None
+                        aligned.append(_icp_align(pc, ref_pc, wj, iters=register_iters))
+                reg_obj_geom  = torch.cat(aligned, dim=0)          # registered (geometry)
+                reg_obj_scene = torch.cat(mask_pool_list, dim=0)   # original (projection)
+                reg_obj_conf  = torch.cat(mask_conf_list, dim=0) if mask_conf_list else None
+
+            # Opt 1: under registration the consensus pool below is built then DISCARDED
+            # (the object cloud comes from the registered mask points at step 5), so skip
+            # both the pool FPS and the projection/consensus to save ~half the per-step FPS.
+            # Diagnostics force the full path so eval_voxels/diagnose_pool_misses still work.
+            reg_active = (reg_obj_scene is not None and reg_obj_scene.shape[0] > 0
+                          and not return_diagnostics)
+
+            if reg_active:
+                pool_pts = reg_obj_scene[:1]   # placeholder for the degenerate fallback only
+            elif mask_pool_list:
                 raw_pts  = torch.cat(mask_pool_list, dim=0)
                 raw_conf = torch.cat(mask_conf_list, dim=0) if mask_conf_list else None
                 # Boundary bias: multiply conf by weight so boundary pixels are
@@ -736,7 +856,13 @@ def discover_instance_points_mv(
         # at least min_views views (clamped so we never require more views than
         # those that have a valid target ID).
         n_valid_views = int((target_ids_n > 0).sum().item())
-        if n_valid_views > 0:
+        if reg_active:
+            # Opt 1: object cloud comes from registration (step 5); consensus is skipped.
+            obj_pts    = torch.empty(0, 3, device=device)
+            obj_scores = None
+            diag_pool_hit_rate.append(0.0)
+            diag_n_obj_raw.append(0)
+        elif n_valid_views > 0:
             pix_coords, pts_cam = _project_pts_to_views(pool_pts, st_b, K_b, H, W)
             P = pool_pts.shape[0]
             threshold = min(min_views, n_valid_views)
@@ -784,22 +910,46 @@ def discover_instance_points_mv(
                 diag_pool_hit_2d.append(torch.zeros(P_b, dtype=torch.bool))
 
         # --- 5. Fallback + FPS to fixed obj size ---
+        # Fix A: when registration produced a merged object cloud, FPS on the SCENE-frame
+        # twin (projection-safe) and gather the index-aligned REGISTERED points for the
+        # geometry stream. The mask-seeded points are object-by-construction; we do NOT
+        # re-apply the min_views=3 consensus (it removes legitimately few-view surface and
+        # would undo Fix A's coverage gain) but DO drop low-confidence points (likely
+        # mask-bleed) by conf_threshold — the same purity guard adaptive_fps_voxelize uses.
+        use_reg = reg_obj_geom is not None and reg_obj_scene is not None and reg_obj_scene.shape[0] > 0
+        reg_geom_for_gather = None
+        if use_reg:
+            if reg_obj_conf is not None:
+                keep = reg_obj_conf >= conf_threshold
+                if int(keep.sum()) >= num_obj_voxels // 8:   # don't over-prune tiny objects
+                    reg_obj_scene = reg_obj_scene[keep]
+                    reg_obj_geom  = reg_obj_geom[keep]
+                    reg_obj_conf  = reg_obj_conf[keep]
+            obj_pts    = reg_obj_scene
+            obj_scores = reg_obj_conf.clamp_min(0) if reg_obj_conf is not None else None
+            reg_geom_for_gather = reg_obj_geom
         if obj_pts.shape[0] == 0:
             obj_pts    = seed_pcs[b].float()
             obj_scores = None  # no hit-count scores available in fallback
+            reg_geom_for_gather = None
         if obj_pts.shape[0] == 0:
             obj_pts    = pool_pts[:1]
             obj_scores = None
+            reg_geom_for_gather = None
 
-        if obj_scores is not None and obj_scores.shape[0] > 0:
-            obj_list.append(
-                fps_score_seeded(obj_pts.unsqueeze(0), obj_scores.unsqueeze(0), num_obj_voxels).squeeze(0)
-            )
-        else:
-            obj_list.append(fps_centroid_seeded(obj_pts.unsqueeze(0), num_obj_voxels).squeeze(0))
+        # Opt 2: defer the FPS — collect the raw candidate cloud, its seeding score, and
+        # the registered geometry twin. The batched FPS runs once after the loop.
+        obj_raw_list.append(obj_pts)
+        obj_scores_list.append(obj_scores)
+        reg_geom_list.append(reg_geom_for_gather)
         ctx_list.append(ctx_voxels_b)
 
-    obj_t = torch.stack(obj_list, dim=0).to(out_dtype)
+    # Opt 2: one batched score-seeded FPS over all items' object clouds (pytorch3d with
+    # `lengths`) replaces the B serial per-item calls — the index-aligned registered twin
+    # is gathered with the same indices.
+    obj_t, obj_geom_t = _batched_obj_fps(
+        obj_raw_list, obj_scores_list, reg_geom_list, num_obj_voxels, device, out_dtype
+    )
     ctx_t = torch.stack(ctx_list, dim=0).to(out_dtype)
     target_ids_t = torch.stack(target_ids_list, dim=0) if return_target_ids else None  # (B, N) long
     if return_diagnostics:
@@ -812,5 +962,5 @@ def discover_instance_points_mv(
             return obj_t, ctx_t, diag, target_ids_t
         return obj_t, ctx_t, diag
     if return_target_ids:
-        return obj_t, ctx_t, target_ids_t
+        return obj_t, ctx_t, target_ids_t, obj_geom_t
     return obj_t, ctx_t

@@ -58,7 +58,15 @@ model:
   # multi-view-discovered points are fed in-distribution to the channel the decoder actually
   # exploits. Drop-in: cond_encoder pools any count to pc_latent_len, so prefix_len is
   # unchanged; a probe showed per_device 8 @ 8192 voxels peaks ~15 GB / 143 GB.
-  mv_num_obj_voxels: 8192
+  # Object-PC density fed to the cond_encoder. Set to 2048 to MATCH SV's
+  # local_obj_num_points (2048) and the encoder's pc_latent_len (2048): the encoder pools
+  # any count to 2048 latents, so >2048 input adds cost (4x slower FPS) without capacity.
+  # The old 8192 over-matched SV's *dense/scene* count, not its object PC, and was the
+  # dominant training-speed cost (per-step FPS 15.7s -> 1.8s at 2048).
+  mv_num_obj_voxels: 2048
+  # Candidate-pool size for mask consensus. Under intra_obj_register the pool is bypassed
+  # (object cloud comes from the registered mask points), so keep it at the obj density.
+  mv_pool_size: 2048
   mv_num_ctx_voxels: 1024
   mv_voxel_dim: 512
   mv_mask_feat_dim: 64
@@ -67,6 +75,15 @@ model:
   # mask consensus with 3-view agreement and no depth gate (purity 0.974, hit 0.725).
   mv_min_views: 3
   mv_depth_rtol: 100.0
+  # Fix A / CMVSA: cross-view register the per-view object clouds (confidence-weighted
+  # Sim3 ICP) before merge, removing Pi3X's 8-13% cross-view inconsistency. Feeds the
+  # registered cloud to the geometry stream only (scene-frame stays for projection).
+  # Validated zero-shot on ckpt-15000: GT coverage 20.6%->29.6%, anisotropy 4.24->3.15,
+  # CD(obj-PC vs GT) 0.232->0.215. mv_geom_norm_quantile (robust norm) left 0.0 — its
+  # zero-shot A/B was net-negative on CD.
+  mv_intra_obj_register: true
+  mv_register_iters: 4
+  mv_geom_norm_quantile: 0.0
   # Explicit geometry stream: PointEmbed(voxel xyz) added to the DINO-fused voxel
   # features so z_i / z_scene carry point-cloud cues (geometry-aware conditioning).
   # Set false to ablate appearance-only vs geometry+appearance.
@@ -81,5 +98,6 @@ model:
   mv_use_voxel_encoder: true
   # Inject confidence-weighted multi-view DINO appearance into the obj-PC channel's
   # cond_encoder (extra_feat) — restores SV's always-on appearance term (img_cond_drop_prob=0).
-  # Default off; enabled only if the zero-shot probe confirms it improves CD. prefix_len unchanged.
-  mv_obj_pc_appearance: false
+  # Enabled with Fix A: the dual-cloud keeps the scene-frame projection index-aligned to the
+  # registered geometry, so the appearance feature attaches to the correct geometry point.
+  mv_obj_pc_appearance: true
