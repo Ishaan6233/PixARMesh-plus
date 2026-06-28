@@ -209,7 +209,11 @@ def get_prefix_allowed_tokens_fn_edgerunner(model, batch_size=1):
         required_coords = 9 if last_struct == 5 else 3
         consumed_coords = len(tokens) - last_struct_idx - 1
         if consumed_coords < required_coords:
-            return list(range(coord_start, model.config.vocab_size))
+            # Coordinate tokens occupy exactly [coord_start, coord_start+num_pos_tokens).
+            # The old upper bound (vocab_size) also admitted the structure/sep ids and
+            # unused vocab as "coordinates", letting the model emit out-of-bin vertices.
+            coord_end = coord_start + model.config.num_pos_tokens
+            return list(range(coord_start, coord_end))
         return [3, 4, 5, model.config.eos_token_id]
 
     return prefix_allowed_tokens_fn

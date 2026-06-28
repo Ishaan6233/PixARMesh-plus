@@ -159,32 +159,43 @@ def main():
             "f_score": None,
         }
 
-        if has_gt and has_pred:
-            gt_pcds = evaluation.sample_points_from_o3d_mesh(
-                gt_mesh, args.num_sample_points
-            )
-            pred_pcds = evaluation.sample_points_from_o3d_mesh(
-                pred_mesh, args.num_sample_points
-            )
-            gt_pcds = evaluation.get_normalized_pcd(gt_pcds)
-            pred_pcds = evaluation.get_normalized_pcd(pred_pcds)
-            if args.no_align:
-                eval_pred_pcds = pred_pcds
-            else:
-                transform_matrices = evaluation.get_object_transformations(
-                    [pred_pcds], [gt_pcds]
+        # A degenerate decode (0 faces / 0 surface area) still writes a valid PLY, so
+        # has_pred=True, but open3d's sample_points_uniformly raises on it. Treat it as
+        # an unscorable prediction (still counts toward coverage; cd/f_score left None)
+        # rather than letting the exception kill the whole eval shard.
+        if has_gt and has_pred and len(pred_mesh.triangles) == 0:
+            record["degenerate_pred"] = True
+        elif has_gt and has_pred:
+            try:
+                gt_pcds = evaluation.sample_points_from_o3d_mesh(
+                    gt_mesh, args.num_sample_points
                 )
-                eval_pred_pcds = evaluation.apply_transformation_matrix(
-                    pred_pcds,
-                    transform_matrices[0],
+                pred_pcds = evaluation.sample_points_from_o3d_mesh(
+                    pred_mesh, args.num_sample_points
                 )
-            cd_loss = chamfer_distance(
-                gt_pcds.unsqueeze(0).cuda(),
-                eval_pred_pcds.unsqueeze(0).cuda(),
-            )[0].item()
-            f_score = evaluation.f_score(gt_pcds.numpy(), eval_pred_pcds.numpy())
-            record["cd"] = float(cd_loss)
-            record["f_score"] = float(f_score)
+                gt_pcds = evaluation.get_normalized_pcd(gt_pcds)
+                pred_pcds = evaluation.get_normalized_pcd(pred_pcds)
+                if args.no_align:
+                    eval_pred_pcds = pred_pcds
+                else:
+                    transform_matrices = evaluation.get_object_transformations(
+                        [pred_pcds], [gt_pcds]
+                    )
+                    eval_pred_pcds = evaluation.apply_transformation_matrix(
+                        pred_pcds,
+                        transform_matrices[0],
+                    )
+                cd_loss = chamfer_distance(
+                    gt_pcds.unsqueeze(0).cuda(),
+                    eval_pred_pcds.unsqueeze(0).cuda(),
+                )[0].item()
+                f_score = evaluation.f_score(gt_pcds.numpy(), eval_pred_pcds.numpy())
+                record["cd"] = float(cd_loss)
+                record["f_score"] = float(f_score)
+            except (RuntimeError, ValueError) as e:
+                # e.g. open3d "Invalid surface area 0" on a triangulated-but-zero-area mesh
+                record["degenerate_pred"] = True
+                record["error"] = str(e)
 
         with out_json_path.open("w") as f:
             json.dump(record, f)
@@ -195,7 +206,8 @@ def main():
         all_cds = []
         all_f_scores = []
         n_total = 0          # objects above the mask threshold (the eval denominator)
-        n_has_pred = 0       # objects that produced a mesh prediction
+        n_has_pred = 0       # objects that produced a USABLE (non-degenerate) mesh
+        n_degenerate = 0     # objects whose PLY decoded to 0 faces / 0 surface area
         for item in subset:
             uid = item["uid"]
             obj_id = item["obj_id"]
@@ -207,15 +219,21 @@ def main():
             n_total += 1
             with out_json_path.open("r") as f:
                 record = json.load(f)
-            if record.get("has_pred"):
+            # A degenerate (0-face/0-area) decode wrote a PLY but produced no usable
+            # geometry — it is a miss, not coverage. Exclude it from has_pred so the
+            # coverage metric stays honest, and surface the count separately.
+            if record.get("degenerate_pred"):
+                n_degenerate += 1
+            elif record.get("has_pred"):
                 n_has_pred += 1
             if record["cd"] is not None:
                 all_cds.append(record["cd"])
                 all_f_scores.append(record["f_score"])
             results.append(record)
 
-        # Coverage makes silent misses (no PLY / decode failures) visible: a low CD over
-        # 10% of objects is not a real win. Report it alongside CD/F.
+        # Coverage makes silent misses (no PLY / decode failures / degenerate meshes)
+        # visible: a low CD over a fraction of objects is not a real win. Report it
+        # alongside CD/F.
         coverage = n_has_pred / max(n_total, 1)
         avg_cd = float(np.mean(all_cds)) if all_cds else float("nan")
         avg_f_scores = float(np.mean(all_f_scores)) if all_f_scores else float("nan")
@@ -225,6 +243,7 @@ def main():
                 "avg_f_score": avg_f_scores,
                 "num_evaluated": len(all_cds),
                 "num_total": n_total,
+                "num_degenerate": n_degenerate,
                 "coverage": coverage,
             }
         )
@@ -235,7 +254,7 @@ def main():
             f"""
 Evaluation results saved to {results_path}.
 Num valid objects (scored): {len(all_cds)} / {n_total} total
-Coverage (has_pred): {coverage * 100:.1f}%
+Coverage (usable mesh): {coverage * 100:.1f}%   (degenerate decodes: {n_degenerate})
 Average Chamfer Distance (x10^{-3}): {avg_cd * 1000:.3f}
 Average F-Score (%): {avg_f_scores:.3f}
 """

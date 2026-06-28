@@ -139,7 +139,8 @@ class BPTModel(PreTrainedModel):
         # pixel_values.dim() == 5 (N views stacked).
         self.mv_voxel_encoder = None
         if getattr(config, "mv_voxel_encoder", False) and cond_encoder_img is not None:
-            img_feat_dim = getattr(cond_encoder_img, "output_feat_dim", 384)
+            # `output_dim` is the real attribute; the old key always fell back to 384.
+            img_feat_dim = getattr(cond_encoder_img, "output_dim", 384)
             self.mv_voxel_encoder = MultiViewVoxelAlignedEncoder(
                 feat_dim          = img_feat_dim,
                 voxel_dim         = getattr(config, "mv_voxel_dim",          512),

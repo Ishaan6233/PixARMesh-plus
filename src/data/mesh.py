@@ -662,6 +662,13 @@ def transform_3d_front_multiview(
                 "valid_mask": valid_n,
                 "pcd_2d": depth_pcs_n.reshape(img_shape[0], img_shape[1], 3),
                 "wrd2cam_rect": wrd2cam_n,
+                # Preprocessor pad geometry, mirrored onto the panoptic mask below so the
+                # mask shares the Pi3X/K_adj padded frame (else discovery samples a
+                # stretched mask, mis-assigning boundary points up to ~pad px off).
+                "pad_top": pad_top,
+                "pad_left": pad_left,
+                "out_h": out_h,
+                "out_w": out_w,
             })
 
         # --- Reference view: argmax valid-depth pixels (deterministic uid tiebreak) ---
@@ -859,11 +866,30 @@ def transform_3d_front_multiview(
                 if arr.ndim == 3:  # (H, W, 3) RGB-encoded
                     return (arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]).astype(np.int32)
                 return arr.astype(np.int32)  # already (H, W)
+
+            def _pad_pan(dec, n):
+                # Center-pad the raw-resolution mask to the preprocessed (out_h,out_w)
+                # frame with the SAME offsets the preprocessor used (per_view_data[n]),
+                # so the mask aligns with K_adj / Pi3X local_points. Pad value 0 =
+                # background (excluded by the tgt>0 checks downstream). No-op when
+                # images aren't loaded (out_h/out_w == raw size, pad=0).
+                pvd = per_view_data[n]
+                oh, ow, pt, pl = pvd["out_h"], pvd["out_w"], pvd["pad_top"], pvd["pad_left"]
+                h, w = dec.shape
+                if (h, w) == (oh, ow):
+                    return dec
+                out = np.zeros((oh, ow), dtype=dec.dtype)
+                out[pt:pt + h, pl:pl + w] = dec
+                return out
             if isinstance(raw_masks, list):
                 raw_masks = [raw_masks[i] for i in _pan_vidx]  # match the view selection
-                pan_stack = np.stack([_decode_pan(m) for m in raw_masks], axis=0)  # (N, H, W)
+                pan_stack = np.stack(
+                    [_pad_pan(_decode_pan(m), n) for n, m in enumerate(raw_masks)], axis=0
+                )  # (N, out_h, out_w) — padded frame, aligned with K_adj/local_points
             else:
-                pan_stack = np.stack([_decode_pan(raw_masks)] * N_views, axis=0)
+                pan_stack = np.stack(
+                    [_pad_pan(_decode_pan(raw_masks), n) for n in range(N_views)], axis=0
+                )
             result_panoptic_masks.append(pan_stack)
 
     ret = {

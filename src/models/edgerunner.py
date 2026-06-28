@@ -133,7 +133,10 @@ class ShapeOPT(OPTForCausalLM):
         # Instance discovery uses Grounded-SAM consensus voting (no binary mask conv).
         self.mv_voxel_encoder = None
         if getattr(config, "mv_voxel_encoder", False) and cond_encoder_img is not None:
-            img_feat_dim = getattr(cond_encoder_img, "output_feat_dim", 384)
+            # The image encoder exposes its width as `output_dim` (not output_feat_dim);
+            # the old key always fell back to 384 and would silently mis-size the voxel
+            # encoder against any non-small DINOv2 backbone.
+            img_feat_dim = getattr(cond_encoder_img, "output_dim", 384)
             self.mv_voxel_encoder = MultiViewVoxelAlignedEncoder(
                 feat_dim          = img_feat_dim,
                 voxel_dim         = getattr(config, "mv_voxel_dim",          512),
