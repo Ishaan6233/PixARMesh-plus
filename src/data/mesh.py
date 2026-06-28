@@ -800,14 +800,26 @@ def transform_3d_front_multiview(
             ref_pts_flat = utils.transform_3d_points(ref_pts_flat, M_shift)
             ref_pcd_augmented = ref_pts_flat.reshape(ref_valid.shape[0], ref_valid.shape[1], 3)
 
-            if use_masked_obj_pc and "panoptic_mask" in example:
+            # Seed must be masked to the TARGET object, else point_clouds_2d is the
+            # whole valid frame and every object in a scene votes for the same
+            # plurality SAM ID downstream (target-ID collapse). The MV dataset stores
+            # the per-view panoptic under the PLURAL key "panoptic_masks" (a list of N
+            # raw views); fall back to the singular SV key for compatibility. ref_view
+            # indexes the selected/padded view space, so map it back to the raw stored
+            # view via _pan_vidx before indexing the list.
+            seed_pan_key = (
+                "panoptic_masks" if "panoptic_masks" in example
+                else ("panoptic_mask" if "panoptic_mask" in example else None)
+            )
+            if use_masked_obj_pc and seed_pan_key is not None:
                 inst_ids = objects["inst_ids"]
+                pan_sample = example[seed_pan_key][idx]
+                ref_pan = (
+                    pan_sample[_pan_vidx[ref_view]]
+                    if isinstance(pan_sample, list) else pan_sample
+                )
                 obj_masks = utils.get_masks_by_ids(
-                    example["panoptic_mask"][idx][ref_view]
-                    if isinstance(example["panoptic_mask"][idx], list)
-                    else example["panoptic_mask"][idx],
-                    inst_ids,
-                    erode_size=data_cfg.mask_erosion_size,
+                    ref_pan, inst_ids, erode_size=data_cfg.mask_erosion_size,
                 )
                 pts_mask = ref_valid & obj_masks[inst_idx]
             else:
