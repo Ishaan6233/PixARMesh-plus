@@ -601,8 +601,19 @@ def prepare_mv_test_set(data_cfg):
 
 
 def build_mv_uid_to_model_id(data_cfg):
-    """Map MV row uid -> 3D-FUTURE model_id (objects.model_ids[0]) for eval GT lookup."""
+    """Map MV row uid -> (3D-FUTURE model_id, ref-view mask area).
+
+    model_id (objects.model_ids[0]) is the GT-mesh lookup key. The ref-view mask area
+    (target instance's pixel count in view 0, the seed/bbox view) lets the eval apply the
+    SAME small-object `mask_area_thresh` filter the single-view protocol uses — otherwise
+    MV is scored on a strict superset of objects (incl. tiny/occluded ones SV skips),
+    biasing the MV-vs-SV comparison. Falls back to a large area if masks are unavailable.
+    """
     from pathlib import Path
+
+    import numpy as np
+
+    from src.data.utils import get_masks_by_ids
 
     path = Path(data_cfg.path).absolute().as_posix()
     try:
@@ -612,12 +623,25 @@ def build_mv_uid_to_model_id(data_cfg):
     if not isinstance(data, datasets.Dataset):
         split = next(s for s in ("validation", "val", "test") if s in data)
         data = data[split]
+    keep = ("uid", "objects", "panoptic_masks", "panoptic_mask")
+    cols = data.remove_columns([c for c in data.column_names if c not in keep])
     mapping = {}
-    cols = data.remove_columns(
-        [c for c in data.column_names if c not in ("uid", "objects")]
-    )
     for row in cols:
-        mids = row["objects"].get("model_ids") if row.get("objects") else None
-        if mids:
-            mapping[row["uid"]] = mids[0]
+        objs = row.get("objects")
+        mids = objs.get("model_ids") if objs else None
+        if not mids:
+            continue
+        area = 10 ** 9
+        pan = row.get("panoptic_masks")
+        if pan is None:
+            pan = row.get("panoptic_mask")
+        inst_ids = objs.get("inst_ids") if objs else None
+        if pan is not None and inst_ids:
+            ref_mask = pan[0] if isinstance(pan, list) else pan  # ref view = view 0
+            try:
+                masks = get_masks_by_ids(ref_mask, [inst_ids[0]])
+                area = int(np.asarray(masks[0]).sum())
+            except Exception:
+                area = 10 ** 9
+        mapping[row["uid"]] = (mids[0], area)
     return mapping

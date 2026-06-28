@@ -347,6 +347,13 @@ class ShapeOPT(OPTForCausalLM):
         else:
             pi3x_out = self.pi3x_encoder.forward_all_views_joint(pixel_values)
             lp = pi3x_out["local_points"]       # (B, N, H, W, 3) camera frame
+        # Pi3X 'conf' is a RAW logit (the conf head has no activation); the reference VO
+        # pipeline (pi3x_vo.py) consumes it as torch.sigmoid(conf). Every MV consumer here
+        # treats conf as a [0,1] reliability weight (clamp>=0, threshold, IBRNet weights),
+        # so map it through sigmoid at consumption. Done here (not in the encoder/cache) so
+        # it applies identically to cached and live conf with no cache rebuild.
+        if pi3x_out.get("conf") is not None:
+            pi3x_out["conf"] = pi3x_out["conf"].sigmoid()
         pi3x_depth = lp[..., 2]                 # (B, N, H, W)
         st         = scene_transforms.to(device, dtype=torch.float32)
         K_f        = K_per_view.float().to(device)

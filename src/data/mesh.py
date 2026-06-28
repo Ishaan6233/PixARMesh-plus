@@ -561,8 +561,6 @@ def transform_3d_front_multiview(
     load_images  = data_cfg.load_images and image_preprocessor is not None
     use_masked_obj_pc = data_cfg.use_masked_obj_pc
 
-    y_up_matrix = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
-
     for idx in range(len(example["uid"])):
         scene_id = example["uid"][idx]
         objects  = example["objects"][idx]
@@ -574,7 +572,6 @@ def transform_3d_front_multiview(
         images_n         = example["images"][idx]        # list of N PIL/array
         depths_n         = example["depths"][idx]        # list of N arrays
         wrd2cam_rects_n  = example["wrd2cam_rects"][idx] # list of N (4,4)
-        rect_invs_n      = example["rect_invs"][idx]     # list of N (3,3)
         Ks_n             = example["Ks"][idx]            # list of N (3,3)
 
         # Scenes have variable view counts; fix every object to exactly num_views so
@@ -591,7 +588,6 @@ def transform_3d_front_multiview(
         images_n        = [images_n[i] for i in _vidx]
         depths_n        = [depths_n[i] for i in _vidx]
         wrd2cam_rects_n = [wrd2cam_rects_n[i] for i in _vidx]
-        rect_invs_n     = [rect_invs_n[i] for i in _vidx]
         Ks_n            = [Ks_n[i] for i in _vidx]
         _pan_vidx       = _vidx
         N_views          = len(images_n)
@@ -603,7 +599,6 @@ def transform_3d_front_multiview(
             depth_n_raw  = np.array(depths_n[n], dtype=np.float32)
             depth_n      = (1 - depth_n_raw / 255.0) * 10.0
             wrd2cam_n    = np.array(wrd2cam_rects_n[n], dtype=np.float32)
-            rect_inv_n   = np.array(rect_invs_n[n],     dtype=np.float32)
             K_n          = np.array(Ks_n[n],            dtype=np.float32)
 
             # Image preprocessing
@@ -631,13 +626,6 @@ def transform_3d_front_multiview(
                 depth_n[valid_n] += noise[valid_n]
                 depth_n[valid_n] = depth_n[valid_n].clip(min=depth_trunc)
 
-            # Gravity-align: camera → gravity-aligned frame
-            t_cam = wrd2cam_n[:3, 3]
-            T_gravity_n = np.eye(4, dtype=np.float32)
-            T_gravity_n[:3, :3] = rect_inv_n
-            T_gravity_n[:3, 3]  = t_cam - rect_inv_n @ t_cam
-            T_gravity_inv_n     = np.linalg.inv(T_gravity_n).astype(np.float32)
-
             K_inv_n = np.linalg.inv(K_n).astype(np.float32)
             depth_pcs_n, pix_pcs_n = utils.back_project_depth(
                 depth_n, K_inv_n, return_pix_coords=True
@@ -646,17 +634,20 @@ def transform_3d_front_multiview(
             pix_pcs_n = pix_pcs_n + np.array([pad_left, pad_top])
             pix_pcs_n = (pix_pcs_n + 0.5) / np.array([out_w, out_h]) * 2 - 1
 
+            # Keep points in THIS view's camera frame. Registration into the shared scene
+            # frame (the reference view's rect-camera frame) is applied below, once
+            # ref_view is known, via C_n = wrd2cam_ref @ inv(wrd2cam_n). The previous
+            # per-camera gravity rotation only de-tilted each camera about its own centre
+            # and never placed views in a common frame (measured cross-view scatter ~2.3m),
+            # and it was inconsistent with obj_canon_transform's OpenCV ref-camera frame.
             img_shape = depth_pcs_n.shape[:2]
-            depth_pcs_n = utils.transform_3d_points(
-                depth_pcs_n.reshape(-1, 3), T_gravity_inv_n @ y_up_matrix
-            ).reshape(img_shape[0], img_shape[1], 3)
+            depth_pcs_n = depth_pcs_n.reshape(img_shape[0], img_shape[1], 3)
             depth_pcs_n[~valid_n] = depth_trunc
 
             ref_cand_counts.append(valid_n.sum())
             per_view_data.append({
                 "pv": pv_n,
                 "K_adj": K_adj,
-                "T_gravity_inv": T_gravity_inv_n,
                 "all_pcd": depth_pcs_n.reshape(-1, 3),
                 "pix_pcs": pix_pcs_n.reshape(-1, 2),
                 "valid_mask": valid_n,
@@ -709,16 +700,25 @@ def transform_3d_front_multiview(
             else:
                 rot_mat = None
 
-            # Merge all views for shared normalisation
+            # The reference view's rect-camera frame IS the shared scene frame (the same
+            # frame the bboxes and obj_canon_transform use). Register every view's
+            # camera-frame cloud into it via C_n = wrd2cam_ref @ inv(wrd2cam_n) so the
+            # merged cloud — and the normalisation fit on it — is coherent across views.
+            wrd2cam_ref = per_view_data[ref_view]["wrd2cam_rect"]
+            cam_to_ref = []
             merged_pcd_list = []
             for n in range(N_views):
+                C_n = (
+                    wrd2cam_ref @ np.linalg.inv(per_view_data[n]["wrd2cam_rect"])
+                ).astype(np.float32)
+                cam_to_ref.append(C_n)
                 pcd_n = per_view_data[n]["all_pcd"]
                 vm_n  = per_view_data[n]["valid_mask"].reshape(-1)
-                merged_pcd_list.append(pcd_n[vm_n])
+                merged_pcd_list.append(utils.transform_3d_points(pcd_n[vm_n], C_n))
             merged_pcd = np.concatenate(merged_pcd_list, axis=0)
 
-            # Bboxes in reference view's gravity-aligned camera-rect frame
-            wrd2cam_ref = per_view_data[ref_view]["wrd2cam_rect"]
+            # Bboxes in the reference view's rect-camera frame
+            all_bboxes_rect = []
             all_bboxes_rect = []
             all_obj_to_cam_ref = []
             for obj_idx, (bound_o, tr) in enumerate(zip(bounds, transforms_obj)):
@@ -753,11 +753,16 @@ def transform_3d_front_multiview(
                 )
 
             # --- Per-view scene_transforms ---
+            # scene = S @ C_n maps camera_n -> shared scene frame, where
+            # S = M_shift @ normalize_matrix @ M_rot_4d and C_n registers view n into the
+            # reference rect-camera frame. This is consistent with
+            # obj_canon_transform = inv(obj_to_cam_ref) @ inv(S) (verified: a GT bbox routed
+            # camera->scene->canonical lands inside the [-0.95,0.95] box), so the decoder's
+            # conditioning is canonicalised with the correct rotation.
             scene_transforms_n = []
             K_per_view_n       = []
             for n in range(N_views):
-                M_gravity_n    = per_view_data[n]["T_gravity_inv"] @ y_up_matrix
-                scene_trans_n  = M_shift @ normalize_matrix @ M_rot_4d @ M_gravity_n
+                scene_trans_n  = M_shift @ normalize_matrix @ M_rot_4d @ cam_to_ref[n]
                 scene_transforms_n.append(scene_trans_n.astype(np.float32))
                 K_per_view_n.append(per_view_data[n]["K_adj"].astype(np.float32))
 
@@ -790,7 +795,7 @@ def transform_3d_front_multiview(
             result_obj_canon_transform.append(scene_to_canon)
 
             # --- cond_pcs from reference view ---
-            ref_pcd   = per_view_data[ref_view]["pcd_2d"]    # (H, W, 3) gravity-aligned
+            ref_pcd   = per_view_data[ref_view]["pcd_2d"]    # (H, W, 3) ref-camera frame (C_ref=I)
             ref_valid = per_view_data[ref_view]["valid_mask"]
             ref_pix   = per_view_data[ref_view]["pix_pcs"].reshape(
                 ref_valid.shape[0], ref_valid.shape[1], 2

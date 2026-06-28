@@ -102,9 +102,11 @@ def main():
         uid2mid = build_mv_uid_to_model_id(
             DataConfig(type="3d-front-multiview", path=args.mv_path)
         )
+        # Real ref-view mask area applies the same small-object filter as the SV protocol
+        # (matching mask_area_thresh), so MV is scored on a comparable object population.
         subset = [
-            {"uid": uid, "obj_id": None, "model_id": mid, "mask_area": 10**9}
-            for uid, mid in uid2mid.items()
+            {"uid": uid, "obj_id": None, "model_id": mid, "mask_area": area}
+            for uid, (mid, area) in uid2mid.items()
         ]
         sharded_subset = subset[accelerator.process_index :: accelerator.num_processes]
     else:
