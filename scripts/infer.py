@@ -93,9 +93,13 @@ def _strip_padding_and_eos(tokens, pad_token_id, eos_token_id):
 
 
 def _write_decode_failure_placeholder(out_path):
+    # Write a ZERO-FACE mesh so a decode failure is counted as a coverage MISS, not a
+    # scored prediction. A 1-triangle placeholder would have len(triangles)==1, slipping
+    # past eval_obj's degenerate guard (len(triangles)==0) -> it would inflate coverage to
+    # ~100% (hiding decode failures) AND inject a bad CD into the mean.
     trimesh.Trimesh(
         vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32),
-        faces=np.array([[0, 1, 2]]),
+        faces=np.zeros((0, 3), dtype=np.int64),
     ).export(out_path)
 
 
@@ -225,6 +229,7 @@ def run_multiview_inference(args):
                     cond_num_faces=None,
                     obj_canon_transform=_to(batch.get("obj_canon_transform")),
                     gt_obj_vertices=_to(batch.get("gt_obj_vertices")),
+                    ref_view=_to(batch.get("ref_view")),
                 )
 
                 results = model.generate(

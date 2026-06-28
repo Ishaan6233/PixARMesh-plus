@@ -151,6 +151,9 @@ class BPTModel(PreTrainedModel):
                 use_geometry      = getattr(config, "mv_use_geometry",     True),
             )
             self.mv_voxel_encoder.apply(self._init_weights)
+            # Restore offset_net's zero-init (identity deformable offset); the generic
+            # _init_weights pass above re-inits it with non-zero std otherwise.
+            self.mv_voxel_encoder.reset_offset_net()
 
         attn_dim_head = config.hidden_size // config.num_attention_heads
         flash_attn = config._attn_implementation in (

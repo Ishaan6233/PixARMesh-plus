@@ -75,15 +75,20 @@ model:
   # mask consensus with 3-view agreement and no depth gate (purity 0.974, hit 0.725).
   mv_min_views: 3
   mv_depth_rtol: 100.0
-  # Fix A / CMVSA: cross-view register the per-view object clouds (confidence-weighted
-  # Sim3 ICP) before merge, removing Pi3X's 8-13% cross-view inconsistency. Feeds the
-  # registered cloud to the geometry stream only (scene-frame stays for projection).
-  # Validated zero-shot on ckpt-15000: GT coverage 20.6%->29.6%, anisotropy 4.24->3.15,
-  # CD(obj-PC vs GT) 0.232->0.215. mv_geom_norm_quantile (robust norm) left 0.0 — its
-  # zero-shot A/B was net-negative on CD.
-  mv_intra_obj_register: true
+  # Fix A / CMVSA: cross-view Sim3-ICP registration of the per-view object clouds. This was
+  # added to correct the ~2.3m cross-view smear caused by the (now-fixed) scene_transform
+  # bug. With views now properly registered (scene_transform_n = S @ wrd2cam_ref @
+  # inv(wrd2cam_n)), CMVSA is redundant AND harmful: _icp_align has no inlier gate, so on
+  # already-registered complementary partial views it distorts the geometry (measured:
+  # obj_geom_voxels extent inflates 2.6x, 0.60->1.08, Chamfer change 0.194). Disabled.
+  # (The old "validated" numbers were measured registration-OFF, pre-fix.)
+  mv_intra_obj_register: false
   mv_register_iters: 4
   mv_geom_norm_quantile: 0.0
+  # Pi3X conf is sigmoid'd at consumption (a probability in (0,1)); 0.5 is the calibrated
+  # keep-threshold for that domain (the old 0.3 was tuned on raw logits and, post-sigmoid,
+  # kept ~99% of points, near-disabling the mask-bleed purity filter).
+  mv_conf_threshold: 0.5
   # Explicit geometry stream: PointEmbed(voxel xyz) added to the DINO-fused voxel
   # features so z_i / z_scene carry point-cloud cues (geometry-aware conditioning).
   # Set false to ablate appearance-only vs geometry+appearance.

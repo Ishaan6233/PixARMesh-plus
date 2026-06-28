@@ -147,6 +147,11 @@ class ShapeOPT(OPTForCausalLM):
                 use_geometry      = getattr(config, "mv_use_geometry",     True),
             )
             self.mv_voxel_encoder.apply(self._init_weights)
+            # _init_weights (base PreTrainedModel) re-inits every nn.Linear with
+            # normal(std=init_std), which clobbers offset_net's zero-init and makes the
+            # deformable sampling offset non-identity (~12px) from step 0 — corrupting the
+            # appearance sampling. Restore the intended identity start.
+            self.mv_voxel_encoder.reset_offset_net()
 
     def _init_weights(self, module):
         return PreTrainedModel._init_weights(self, module)
@@ -321,6 +326,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_dino_feats=None,    # (B, N, C_d, H', W') precomputed DINOv2 features
         obj_canon_transform=None,  # (B, 4, 4) scene -> per-object canonical (rotation used)
         gt_obj_vertices=None,      # (B, V, 3) DEBUG oracle: GT-canonical surface points
+        ref_view=None,             # (B,) long: data-loader reference view (seed source)
     ):
         """Build the multi-view conditioning prefix embeddings.
 
@@ -368,7 +374,14 @@ class ShapeOPT(OPTForCausalLM):
         obj_voxels_geom = None   # registered geometry-stream cloud (set in discover path)
         if panoptic_masks is not None:
             # Enhance seed first: use Pi3X geometry at reference-view obj pixels
-            ref_idx = self._select_ref_view(lp, view_mask)
+            # Prefer the data-loader's reference view (the view the seed cond_pcs_2d pixels
+            # were taken from); fall back to the Pi3X-valid-count heuristic only if absent.
+            # These can disagree (GT-depth vs Pi3X-depth argmax) on ~6.5% of train objects,
+            # which mis-samples the seed at a different view's geometry.
+            ref_idx = (
+                ref_view.to(lp.device).long() if ref_view is not None
+                else self._select_ref_view(lp, view_mask)
+            )
             seed_list = []
             for b in range(B):
                 rv   = ref_idx[b].item()
@@ -389,6 +402,9 @@ class ShapeOPT(OPTForCausalLM):
                 num_obj_voxels      = mv_num_obj_voxels,
                 num_ctx_voxels      = mv_num_ctx_voxels,
                 conf                = pi3x_out["conf"],
+                # conf is sigmoid'd (a probability); use the calibrated keep-threshold for
+                # that domain (default 0.3 was tuned on raw logits and barely filters now).
+                conf_threshold      = getattr(self.config, "mv_conf_threshold", 0.5),
                 # Proven operating point (Experiments 1-5): mask consensus with 3-view
                 # agreement and no depth gate. min_views/depth_rtol must be passed
                 depth_rtol          = getattr(self.config, "mv_depth_rtol", 100.0),
@@ -406,7 +422,14 @@ class ShapeOPT(OPTForCausalLM):
                 "panoptic_masks not provided; falling back to seed-FPS for obj_voxels."
             )
             mv_target_ids = None  # no mask consensus possible without panoptic masks
-            ref_idx = self._select_ref_view(lp, view_mask)
+            # Prefer the data-loader's reference view (the view the seed cond_pcs_2d pixels
+            # were taken from); fall back to the Pi3X-valid-count heuristic only if absent.
+            # These can disagree (GT-depth vs Pi3X-depth argmax) on ~6.5% of train objects,
+            # which mis-samples the seed at a different view's geometry.
+            ref_idx = (
+                ref_view.to(lp.device).long() if ref_view is not None
+                else self._select_ref_view(lp, view_mask)
+            )
             seed_list = []
             for b in range(B):
                 rv   = ref_idx[b].item()
@@ -594,6 +617,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_dino_feats=None,
         obj_canon_transform=None,
         gt_obj_vertices=None,
+        ref_view=None,
         **decoder_kwargs,
     ):
         inputs_embeds = self.get_mv_inputs_with_cond(
@@ -611,6 +635,7 @@ class ShapeOPT(OPTForCausalLM):
             cached_dino_feats=cached_dino_feats,
             obj_canon_transform=obj_canon_transform,
             gt_obj_vertices=gt_obj_vertices,
+            ref_view=ref_view,
         )
 
         # --- OPT decoder ---
@@ -700,6 +725,7 @@ class ShapeOPT(OPTForCausalLM):
         cached_dino_feats=None,   # precomputed frozen-DINOv2 features (skips DINOv2 forward)
         obj_canon_transform=None, # (B, 4, 4) scene -> per-object canonical (geometry frame)
         gt_obj_vertices=None,     # (B, V, 3) DEBUG oracle: GT-canonical surface points
+        ref_view=None,            # (B,) long — data-loader reference view (seed source)
         **kwargs,
     ):
         # Multi-view path: pixel_values is (B, N, C, H, W) when N > 1.
@@ -726,6 +752,7 @@ class ShapeOPT(OPTForCausalLM):
                 cached_dino_feats=cached_dino_feats,
                 obj_canon_transform=obj_canon_transform,
                 gt_obj_vertices=gt_obj_vertices,
+                ref_view=ref_view,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
                 past_key_values=past_key_values,

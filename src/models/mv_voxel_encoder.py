@@ -313,8 +313,7 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
 
         # Variance-aware deformable offset predictor (zero-init → identity at start)
         self.offset_net = nn.Linear(voxel_dim, 2)
-        nn.init.zeros_(self.offset_net.weight)
-        nn.init.zeros_(self.offset_net.bias)
+        self.reset_offset_net()
 
         # Per-view KV projection for deformable cross-attention
         self.deform_kv_proj = nn.Linear(feat_dim, voxel_dim)
@@ -339,6 +338,13 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         # Output projections
         self.obj_out_proj   = nn.Linear(voxel_dim, out_dim)
         self.scene_out_proj = nn.Linear(voxel_dim, out_dim)
+
+    def reset_offset_net(self):
+        """Zero the deformable offset predictor so it starts as identity (no shift).
+        Called after a generic _init_weights pass (which would otherwise re-init this
+        nn.Linear with non-zero std, making the offset non-identity from step 0)."""
+        nn.init.zeros_(self.offset_net.weight)
+        nn.init.zeros_(self.offset_net.bias)
 
     def _process_voxels(
         self,

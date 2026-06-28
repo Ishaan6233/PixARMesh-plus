@@ -551,6 +551,7 @@ def transform_3d_front_multiview(
     result_scene_transforms_all = []   # per-sample list of (N, 4, 4)
     result_K_per_view = []             # per-sample list of (N, 3, 3)
     result_view_masks = []             # per-sample list of (N,)
+    result_ref_view = []               # per-sample int: reference view (seed source)
     result_panoptic_masks = []         # per-sample list of (N, H, W) int32
     result_obj_canon_transform = []    # per-sample (4, 4) scene -> per-object canonical frame
 
@@ -769,6 +770,7 @@ def transform_3d_front_multiview(
             result_scene_transforms_all.append(np.stack(scene_transforms_n, axis=0))
             result_K_per_view.append(np.stack(K_per_view_n, axis=0))
             result_view_masks.append(view_valid)
+            result_ref_view.append(int(ref_view))
 
             # --- scene -> per-object canonical transform (rotation is metric-safe) ---
             # The decoder emits vertices in the per-object canonical frame
@@ -911,6 +913,7 @@ def transform_3d_front_multiview(
         ret["scene_transforms"]   = result_scene_transforms_all   # (N, 4, 4) per sample
         ret["K_per_view"]         = result_K_per_view             # (N, 3, 3) per sample
         ret["view_mask"]          = result_view_masks              # (N,) per sample
+        ret["ref_view"]           = result_ref_view                # int per sample (seed source)
         ret["obj_canon_transform"] = result_obj_canon_transform   # (4, 4) scene -> obj canonical
     if load_images:
         ret["pixel_values"] = result_pixel_values   # list of (N, C, H, W) tensors

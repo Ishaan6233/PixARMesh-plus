@@ -397,7 +397,10 @@ def main():
         with torch.no_grad():
             pi3x_out = pi3x.forward_all_views_joint(pixel_values.float())
             lp   = pi3x_out["local_points"]   # (B, N, H, W, 3)
-            conf = pi3x_out["conf"]            # (B, N, H, W, 1)
+            # Match the model: Pi3X conf is a raw logit; the training/inference path
+            # sigmoids it at consumption, so do the same here or this diagnostic measures a
+            # different operating point (raw-logit thresholds) than the live run.
+            conf = pi3x_out["conf"].sigmoid()  # (B, N, H, W, 1)
 
             st  = scene_transforms.float()
             K_f = K_per_view.float()

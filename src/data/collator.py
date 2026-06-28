@@ -405,6 +405,10 @@ class Front3DCollator(BaseCollator):
             ret["view_mask"] = torch.as_tensor(
                 np.array([ex["view_mask"] for ex in examples]), dtype=torch.bool
             )  # (B, N)
+            if "ref_view" in examples[0]:
+                ret["ref_view"] = torch.as_tensor(
+                    np.array([ex["ref_view"] for ex in examples]), dtype=torch.long
+                )  # (B,) reference view (seed source); model uses it instead of re-deriving
             if "obj_canon_transform" in examples[0]:
                 ret["obj_canon_transform"] = torch.as_tensor(
                     np.array([ex["obj_canon_transform"] for ex in examples]),
