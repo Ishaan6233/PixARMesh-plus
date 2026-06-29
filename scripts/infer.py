@@ -231,11 +231,9 @@ def run_multiview_inference(args):
                 def _to(x):
                     return x.to(device) if torch.is_tensor(x) else x
 
-                # Guard the conditioning + decode: a single object with degenerate
-                # discovery (e.g. an empty/tiny obj cloud) must not crash the whole
-                # Accelerate rank and forfeit the shard (and stall the distributed
-                # barrier). On failure, record every object in the batch as an honest
-                # coverage MISS (0-face placeholder) and move on.
+                # Outer guard: catastrophic batch-level failures (conditioning or
+                # generation crash the whole rank). On failure every object in the
+                # batch is an honest coverage MISS — we genuinely have no tokens.
                 try:
                     inputs_embeds = model.get_mv_inputs_with_cond(
                         input_ids=input_ids,
@@ -263,13 +261,23 @@ def run_multiview_inference(args):
                         ),
                     )
                     results = results.cpu().numpy()
+                    # Per-object guard: a degenerate token sequence for one object
+                    # must not forfeit the rest of the batch.
                     for uid, tokens in zip(uids, results):
-                        _export_edgerunner_mesh(
-                            tokens, collator, model, out_dir / f"{uid}.ply", uid
-                        )
+                        try:
+                            _export_edgerunner_mesh(
+                                tokens, collator, model, out_dir / f"{uid}.ply", uid
+                            )
+                        except Exception as e_obj:
+                            warnings.warn(
+                                f"MV mesh export failed for {uid} "
+                                f"({type(e_obj).__name__}: {e_obj}); "
+                                f"writing decode-failure placeholder."
+                            )
+                            _write_decode_failure_placeholder(out_dir / f"{uid}.ply")
                 except Exception as e:
                     warnings.warn(
-                        f"MV conditioning/decode failed for batch {uids} "
+                        f"MV conditioning/generation failed for batch {uids} "
                         f"({type(e).__name__}: {e}); writing decode-failure placeholders."
                     )
                     for uid in uids:

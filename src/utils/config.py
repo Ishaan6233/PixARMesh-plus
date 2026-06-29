@@ -126,6 +126,19 @@ class ModelConfig:
     # bound whether ANY conditioning fix can beat SV and to quantify the partial-observation
     # self-norm scale cost (oracle uses full extent). MUST stay false in any shippable config.
     mv_obj_pc_oracle: bool = False
+    # Discovery / voxelization parameters.  These must be in ModelConfig (not just accessed
+    # via getattr defaults) so that _filter_dataclass_kwargs passes them through to
+    # ShapeOPTConfig, and _mv_fields propagates them when loading single-view checkpoints.
+    # Defaults match the getattr fallbacks in edgerunner.py so existing checkpoints are
+    # behaviour-identical; yaml overrides (e.g. mv_min_views: 2) now actually take effect.
+    mv_min_views: int = 3
+    mv_conf_threshold: float = 0.5
+    mv_depth_rtol: float = 100.0
+    mv_pool_size: int = 8192
+    mv_intra_obj_register: bool = False
+    mv_register_iters: int = 4
+    mv_geom_norm_quantile: float = 0.0
+    mv_use_geometry: bool = True
 
 
 def mv_prefix_len(model_cfg) -> int:

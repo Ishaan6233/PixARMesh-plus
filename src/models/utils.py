@@ -114,7 +114,13 @@ def get_model(
             "mv_voxel_dim", "mv_num_obj_queries", "mv_num_scene_queries",
             "mv_num_heads", "mv_mask_seeded_pool", "mv_boundary_bias_alpha",
             "mv_obj_pc_cond", "mv_use_voxel_encoder", "mv_obj_pc_appearance",
-            "mv_obj_pc_oracle",
+            "mv_obj_pc_oracle", "mv_discovery_method",
+            # Discovery / voxelization params — must be here so yaml overrides reach
+            # ShapeOPTConfig; without this, getattr fallbacks in edgerunner.py fire
+            # instead of the configured values (e.g. mv_min_views: 2 → was using 3).
+            "mv_min_views", "mv_conf_threshold", "mv_depth_rtol", "mv_pool_size",
+            "mv_intra_obj_register", "mv_register_iters",
+            "mv_geom_norm_quantile", "mv_use_geometry",
         ]
         for _f in _mv_fields:
             if hasattr(model_cfg, _f):

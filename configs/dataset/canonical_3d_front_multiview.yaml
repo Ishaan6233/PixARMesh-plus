@@ -86,7 +86,11 @@ model:
   # (The old "validated" numbers were measured registration-OFF, pre-fix.)
   mv_intra_obj_register: false
   mv_register_iters: 4
-  mv_geom_norm_quantile: 0.0
+  # Trim [q, 1-q] extremes before computing the observed-extent normalization box.
+  # Prevents mask-bleed stragglers / Pi3X partial-observation outliers from inflating
+  # the canonical scale by ~1.4x (measured: aniso 4.24 → better aspect ratio).
+  # q=0.0 recovers the old min/max behaviour for clean A/B.
+  mv_geom_norm_quantile: 0.05
   # Pi3X conf is sigmoid'd at consumption (a probability in (0,1)); 0.5 is the calibrated
   # keep-threshold for that domain (the old 0.3 was tuned on raw logits and, post-sigmoid,
   # kept ~99% of points, near-disabling the mask-bleed purity filter).
