@@ -71,9 +71,11 @@ model:
   mv_voxel_dim: 512
   mv_mask_feat_dim: 64
   mv_num_heads: 8
-  # Instance-discovery operating point proven by Experiments 1-5:
-  # mask consensus with 3-view agreement and no depth gate (purity 0.974, hit 0.725).
-  mv_min_views: 3
+  # Instance-discovery operating point: mv2 c50 sweep (150 val objects) dominates live baseline
+  # on every metric (purity 1.000 vs 0.995, usable% 80 vs 55, zero% 3.3 vs 5.3, med_pts 983 vs 312).
+  # threshold=min(min_views,n_valid) → min_views=3 forced all-agree for 3-view objects; min_views=2
+  # is majority consensus, which is strictly better and semantically correct.
+  mv_min_views: 2
   mv_depth_rtol: 100.0
   # Fix A / CMVSA: cross-view Sim3-ICP registration of the per-view object clouds. This was
   # added to correct the ~2.3m cross-view smear caused by the (now-fixed) scene_transform

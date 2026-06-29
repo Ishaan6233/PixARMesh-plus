@@ -585,7 +585,11 @@ def transform_3d_front_multiview(
             _vidx = list(range(_nv))
         else:
             _vidx = list(range(_orig)) + [_orig - 1] * (_nv - _orig)
-        view_valid = np.array([i < _orig for i in _vidx], dtype=bool)
+        # NB: index by POSITION in the padded sequence, not by _vidx value — the
+        # repeat-pad reuses the value (_orig-1), which is always < _orig, so a
+        # value-based test marks every duplicate slot valid and lets one real view
+        # vote num_views times (defeating the min_views consensus + biasing fusion).
+        view_valid = np.array([k < _orig for k in range(_nv)], dtype=bool)
         images_n        = [images_n[i] for i in _vidx]
         depths_n        = [depths_n[i] for i in _vidx]
         wrd2cam_rects_n = [wrd2cam_rects_n[i] for i in _vidx]

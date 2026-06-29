@@ -306,14 +306,23 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
                  else torch.arange(m, device=device))
         padded[b, :m] = p[order].float()
         orders.append((order, m))
-    # pytorch3d's FPS CUDA kernel reads out of bounds (an intermittent illegal memory
-    # access — it only faults when the OOB address hits an unmapped page) when K exceeds
-    # the padded point count P=Mmax; the Python wrapper validates lengths<=P but NOT K<=P.
-    # Small/occluded objects routinely yield fewer candidate points than num_obj_voxels, so
-    # cap K to Mmax and pad each item back up to n_sample by repetition below — the same
-    # small-cloud guard fps_centroid_seeded already applies.
+    # FPS is only needed to DOWNSAMPLE items with more than K_eff points; items with
+    # fewer are kept whole (in score order) and repeat-padded downstream. So run the
+    # pytorch3d kernel ONLY on the genuinely-large items. This prevents two CUDA faults
+    # its FPS kernel exhibits — both an UNCATCHABLE async illegal-memory-access, so they
+    # must be avoided not try/except'd: (1) a batch item whose length < the scalar K
+    # (mixed sparse/dense batches — the old min(n_sample,Mmax) only caps K to the batch
+    # MAX, not per-item), and (2) tiny / near-degenerate clouds. Identity order is correct
+    # for the kept-whole items: line ~331 clamps idx to [0, m-1] and _pad_to repeats.
     K_eff = min(n_sample, Mmax)
-    _, idx_pad = sample_farthest_points(padded, lengths, K=K_eff, random_start_point=False)
+    idx_pad = torch.arange(K_eff, device=device).unsqueeze(0).repeat(B, 1)
+    dense = [b for b in range(B) if orders[b][1] > K_eff]
+    if dense:
+        dsel = torch.tensor(dense, device=device)
+        _, didx = sample_farthest_points(
+            padded[dsel], lengths[dsel], K=K_eff, random_start_point=False
+        )
+        idx_pad[dsel] = didx
 
     def _pad_to(x):   # (k, 3) -> (n_sample, 3), repeating the last row when short
         if x.shape[0] >= n_sample:

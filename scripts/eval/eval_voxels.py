@@ -71,6 +71,10 @@ def parse_args():
                    help="Min views a pool point must match (1=any, 2=consensus)")
     p.add_argument("--depth-rtol",     type=float, default=0.10,
                    help="Depth relative tolerance for visibility test (default 0.10)")
+    p.add_argument("--conf-threshold", type=float, default=0.5,
+                   help="Post-sigmoid confidence threshold for the purity filter. Live "
+                        "training uses 0.5; the discover-fn default (0.3) is more permissive "
+                        "and measures a lower-purity operating point than training.")
     p.add_argument("--sweep-rtols",    default=None,
                    help="Comma-separated rtol values to sweep, e.g. '0.10,0.20,0.50,100.0'. "
                         "Pi3X runs once per batch; discover runs once per rtol value.")
@@ -441,6 +445,7 @@ def main():
                         conf                = conf,
                         pool_size           = args.pool_size,
                         min_views           = args.min_views,
+                        conf_threshold      = args.conf_threshold,
                         depth_rtol          = rtol,
                         adaptive_fallback   = False,
                         mask_seeded_pool    = args.mask_seeded_pool,
@@ -513,6 +518,7 @@ def main():
                     conf                = conf,
                     pool_size           = args.pool_size,
                     min_views           = args.min_views,
+                    conf_threshold      = args.conf_threshold,
                     depth_rtol          = args.depth_rtol,
                     adaptive_fallback   = adaptive_fallback,
                     mask_seeded_pool    = args.mask_seeded_pool,

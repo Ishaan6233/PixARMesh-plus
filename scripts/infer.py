@@ -139,6 +139,20 @@ def run_multiview_inference(args):
         checkpoint=args.checkpoint, config_name=args.mv_config,
         extra_overrides=extra_overrides or None,
     )
+    # The production stage-2 MV checkpoint is trained WITH the obj-PC geometry channel
+    # (mv_obj_pc_cond=true, prefix_len=2370). The default --mv-config disables it
+    # (prefix_len=322); since the cond_token_mask assert still passes either way, a
+    # mismatched eval silently drops the geometry the decoder relies on and produces
+    # meaningless CD/F. Warn loudly (not raise — ablations deliberately vary channels).
+    if state.is_main_process and not getattr(model_cfg, "mv_obj_pc_cond", False):
+        warnings.warn(
+            f"MV eval built WITHOUT the obj-PC channel (mv_obj_pc_cond=False, "
+            f"prefix_len={model_cfg.prefix_len}). Stage-2 checkpoints are trained WITH "
+            f"it (prefix_len=2370); evaluating without it yields meaningless CD/F. Pass "
+            f"--obj-pc-cond (or --mv-config edgerunner_3d_front_multiview_stage2) unless "
+            f"this is a deliberate ablation.",
+            stacklevel=2,
+        )
     model.to(device)
     model.eval()
 
@@ -217,36 +231,49 @@ def run_multiview_inference(args):
                 def _to(x):
                     return x.to(device) if torch.is_tensor(x) else x
 
-                inputs_embeds = model.get_mv_inputs_with_cond(
-                    input_ids=input_ids,
-                    pixel_values=_to(batch["pixel_values"]),
-                    scene_transforms=_to(batch["scene_transforms"]),
-                    K_per_view=_to(batch["K_per_view"]),
-                    view_mask=_to(batch["view_mask"]),
-                    panoptic_masks=_to(batch.get("panoptic_masks")),
-                    cond_pcs=_to(batch["cond_pcs"]),
-                    cond_pcs_2d=_to(batch["cond_pcs_2d"]),
-                    cond_num_faces=None,
-                    obj_canon_transform=_to(batch.get("obj_canon_transform")),
-                    gt_obj_vertices=_to(batch.get("gt_obj_vertices")),
-                    ref_view=_to(batch.get("ref_view")),
-                )
-
-                results = model.generate(
-                    inputs_embeds=inputs_embeds,
-                    **_edgerunner_generation_kwargs(
-                        args,
-                        prompt_len=inputs_embeds.shape[1],
-                        collator=collator,
-                        model=model,
-                        batch_size=len(examples),
-                    ),
-                )
-                results = results.cpu().numpy()
-                for uid, tokens in zip(uids, results):
-                    _export_edgerunner_mesh(
-                        tokens, collator, model, out_dir / f"{uid}.ply", uid
+                # Guard the conditioning + decode: a single object with degenerate
+                # discovery (e.g. an empty/tiny obj cloud) must not crash the whole
+                # Accelerate rank and forfeit the shard (and stall the distributed
+                # barrier). On failure, record every object in the batch as an honest
+                # coverage MISS (0-face placeholder) and move on.
+                try:
+                    inputs_embeds = model.get_mv_inputs_with_cond(
+                        input_ids=input_ids,
+                        pixel_values=_to(batch["pixel_values"]),
+                        scene_transforms=_to(batch["scene_transforms"]),
+                        K_per_view=_to(batch["K_per_view"]),
+                        view_mask=_to(batch["view_mask"]),
+                        panoptic_masks=_to(batch.get("panoptic_masks")),
+                        cond_pcs=_to(batch["cond_pcs"]),
+                        cond_pcs_2d=_to(batch["cond_pcs_2d"]),
+                        cond_num_faces=None,
+                        obj_canon_transform=_to(batch.get("obj_canon_transform")),
+                        gt_obj_vertices=_to(batch.get("gt_obj_vertices")),
+                        ref_view=_to(batch.get("ref_view")),
                     )
+
+                    results = model.generate(
+                        inputs_embeds=inputs_embeds,
+                        **_edgerunner_generation_kwargs(
+                            args,
+                            prompt_len=inputs_embeds.shape[1],
+                            collator=collator,
+                            model=model,
+                            batch_size=len(examples),
+                        ),
+                    )
+                    results = results.cpu().numpy()
+                    for uid, tokens in zip(uids, results):
+                        _export_edgerunner_mesh(
+                            tokens, collator, model, out_dir / f"{uid}.ply", uid
+                        )
+                except Exception as e:
+                    warnings.warn(
+                        f"MV conditioning/decode failed for batch {uids} "
+                        f"({type(e).__name__}: {e}); writing decode-failure placeholders."
+                    )
+                    for uid in uids:
+                        _write_decode_failure_placeholder(out_dir / f"{uid}.ply")
 
 
 def main():
