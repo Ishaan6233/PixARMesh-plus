@@ -64,9 +64,14 @@ model:
   # The old 8192 over-matched SV's *dense/scene* count, not its object PC, and was the
   # dominant training-speed cost (per-step FPS 15.7s -> 1.8s at 2048).
   mv_num_obj_voxels: 2048
-  # Candidate-pool size for mask consensus. Under intra_obj_register the pool is bypassed
-  # (object cloud comes from the registered mask points), so keep it at the obj density.
-  mv_pool_size: 2048
+  # Candidate-pool size for mask consensus. With mask_seeded_pool=True and
+  # intra_obj_register=False (current), the pool IS the pre-consensus FPS step:
+  # all 4-view mask pixels (~50k+) are FPS'd to pool_size BEFORE voting. A pool
+  # capped at 2048 (= num_obj_voxels) loses spatial diversity pre-consensus and
+  # discards the 4-view surface advantage. 8192 preserves diversity while remaining
+  # tractable; the subsequent FPS to num_obj_voxels=2048 then selects the most
+  # representative subset of the (now-diverse) valid object points.
+  mv_pool_size: 8192
   mv_num_ctx_voxels: 1024
   mv_voxel_dim: 512
   mv_mask_feat_dim: 64
