@@ -940,10 +940,32 @@ def transform_3d_front_multiview(
 
 
 def get_mesh_dataset(data_cfg: DataConfig):
+    data_type = data_cfg.type
+
+    # Trellis2-MV uses a custom per-object file format (not HuggingFace Arrow).
+    if data_type == "3d-front-trellis2-mv":
+        from src.data.trellis2_mv import Trellis2MVDataset
+        trellis2_dir = Path(data_cfg.path).absolute().as_posix()
+        hf_path = data_cfg.trellis2_hf_path or str(
+            Path(data_cfg.path).parent.parent / "3d-front-multiview-full"
+        )
+        hf_path = Path(hf_path).absolute().as_posix()
+        image_preprocessor = None
+        if data_cfg.load_images:
+            image_preprocessor = AutoImageProcessor.from_pretrained(
+                data_cfg.image_preprocessor, size_divisor=data_cfg.image_size_divisor
+            )
+        train_data = Trellis2MVDataset(
+            trellis2_dir, hf_path, data_cfg, image_preprocessor, is_train=True
+        )
+        val_data = Trellis2MVDataset(
+            trellis2_dir, hf_path, data_cfg, image_preprocessor, is_train=False
+        )
+        return train_data, val_data, val_data
+
     local_path = Path(data_cfg.path).absolute().as_posix()
     num_proc = max(min(os.cpu_count(), 64), 16)
     data = datasets.load_dataset(local_path, num_proc=num_proc)
-    data_type = data_cfg.type
     match data_type:
         case "shapenet":
             mapper = transform_mesh

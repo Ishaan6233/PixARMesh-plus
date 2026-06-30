@@ -269,8 +269,8 @@ class Front3DCollator(BaseCollator):
                 ctx_pc_2d = example["ctx_point_clouds_2d"]
                 all_ctx_pcs.append(ctx_pc)
                 all_ctx_pcs_2d.append(ctx_pc_2d)
-                if has_scene_transform:
-                    all_scene_transforms.append(example["scene_transforms"])
+            if has_scene_transform:
+                all_scene_transforms.append(example["scene_transforms"])
 
             obj_seq = []
             obj_type_ids = []
@@ -346,10 +346,10 @@ class Front3DCollator(BaseCollator):
             ret["ctx_pcs"] = torch.as_tensor(all_ctx_pcs, dtype=torch.float32)
             all_ctx_pcs_2d = np.array(all_ctx_pcs_2d)
             ret["ctx_pcs_2d"] = torch.as_tensor(all_ctx_pcs_2d, dtype=torch.float32)
-            if has_scene_transform:
-                ret["scene_transform"] = torch.as_tensor(
-                    np.array(all_scene_transforms), dtype=torch.float32
-                )
+        if has_scene_transform:
+            ret["scene_transform"] = torch.as_tensor(
+                np.array(all_scene_transforms), dtype=torch.float32
+            )
         if has_obj:
             all_obj_indices = np.array(all_obj_indices)
             ret["obj_indices"] = torch.as_tensor(all_obj_indices, dtype=torch.long)
@@ -448,7 +448,7 @@ def get_mesh_data_collator(data_cfg: DataConfig, model_cfg: ModelConfig):
     match data_type:
         case "shapenet":
             collator = MeshDataCollator(data_cfg, model_cfg)
-        case "3d-front" | "3d-front-layout" | "3d-front-multiview":
+        case "3d-front" | "3d-front-layout" | "3d-front-multiview" | "3d-front-trellis2-mv":
             collator = Front3DCollator(data_cfg, model_cfg)
         case _:
             raise ValueError(f"Unknown dataset type: {data_type}")

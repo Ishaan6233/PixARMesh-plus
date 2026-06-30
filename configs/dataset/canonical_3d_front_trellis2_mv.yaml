@@ -1,0 +1,79 @@
+# Trellis2-MV 3D-FRONT training config.
+# Dataset: datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-...
+# Per-object file format (mesh_dumps + mv_cond). Images/cameras cross-referenced
+# from local 3d-front-multiview-full HF dataset by scene_id.
+# Scene normalization: T_norm_from_output (gravity-aligned world→norm) replaces the
+# current bbox-centering pipeline. Reference view chosen by covisibility.
+#
+# Model prefix: mv_obj_pc_cond=false here → z_i (257) + z_scene (64) + num_face (1) = 322.
+# Stage configs override mv_obj_pc_cond: true → prefix = 2048+257+64+1 = 2370.
+
+spec:
+  resolution: 518
+  num_points: 4096
+  axis_convention: y_up_z_forward
+  unit_scale: 1.0
+  augmentation_policy: canonical_train_only
+  coordinate_frame:
+    handedness: right
+    up_axis: y
+    forward_axis: z
+    units: meters
+  normalization:
+    mode: gravity_aligned   # uses T_norm_from_output from mv_cond.pt
+    bound: 0.95
+    center: true
+    preserve_aspect_ratio: true
+
+src_data:
+  type: 3d-front-trellis2-mv
+  path: datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-qfcat-obj015-light-bgtex-20260629
+  trellis2_hf_path: datasets/3d-front-multiview-full
+  num_views: 4
+  num_points: ${dataset.spec.num_points}
+  norm_bound: ${dataset.spec.normalization.bound}
+  with_normals: false
+  num_pos_tokens: ${model.num_pos_tokens}
+  # Random augmentation: scale and jitter still on; rotation is OFF because
+  # T_norm_from_output already provides a gravity-aligned frame (random Y-rotation
+  # would fight the consistent up-direction the pre-computed frame provides).
+  random_scale: true
+  random_scale_min: 0.75
+  random_rotate: false
+  random_jitter_point_clouds: true
+  random_jitter_probability: 0.5
+  random_jitter_offset: 0.01
+  random_jitter_depth: false   # no per-view depth maps in this loader
+  random_shift: true
+  random_shift_max: 0.2
+  visualize: false
+  use_masked_obj_pc: true
+  load_images: true
+  image_preprocessor: facebook/dpt-dinov2-small-nyu
+  image_size_divisor: 28
+  ignore_obj_seq: false
+  ignore_layout_seq: false
+
+model:
+  # OPT prefix (base, without mv_obj_pc_cond): z_i (257) + z_scene (64) + num_face (1) = 322
+  prefix_len: 322
+  mv_voxel_encoder: true
+  mv_num_obj_queries: 257
+  mv_num_scene_queries: 64
+  mv_num_obj_voxels: 2048
+  mv_pool_size: 8192
+  mv_num_ctx_voxels: 1024
+  mv_voxel_dim: 512
+  mv_mask_feat_dim: 64
+  mv_num_heads: 8
+  mv_min_views: 2
+  mv_depth_rtol: 100.0
+  mv_intra_obj_register: false
+  mv_register_iters: 4
+  mv_geom_norm_quantile: 0.05
+  mv_conf_threshold: 0.5
+  mv_use_geometry: true
+  img_cond: true
+  mv_obj_pc_cond: false
+  mv_use_voxel_encoder: true
+  mv_obj_pc_appearance: true

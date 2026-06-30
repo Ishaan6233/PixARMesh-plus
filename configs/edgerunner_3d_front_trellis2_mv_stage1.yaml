@@ -1,0 +1,26 @@
+defaults:
+  - edgerunner_3d_front_trellis2_mv
+  - _self_
+
+all:
+  name: edgerunner-3d-front-trellis2-mv-stage1
+
+# Stage 1: layout-only, AUGMENT conditioning (obj-PC 2048 + z_i 257 + z_scene 64 + 1 = 2370).
+# Trains FROM SCRATCH off the EdgeRunner base — same recipe as MV stage1.
+model:
+  local_path: zx1239856/edgerunner
+
+dataset:
+  src_data:
+    ignore_obj_seq: true
+  model:
+    mv_obj_pc_cond: true
+
+train:
+  train_args:
+    per_device_train_batch_size: 16
+    gradient_accumulation_steps: 1
+    max_steps: 5000
+    save_steps: 1000
+    eval_strategy: "no"
+    eval_steps: 999999

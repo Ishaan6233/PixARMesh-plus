@@ -51,6 +51,9 @@ class DataConfig:
     ignore_layout_seq: bool = False
     # Multi-view
     num_views: int = 1
+    # Trellis2-MV dataset: path to local HF dataset used to cross-ref images/cameras.
+    # Defaults to <dataset_path>/../../3d-front-multiview-full when empty.
+    trellis2_hf_path: str = ""
 
 
 @dataclass

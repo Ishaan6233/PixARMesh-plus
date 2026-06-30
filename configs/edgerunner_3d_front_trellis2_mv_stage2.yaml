@@ -1,0 +1,20 @@
+defaults:
+  - edgerunner_3d_front_trellis2_mv
+  - _self_
+
+all:
+  name: edgerunner-3d-front-trellis2-mv-stage2
+
+# Stage 2: full training (layout + mesh), AUGMENT conditioning.
+# Warm-start from Stage-1 final (set by train_mv.sh via model.local_path=<stage1_ckpt>).
+dataset:
+  src_data:
+    ignore_obj_seq: false
+  model:
+    mv_obj_pc_cond: true
+
+train:
+  train_args:
+    max_steps: 30000
+    save_steps: 3000
+    eval_steps: 999999

@@ -1,0 +1,35 @@
+defaults:
+  - edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x
+  - dataset/canonical_3d_front_trellis2_mv
+  - _self_
+
+all:
+  name: edgerunner-3d-front-trellis2-mv
+
+# Trellis2-MV base config. Inherits the same SV warm-start + Pi3X backbone as the
+# standard MV config. The new dataset provides: (1) higher-quality GT meshes
+# (aesthetic_score=10.0 filter, max 4000 faces), (2) gravity-aligned scene
+# normalization via T_norm_from_output, (3) richer 75k-pt scene geometry as
+# discovery seeds. Images/cameras still come from local 3d-front-multiview-full
+# (4 views) so Pi3X + DINOv2 conditioning is unchanged.
+model:
+  local_path: outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260602-135736/checkpoints/final
+  mv_mask_seeded_pool: true
+  mv_boundary_bias_alpha: 0.0
+
+train:
+  train_args:
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 2
+    max_steps: 30000
+    save_steps: 3000
+    eval_strategy: "no"
+    eval_steps: 999999
+    learning_rate: 1e-4
+    warmup_steps: 100
+    lr_scheduler_type: cosine
+    logging_steps: 10
+    bf16: true
+    dataloader_num_workers: 4
+    dataloader_prefetch_factor: 2
