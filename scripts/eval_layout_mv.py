@@ -42,6 +42,11 @@ def bbox_size(corners):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--config-name",
+        default="edgerunner_3d_front_trellis2_mv_stage1",
+        help="Hydra config name (default: trellis2 stage1)",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=4)
     args = parser.parse_args()
@@ -51,7 +56,7 @@ def main():
 
     model, model_cfg, data_cfg = prepare_mv_model_for_inference(
         checkpoint=args.checkpoint,
-        config_name="edgerunner_3d_front_multiview_stage1",
+        config_name=args.config_name,
     )
     model.to(device)
     model.eval()

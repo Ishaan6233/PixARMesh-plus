@@ -34,31 +34,39 @@ from src.data import utils
 from src.data.mesh import subsample_point_clouds, get_instance_mesh
 
 # ── Numpy 2.x compatibility shim ────────────────────────────────────────────
-# mesh_dumps pickles were serialised with numpy 2.x (numpy._core); our env has
-# numpy 1.26.4 (numpy.core).  Register the alias once at import time.
-import numpy.core as _np_core
+# mesh_dumps pickles were serialised with numpy 2.x (numpy._core); register
+# the missing module alias so they load in numpy 1.x envs.  No-op on 2.x
+# where numpy._core already exists natively.
+if np.__version__ < "2":
+    import numpy.core as _np_core
 
-_np_mod = types.ModuleType("numpy._core")
-_np_mod.numeric = _np_core.numeric
-sys.modules.setdefault("numpy._core", _np_mod)
-sys.modules.setdefault("numpy._core.numeric", _np_core.numeric)
+    _np_mod = types.ModuleType("numpy._core")
+    _np_mod.numeric = _np_core.numeric
+    sys.modules.setdefault("numpy._core", _np_mod)
+    sys.modules.setdefault("numpy._core.numeric", _np_core.numeric)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _COVIS_SAMPLE = 2048  # downsample scene pts before covisibility loop (speed)
 
 
-def _fps_np(pts: np.ndarray, n: int) -> np.ndarray:
-    """Greedy farthest-point sampling returning n indices into pts."""
-    if len(pts) <= n:
-        return np.arange(len(pts))
-    chosen = [0]
-    dists = np.full(len(pts), np.inf)
-    for _ in range(n - 1):
-        last = pts[chosen[-1]]
-        d = np.sum((pts - last) ** 2, axis=1)
-        dists = np.minimum(dists, d)
-        chosen.append(int(np.argmax(dists)))
-    return np.array(chosen, dtype=np.int64)
+def _decode_pan_arr(m) -> np.ndarray:
+    """Decode an RGB-encoded (H,W,3) or direct (H,W) panoptic mask to int32."""
+    arr = np.array(m, dtype=np.uint32)
+    if arr.ndim == 3:
+        return (arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]).astype(np.int32)
+    return arr.astype(np.int32)
+
+
+def _pad_pan_arr(dec: np.ndarray, pad_info: dict) -> np.ndarray:
+    """Center-pad a panoptic mask from raw resolution to preprocessor output resolution."""
+    oh, ow = pad_info["out_h"], pad_info["out_w"]
+    pt, pl = pad_info["pad_top"], pad_info["pad_left"]
+    h, w = dec.shape
+    if (h, w) == (oh, ow):
+        return dec
+    out = np.zeros((oh, ow), dtype=dec.dtype)
+    out[pt:pt + h, pl:pl + w] = dec
+    return out
 
 
 def _covisibility_ref_view(
@@ -181,6 +189,7 @@ class Trellis2MVDataset(Dataset):
             "panoptic_masks" if "panoptic_masks" in hf_split.features
             else ("panoptic_mask" if "panoptic_mask" in hf_split.features else None)
         )
+        self._cached_img_chw: tuple | None = None  # (C, H, W) populated on first image load
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -319,16 +328,18 @@ class Trellis2MVDataset(Dataset):
         # ── 5. Reference view by covisibility (valid views only) ─────────────
         n_valid = int(view_valid.sum())
         if len(sc_pts_world) > _COVIS_SAMPLE:
-            samp_idx = _fps_np(sc_pts_world, _COVIS_SAMPLE)
+            samp_idx = np.random.choice(len(sc_pts_world), _COVIS_SAMPLE, replace=False)
             sc_pts_sample = sc_pts_world[samp_idx]
         else:
             sc_pts_sample = sc_pts_world
 
+        # K_adj principal points are in the padded frame, so pass padded H×W for bounds.
+        # All views share the same output resolution from the preprocessor.
         ref_view = _covisibility_ref_view(
             sc_pts_sample,
             np.stack(wrd2cam_rects_n[:n_valid], axis=0),
             np.stack(K_adj_n[:n_valid], axis=0),
-            (raw_img_hw[0], raw_img_hw[1]),
+            (pad_info_n[0]["out_h"], pad_info_n[0]["out_w"]),
         )
 
         # ── 6. Object voxel seed (cond_pcs) ─────────────────────────────────
@@ -378,31 +389,14 @@ class Trellis2MVDataset(Dataset):
             raw_masks = row[self._pan_key]
             if isinstance(raw_masks, list):
                 raw_masks = [raw_masks[v] for v in _vidx]
-
-            def _decode_pan(m):
-                arr = np.array(m, dtype=np.uint32)
-                if arr.ndim == 3:
-                    return (arr[..., 0] * 65536 + arr[..., 1] * 256 + arr[..., 2]).astype(np.int32)
-                return arr.astype(np.int32)
-
-            def _pad_pan(dec, n):
-                pvd = pad_info_n[n]
-                oh, ow = pvd["out_h"], pvd["out_w"]
-                pt, pl = pvd["pad_top"], pvd["pad_left"]
-                h, w = dec.shape
-                if (h, w) == (oh, ow):
-                    return dec
-                out = np.zeros((oh, ow), dtype=dec.dtype)
-                out[pt:pt + h, pl:pl + w] = dec
-                return out
-
-            if isinstance(raw_masks, list):
                 pan_stack = np.stack(
-                    [_pad_pan(_decode_pan(m), n) for n, m in enumerate(raw_masks)], axis=0
+                    [_pad_pan_arr(_decode_pan_arr(m), pad_info_n[n])
+                     for n, m in enumerate(raw_masks)],
+                    axis=0,
                 )
             else:
-                pan_stack = np.stack(
-                    [_pad_pan(_decode_pan(raw_masks), n) for n in range(N_views)], axis=0
+                raise ValueError(
+                    f"panoptic_masks must be a list of per-view masks, got {type(raw_masks)}"
                 )
 
         # ── 8. Assemble output ───────────────────────────────────────────────
@@ -426,6 +420,8 @@ class Trellis2MVDataset(Dataset):
         if load_images:
             pv_stack = torch.cat(pv_n_list, dim=0)  # (N, C, H, W)
             ret["pixel_values"] = pv_stack
+            if self._cached_img_chw is None:
+                self._cached_img_chw = (pv_stack.shape[1], pv_stack.shape[2], pv_stack.shape[3])
 
         if pan_stack is not None:
             ret["panoptic_masks"] = pan_stack  # (N, H, W) int32
@@ -433,9 +429,22 @@ class Trellis2MVDataset(Dataset):
         return ret
 
     def _make_empty(self, uid: str, vertices, faces) -> dict:
-        """Fallback item when scene_id is not found in HF dataset."""
+        """Fallback item when scene_id is not found in HF dataset.
+
+        point_clouds_valid=False causes the collator to mask all loss for this item,
+        so zero bboxes / identity transforms do not affect training. pixel_values and
+        panoptic_masks are included so the collator's batch-level key-detection
+        (based on examples[0]) doesn't KeyError when a fallback appears mid-batch.
+        """
+        import warnings
+        warnings.warn(
+            f"[Trellis2MVDataset] scene_id not found in HF data for uid={uid!r}; "
+            "item contributes no loss (pc_valid=False)",
+            stacklevel=3,
+        )
         n = getattr(self.data_cfg, "num_views", 4) or 4
-        return {
+        load_images = self.data_cfg.load_images and self.image_preprocessor is not None
+        ret = {
             "uid": uid,
             "bboxes": np.zeros((1, 8, 3), dtype=np.float32),
             "obj_indices": 0,
@@ -450,3 +459,14 @@ class Trellis2MVDataset(Dataset):
             "ref_view": 0,
             "obj_canon_transform": np.eye(4, dtype=np.float32),
         }
+        if load_images:
+            # Use cached shape from a successful item; fall back to DINOv2 default
+            # for 484×648 3D-FRONT input (divisor pads to 504×672).
+            if self._cached_img_chw is not None:
+                C, H, W = self._cached_img_chw
+            else:
+                C, H, W = 3, 504, 672
+            ret["pixel_values"] = torch.zeros((n, C, H, W), dtype=torch.float32)
+            if self._hf_has_panoptic:
+                ret["panoptic_masks"] = np.zeros((n, H, W), dtype=np.int32)
+        return ret

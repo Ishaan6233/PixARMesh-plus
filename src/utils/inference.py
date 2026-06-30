@@ -569,6 +569,11 @@ def prepare_mv_test_set(data_cfg):
     is `validation`; get_mesh_dataset's train/val/test logic does not handle it, so
     we load and wrap the split directly here.
     """
+    if data_cfg.type == "3d-front-trellis2-mv":
+        from src.data.mesh import get_mesh_dataset
+        _, val_ds, _ = get_mesh_dataset(data_cfg)
+        return val_ds
+
     from pathlib import Path
     from transformers import AutoImageProcessor
     from src.data.mesh import transform_3d_front_multiview

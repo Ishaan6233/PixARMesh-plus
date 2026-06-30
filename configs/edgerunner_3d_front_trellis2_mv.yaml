@@ -28,7 +28,7 @@ train:
     eval_steps: 999999
     learning_rate: 1e-4
     warmup_steps: 100
-    lr_scheduler_type: cosine
+    lr_scheduler_type: warmup_stable_decay
     logging_steps: 10
     bf16: true
     dataloader_num_workers: 4
