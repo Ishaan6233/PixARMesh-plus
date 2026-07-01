@@ -266,8 +266,78 @@ def fps_centroid_seeded(pts: torch.Tensor, n_sample: int) -> torch.Tensor:
     return pts.gather(1, idx.unsqueeze(-1).expand(B, n_sample, 3))
 
 
+def _voxel_grid_sample(
+    pts: torch.Tensor,             # (M, 3) float
+    scores: "torch.Tensor | None", # (M,) float or None — higher = preferred
+    n_sample: int,
+    grid_res: int = 32,
+) -> "tuple[torch.Tensor, torch.Tensor | None]":
+    """Voxel-grid downsampling: one point per occupied voxel cell.
+
+    Divides the point cloud into a grid_res³ occupancy grid and selects the
+    highest-score point in each occupied cell.  This gives equal representation
+    to thin/occluded structures (chair legs, door frames) that FPS under-samples
+    because FPS maximises spread and biases toward outliers at the bbox boundary.
+
+    Returns: (sampled_pts (≤n_sample, 3), sampled_scores or None)
+    If fewer than n_sample cells are occupied, pads by repeating the last point.
+    If more cells than n_sample, keeps the top-score cells.
+    """
+    M = pts.shape[0]
+    device = pts.device
+    dtype = pts.dtype
+
+    if M == 0:
+        z = torch.zeros(n_sample, 3, device=device, dtype=dtype)
+        return z, None
+
+    vmin = pts.min(0).values
+    extent = (pts.max(0).values - vmin).clamp(min=1e-6)
+    gc = ((pts - vmin) / extent * (grid_res - 1)).long().clamp(0, grid_res - 1)  # (M, 3)
+    cid = gc[:, 0] * (grid_res * grid_res) + gc[:, 1] * grid_res + gc[:, 2]     # (M,)
+
+    # Sort by (cell_id ascending, score descending) so the first point per cell
+    # after sort is the highest-score point in that cell.
+    if scores is not None:
+        score_rank = (-scores.float()).argsort()   # high score → small rank
+        sort_key = cid * (M + 1) + score_rank.argsort()
+    else:
+        sort_key = cid * (M + 1) + torch.arange(M, device=device, dtype=torch.long)
+    order = sort_key.argsort()
+
+    cid_sorted = cid[order]
+    pts_sorted = pts[order]
+    scr_sorted = scores[order] if scores is not None else None
+
+    # Keep only the first occurrence per cell (= highest score in that cell)
+    keep = torch.cat([
+        torch.ones(1, dtype=torch.bool, device=device),
+        cid_sorted[1:] != cid_sorted[:-1],
+    ])
+    sel_pts = pts_sorted[keep]                             # (n_cells, 3)
+    sel_scr = scr_sorted[keep] if scr_sorted is not None else None
+    n_cells = sel_pts.shape[0]
+
+    if n_cells <= n_sample:
+        # Pad to n_sample by repeating the last point
+        if n_cells < n_sample:
+            rep = sel_pts[-1:].expand(n_sample - n_cells, 3)
+            sel_pts = torch.cat([sel_pts, rep], dim=0)
+            if sel_scr is not None:
+                rep_s = sel_scr[-1:].expand(n_sample - n_cells)
+                sel_scr = torch.cat([sel_scr, rep_s], dim=0)
+        return sel_pts, sel_scr
+
+    # More occupied cells than n_sample: keep top-score cells (or first n if no scores)
+    if sel_scr is not None:
+        top_idx = sel_scr.topk(n_sample, largest=True, sorted=False).indices
+    else:
+        top_idx = torch.arange(n_sample, device=device)
+    return sel_pts[top_idx], (sel_scr[top_idx] if sel_scr is not None else None)
+
+
 def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dtype,
-                     max_pts: int = 8192):
+                     max_pts: int = 8192, sampling_mode: str = "fps"):
     """One batched score-seeded FPS over B variable-length object clouds (Opt 2).
 
     Replaces B serial per-item `fps_score_seeded` calls with a single padded pytorch3d
@@ -291,6 +361,29 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
         capped_geom.append(g)
     pts_list, scores_list, geom_list = capped_pts, capped_scores, capped_geom
 
+    # ---- Voxel-grid path: per-item (different bboxes), no batching needed ----
+    if sampling_mode == "grid":
+        obj_out, geom_out = [], []
+        for b, (p, s, g) in enumerate(zip(pts_list, scores_list, geom_list)):
+            p = p.to(device).float()
+            s = s.to(device).float() if s is not None else None
+            g = g.to(device).float() if g is not None else None
+            sel_pts, sel_scr = _voxel_grid_sample(p, s, n_sample)
+            obj_out.append(sel_pts)
+            # Align the registered geometry twin: gather by the same indices that
+            # voxel-grid uses.  Since _voxel_grid_sample returns the actual chosen
+            # points (not indices), we match by nearest neighbour in the selected set.
+            # Simpler: run voxel-grid on (g or p) with the same scores.
+            if g is not None:
+                geom_sel, _ = _voxel_grid_sample(g, s, n_sample)
+            else:
+                geom_sel = sel_pts
+            geom_out.append(geom_sel)
+        obj_t  = torch.stack(obj_out, dim=0).to(out_dtype)
+        geom_t = torch.stack(geom_out, dim=0).to(out_dtype)
+        return obj_t, geom_t
+
+    # ---- FPS path (default) ----
     B = len(pts_list)
     lengths = torch.tensor([max(1, p.shape[0]) for p in pts_list], device=device, dtype=torch.long)
     Mmax = int(lengths.max())
@@ -665,6 +758,7 @@ def discover_instance_points_mv(
     return_diagnostics: bool = False,
     return_pool_diagnostics: bool = False,
     return_target_ids: bool = False,
+    voxel_sampling: str = "fps",  # "fps" (default) or "grid" (voxel-grid, fairer for thin structures)
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """Grounded-SAM direct-mask instance discovery with adaptive voxelization.
 
@@ -985,7 +1079,8 @@ def discover_instance_points_mv(
     # `lengths`) replaces the B serial per-item calls — the index-aligned registered twin
     # is gathered with the same indices.
     obj_t, obj_geom_t = _batched_obj_fps(
-        obj_raw_list, obj_scores_list, reg_geom_list, num_obj_voxels, device, out_dtype
+        obj_raw_list, obj_scores_list, reg_geom_list, num_obj_voxels, device, out_dtype,
+        sampling_mode=voxel_sampling,
     )
     ctx_t = torch.stack(ctx_list, dim=0).to(out_dtype)
     target_ids_t = torch.stack(target_ids_list, dim=0) if return_target_ids else None  # (B, N) long

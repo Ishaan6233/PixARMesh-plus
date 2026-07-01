@@ -414,6 +414,7 @@ class ShapeOPT(OPTForCausalLM):
                 pool_size           = getattr(self.config, "mv_pool_size", 8192),
                 intra_obj_register  = getattr(self.config, "mv_intra_obj_register", False),
                 register_iters      = getattr(self.config, "mv_register_iters", 4),
+                voxel_sampling      = getattr(self.config, "mv_voxel_sampling", "fps"),
                 return_target_ids   = True,
             )   # (B, V_obj, 3), (B, V_ctx, 3), (B, N)
         else:
@@ -549,6 +550,17 @@ class ShapeOPT(OPTForCausalLM):
         # Pass panoptic_masks + per-view target IDs so the encoder gates per-view
         # features by mask consensus (Experiment 3) instead of the Pi3X depth check,
         # and Pi3X confidence so the IBRNet fusion is confidence-weighted.
+        # Per-object view mask: exclude views with insufficient pixel support for this
+        # object even if they have a valid target ID.  Views with fewer than
+        # mv_covis_min_support_pix panoptic pixels are dropped from the object-voxel
+        # IBRNet fusion while the scene-context path keeps the full view_mask.
+        obj_view_mask = None
+        if mv_target_ids is not None and panoptic_masks is not None:
+            pm_dev = panoptic_masks.to(device)                                      # (B, N, Hp, Wp)
+            pixel_support_n = (pm_dev == mv_target_ids[:, :, None, None]).sum((-1, -2)).float()  # (B, N)
+            min_sup_pix = float(getattr(self.config, "mv_covis_min_support_pix", 200))
+            obj_view_mask = view_mask & (pixel_support_n >= min_sup_pix)
+
         z_i = z_scene = None
         if getattr(self.config, "mv_use_voxel_encoder", True):
             mv_out  = self.mv_voxel_encoder(
@@ -559,6 +571,7 @@ class ShapeOPT(OPTForCausalLM):
                 target_ids     = mv_target_ids,
                 conf           = mv_conf,
                 obj_geom_voxels = obj_geom_voxels,   # canonical-frame geometry for PointEmbed
+                obj_view_mask  = obj_view_mask,      # per-object pixel-support gate
             )
             z_i     = mv_out["z_i"]      # (B, M, out_dim)
             z_scene = mv_out["z_scene"]  # (B, S, out_dim)

@@ -151,6 +151,13 @@ class ModelConfig:
     mv_register_iters: int = 4
     mv_geom_norm_quantile: float = 0.0
     mv_use_geometry: bool = True
+    # Sampling strategy for obj_voxels after discovery: "fps" = score-seeded FPS (default,
+    # maximises spread), "grid" = voxel-grid (fairer for thin/occluded structures).
+    mv_voxel_sampling: str = "fps"
+    # Per-object pixel-support gate for IBRNet fusion: views with fewer than this many
+    # panoptic pixels matching the target instance are excluded from the object-voxel
+    # encoder path (scene context voxels still use all valid views).
+    mv_covis_min_support_pix: int = 200
 
 
 def mv_prefix_len(model_cfg) -> int:

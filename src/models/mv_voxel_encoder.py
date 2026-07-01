@@ -466,19 +466,28 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         target_ids: torch.Tensor | None = None,      # (B, N) long — per-view target instance ID
         conf: torch.Tensor | None = None,            # (B, N, H, W) Pi3X confidence — weighted fusion
         obj_geom_voxels: torch.Tensor | None = None, # (B, V_obj, 3) canonical-frame obj voxels
+        obj_view_mask: torch.Tensor | None = None,   # (B, N) bool — per-object override for obj path
     ) -> dict:
+        """Forward pass.
+
+        obj_view_mask: when provided, replaces view_mask for the object-voxel path only.
+        Allows excluding low-pixel-support views per object without affecting the scene
+        context voxels which benefit from all valid views.
+        """
         B = obj_voxels.shape[0]
+        eff_obj_mask = obj_view_mask if obj_view_mask is not None else view_mask
 
         # Object voxels: mask-consensus visibility (Experiment 3) when panoptic + target_ids
         # are supplied; otherwise the depth-gate fallback inside _process_voxels.
         obj_voxel_feats = self._process_voxels(
             obj_voxels, dino_feats, mask_feats,
-            scene_transforms, K_per_view, pi3x_depth, view_mask,
+            scene_transforms, K_per_view, pi3x_depth, eff_obj_mask,
             conf=conf, panoptic_masks=panoptic_masks, target_ids=target_ids,
             geom_voxels=obj_geom_voxels,   # canonical-frame geometry for PointEmbed
         )   # (B, V_obj, D)
 
         # Context voxels: no single target instance → geometry-only visibility.
+        # Always uses the global view_mask (scene context benefits from all valid views).
         ctx_voxel_feats = self._process_voxels(
             ctx_voxels, dino_feats, mask_feats,
             scene_transforms, K_per_view, pi3x_depth, view_mask,
