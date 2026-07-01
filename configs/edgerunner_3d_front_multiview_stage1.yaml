@@ -18,6 +18,7 @@ model:
   # Override the MV base config's SV-final warm-start: init from the EdgeRunner base, the
   # exact init SV stage-1 used (base_edgerunner.yaml). "From scratch" = no 3D-FRONT warm-start.
   local_path: zx1239856/edgerunner
+  loss_layout_ordinal_sigma: 2.0  # Gaussian ordinal smoothing for layout tokens
 
 dataset:
   src_data:

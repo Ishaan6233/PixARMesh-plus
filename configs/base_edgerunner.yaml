@@ -18,3 +18,4 @@ model:
   pos_token_offset: 6
   layout_tokenization_method: full
   loss_layout_scale: null
+  loss_layout_ordinal_sigma: null  # set to 2.0 in stage-1 configs to enable ordinal smoothing

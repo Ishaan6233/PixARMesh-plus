@@ -9,6 +9,7 @@ all:
 # Trains FROM SCRATCH off the EdgeRunner base — same recipe as MV stage1.
 model:
   local_path: zx1239856/edgerunner
+  loss_layout_ordinal_sigma: 2.0  # Gaussian ordinal smoothing (σ=2 bins ≈ 0.4% of 512 range)
 
 dataset:
   src_data:

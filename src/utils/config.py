@@ -93,6 +93,9 @@ class ModelConfig:
     with_ctx_pc: bool = False
     img_cond_drop_prob: float = 0.0
     loss_layout_scale: Optional[float] = None
+    # Ordinal label smoothing for layout tokens: σ=2.0 means ±2-bin Gaussian spread.
+    # None disables (backwards-compatible). Enable in stage-1 configs for A/B eval.
+    loss_layout_ordinal_sigma: Optional[float] = None
     # Pi3X: frozen image→3D backbone (replaces Depth Pro + Grounded-SAM)
     use_pi3x: bool = False
     pi3x_ckpt_path: str = "checkpoints/pi3x"

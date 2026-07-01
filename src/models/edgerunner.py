@@ -674,6 +674,7 @@ class ShapeOPT(OPTForCausalLM):
                 labels,
                 vocab_size=self.config.vocab_size,
                 loss_layout_scale=self.config.loss_layout_scale,
+                loss_layout_ordinal_sigma=getattr(self.config, "loss_layout_ordinal_sigma", None),
                 **decoder_kwargs,
             )
 
@@ -848,6 +849,7 @@ class ShapeOPT(OPTForCausalLM):
                 labels,
                 vocab_size=self.config.vocab_size,
                 loss_layout_scale=self.config.loss_layout_scale,
+                loss_layout_ordinal_sigma=getattr(self.config, "loss_layout_ordinal_sigma", None),
                 **kwargs,
             )
 
