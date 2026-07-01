@@ -29,7 +29,9 @@ src_data:
   type: 3d-front-trellis2-mv
   path: datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-qfcat-obj015-light-bgtex-20260629
   trellis2_hf_path: datasets/3d-front-multiview-full
-  num_views: 4
+  num_views: 8        # pad-to slots; actual views chosen by covisibility (mv_covis_k_max)
+  mv_covis_k_max: 8   # max diverse views to select per object
+  mv_covis_min_support_pts: 50  # min projected obj points for a view to be eligible
   num_points: ${dataset.spec.num_points}
   norm_bound: ${dataset.spec.normalization.bound}
   with_normals: false

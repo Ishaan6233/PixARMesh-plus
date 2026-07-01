@@ -47,6 +47,7 @@ if np.__version__ < "2":
 # ─────────────────────────────────────────────────────────────────────────────
 
 _COVIS_SAMPLE = 2048  # downsample scene pts before covisibility loop (speed)
+_OBJ_PTS_SAMPLE = 512  # max object pts used for per-view covisibility scoring
 
 
 def _decode_pan_arr(m) -> np.ndarray:
@@ -69,51 +70,152 @@ def _pad_pan_arr(dec: np.ndarray, pad_info: dict) -> np.ndarray:
     return out
 
 
+def _covisibility_scores(
+    obj_pts_world: np.ndarray,
+    wrd2cams: np.ndarray,
+    Ks: np.ndarray,
+    img_hw: tuple,
+) -> np.ndarray:
+    """Per-view object pixel support: count of obj_pts_world projecting in-frame.
+
+    obj_pts_world : (M, 3)  object-region world-frame points
+    wrd2cams      : (N, 4, 4)
+    Ks            : (N, 3, 3)
+    img_hw        : (H, W)
+    returns       : (N,) float32
+    """
+    H, W = img_hw
+    N = len(wrd2cams)
+    scores = np.zeros(N, dtype=np.float32)
+    if len(obj_pts_world) == 0:
+        return scores
+    pts_h = np.concatenate(
+        [obj_pts_world, np.ones((len(obj_pts_world), 1), dtype=np.float32)], axis=1
+    )
+    for n in range(N):
+        pts_cam = (wrd2cams[n] @ pts_h.T).T[:, :3]
+        z = pts_cam[:, 2]
+        valid = z > 1e-4
+        if not valid.any():
+            continue
+        uvw = Ks[n] @ pts_cam[valid].T  # (3, k)
+        u = uvw[0] / uvw[2]
+        v = uvw[1] / uvw[2]
+        scores[n] = float(((u >= 0) & (u < W) & (v >= 0) & (v < H)).sum())
+    return scores
+
+
 def _covisibility_ref_view(
     pts_world: np.ndarray,
     wrd2cams: np.ndarray,
     Ks: np.ndarray,
     img_hw: tuple,
 ) -> int:
-    """Return the index of the local view with highest covisibility.
-
-    For each candidate view n we count how many of its visible scene points
-    also project inside the image of every other view m.  The view with the
-    highest total co-visible count is the reference.
-
-    pts_world : (M, 3)  world-frame points (sampled subset for speed)
-    wrd2cams  : (N, 4, 4)  world→camera transforms
-    Ks        : (N, 3, 3)  camera intrinsics
-    img_hw    : (H, W) raw image resolution
-    """
+    """Return index of view with highest scene-level cross-view covisibility."""
     H, W = img_hw
     N = len(wrd2cams)
     scores = np.zeros(N, dtype=np.int64)
-    pts_h = np.concatenate([pts_world, np.ones((len(pts_world), 1), dtype=np.float32)], axis=1)  # (M,4)
+    pts_h = np.concatenate([pts_world, np.ones((len(pts_world), 1), dtype=np.float32)], axis=1)
     for n in range(N):
-        pts_cam_n = (wrd2cams[n] @ pts_h.T).T[:, :3]  # (M, 3)
+        pts_cam_n = (wrd2cams[n] @ pts_h.T).T[:, :3]
         valid_n = pts_cam_n[:, 2] > 1e-4
         if not valid_n.any():
             continue
-        sub = pts_cam_n[valid_n]  # (M_n, 3) — camera-n frame
-        # back-project cam-n → world before projecting into other views
+        sub = pts_cam_n[valid_n]
         cam2wrd_n = np.linalg.inv(wrd2cams[n])
         sub_h = np.concatenate([sub, np.ones((len(sub), 1), dtype=np.float32)], axis=1)
-        sub_world_h = (cam2wrd_n @ sub_h.T).T  # (M_n, 4) world frame
+        sub_world_h = (cam2wrd_n @ sub_h.T).T
         for m in range(N):
             if m == n:
                 continue
-            pts_cam_m = (wrd2cams[m] @ sub_world_h.T).T[:, :3]  # (M_n, 3)
+            pts_cam_m = (wrd2cams[m] @ sub_world_h.T).T[:, :3]
             z_m = pts_cam_m[:, 2]
             valid_m = z_m > 1e-4
             if not valid_m.any():
                 continue
-            uvw = (Ks[m] @ pts_cam_m[valid_m].T)  # (3, k)
+            uvw = Ks[m] @ pts_cam_m[valid_m].T
             u = uvw[0] / uvw[2]
             v = uvw[1] / uvw[2]
-            in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-            scores[n] += int(in_bounds.sum())
+            scores[n] += int(((u >= 0) & (u < W) & (v >= 0) & (v < H)).sum())
     return int(np.argmax(scores))
+
+
+def _select_diverse_views(
+    obj_pts_world: np.ndarray,
+    wrd2cams: np.ndarray,
+    Ks: np.ndarray,
+    img_hw: tuple,
+    pixel_support: np.ndarray,
+    k_max: int,
+    min_support_pts: int = 50,
+) -> list:
+    """Greedy diverse view selection maximising coverage and minimising overlap.
+
+    Greedily builds a set of at most k_max views.  Each step picks the candidate
+    that maximises  pixel_support[n] * (1 - max_covisibility_with_selected[n]).
+
+    Returns selected world-view indices with the highest-support view first (used
+    as the reference view by the caller).  Falls back gracefully when no view
+    meets min_support_pts.
+    """
+    H, W = img_hw
+    N = len(wrd2cams)
+
+    candidates = [n for n in range(N) if pixel_support[n] >= min_support_pts]
+    if not candidates:
+        # No view meets threshold; take all sorted by support (best-effort)
+        candidates = sorted(range(N), key=lambda n: -float(pixel_support[n]))
+
+    if len(candidates) <= k_max:
+        return sorted(candidates, key=lambda n: -float(pixel_support[n]))
+
+    # Precompute in-frame object-point indices per candidate view for fast covisibility
+    pts_h = np.concatenate(
+        [obj_pts_world, np.ones((len(obj_pts_world), 1), dtype=np.float32)], axis=1
+    )
+    cand_inframe: list = []  # list of np.ndarray of point indices
+    for n in candidates:
+        pts_cam = (wrd2cams[n] @ pts_h.T).T[:, :3]
+        z = pts_cam[:, 2]
+        valid = z > 1e-4
+        if valid.any():
+            uvw = Ks[n] @ pts_cam[valid].T
+            u = uvw[0] / uvw[2]
+            v = uvw[1] / uvw[2]
+            inside = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+            cand_inframe.append(np.where(valid)[0][inside])
+        else:
+            cand_inframe.append(np.array([], dtype=np.int64))
+
+    cand_to_local = {c: i for i, c in enumerate(candidates)}
+
+    # Initialise with highest-support view (= reference view)
+    best_start = max(candidates, key=lambda n: float(pixel_support[n]))
+    selected = [best_start]
+    selected_sets = [set(cand_inframe[cand_to_local[best_start]].tolist())]
+    remaining = [c for c in candidates if c != best_start]
+
+    while len(selected) < k_max and remaining:
+        best_n, best_score = None, -1.0
+        for n in remaining:
+            sup = float(pixel_support[n])
+            if sup < 1:
+                continue
+            in_n = set(cand_inframe[cand_to_local[n]].tolist())
+            max_covis = max(
+                (len(in_n & s_set) / max(sup, 1.0) for s_set in selected_sets),
+                default=0.0,
+            )
+            score = sup * (1.0 - max_covis)
+            if score > best_score:
+                best_score, best_n = score, n
+        if best_n is None:
+            break
+        selected.append(best_n)
+        selected_sets.append(set(cand_inframe[cand_to_local[best_n]].tolist()))
+        remaining.remove(best_n)
+
+    return selected
 
 
 class Trellis2MVDataset(Dataset):
@@ -245,19 +347,67 @@ class Trellis2MVDataset(Dataset):
 
         row = self._hf[hf_idx]
         n_avail = len(row["wrd2cam_rects"])
-        _nv = getattr(data_cfg, "num_views", n_avail) or n_avail
-        # Pad when n_avail < _nv by repeating the last valid view
-        if n_avail >= _nv:
-            _vidx = list(range(_nv))
-        else:
-            _vidx = list(range(n_avail)) + [n_avail - 1] * (_nv - n_avail)
-        view_valid = np.array([k < n_avail for k in range(_nv)], dtype=bool)
-        N_views = _nv
 
-        wrd2cam_rects_n = [np.array(row["wrd2cam_rects"][v], dtype=np.float32) for v in _vidx]
-        Ks_raw_n = [np.array(row["Ks"][v], dtype=np.float32) for v in _vidx]
+        # Covisibility-based view selection ─────────────────────────────────
+        # Load lightweight camera data for ALL available views first, score each
+        # view by how many object-region points project in-frame, then greedily
+        # select up to mv_covis_k_max diverse views.  This replaces the old
+        # "take first num_views views" truncation that silently discarded most
+        # views in 20+-view mesh_datasets scenes.
+
+        k_max = getattr(data_cfg, "mv_covis_k_max", 8) or n_avail
+        min_sup = getattr(data_cfg, "mv_covis_min_support_pts", 50)
+        pad_slots = getattr(data_cfg, "num_views", k_max) or k_max  # tensor padding target
+
+        all_wrd2cams = np.stack(
+            [np.array(row["wrd2cam_rects"][v], dtype=np.float32) for v in range(n_avail)]
+        )  # (n_avail, 4, 4)
+        all_Ks_raw = np.stack(
+            [np.array(row["Ks"][v], dtype=np.float32) for v in range(n_avail)]
+        )  # (n_avail, 3, 3)
+
+        # Approximate raw image HW from principal point (cx≈W/2, cy≈H/2) — avoids
+        # loading any image before the selection decision.
+        k0 = all_Ks_raw[0]
+        raw_img_hw = (int(round(float(k0[1, 2]) * 2)), int(round(float(k0[0, 2]) * 2)))
+
+        # Object-region points in world frame for scoring (computed from pre-norm data)
+        bboxes_world_corners = (
+            T_output_from_norm[:3, :3] @ bboxes_norm[0].T + T_output_from_norm[:3, 3:]
+        ).T  # (8, 3)
+        bbox_min_w = bboxes_world_corners.min(0) - 0.1
+        bbox_max_w = bboxes_world_corners.max(0) + 0.1
+        in_bbox_w = (
+            (sc_pts_world >= bbox_min_w) & (sc_pts_world <= bbox_max_w)
+        ).all(axis=1)
+        obj_pts_for_scoring = sc_pts_world[in_bbox_w] if in_bbox_w.any() else sc_pts_world
+        if len(obj_pts_for_scoring) > _OBJ_PTS_SAMPLE:
+            rng_idx = np.random.choice(len(obj_pts_for_scoring), _OBJ_PTS_SAMPLE, replace=False)
+            obj_pts_for_scoring = obj_pts_for_scoring[rng_idx]
+
+        pixel_support = _covisibility_scores(obj_pts_for_scoring, all_wrd2cams, all_Ks_raw, raw_img_hw)
+        selected_views = _select_diverse_views(
+            obj_pts_for_scoring, all_wrd2cams, all_Ks_raw, raw_img_hw,
+            pixel_support, k_max=min(k_max, n_avail), min_support_pts=min_sup,
+        )
+
+        # Pad to pad_slots with the last selected view (maintains fixed tensor size)
+        n_selected = len(selected_views)
+        if n_selected < pad_slots:
+            _vidx = selected_views + [selected_views[-1]] * (pad_slots - n_selected)
+        else:
+            _vidx = selected_views[:pad_slots]
+            n_selected = pad_slots
+        view_valid = np.array(
+            [i < len(selected_views) and i < pad_slots for i in range(pad_slots)], dtype=bool
+        )
+        N_views = pad_slots
+        # First selected view acts as the reference (highest pixel support)
+        ref_view = 0
+
+        wrd2cam_rects_n = [all_wrd2cams[v] for v in _vidx]
+        Ks_raw_n = [all_Ks_raw[v] for v in _vidx]
         images_n = [row["images"][v] for v in _vidx]
-        raw_img_hw = (np.array(images_n[0]).shape[0], np.array(images_n[0]).shape[1])
 
         # ── 4. Per-view images, K_adj, and raw scene_transforms ─────────────
         # scene_trans_raw_n[n] = T_norm_from_output @ inv(wrd2cam_n) maps
@@ -325,22 +475,8 @@ class Trellis2MVDataset(Dataset):
         # Used later to project scene-frame pts back to world for 2D pixel coords
         T_scene_to_world = (T_output_from_norm @ S_inv).astype(np.float32)
 
-        # ── 5. Reference view by covisibility (valid views only) ─────────────
-        n_valid = int(view_valid.sum())
-        if len(sc_pts_world) > _COVIS_SAMPLE:
-            samp_idx = np.random.choice(len(sc_pts_world), _COVIS_SAMPLE, replace=False)
-            sc_pts_sample = sc_pts_world[samp_idx]
-        else:
-            sc_pts_sample = sc_pts_world
-
-        # K_adj principal points are in the padded frame, so pass padded H×W for bounds.
-        # All views share the same output resolution from the preprocessor.
-        ref_view = _covisibility_ref_view(
-            sc_pts_sample,
-            np.stack(wrd2cam_rects_n[:n_valid], axis=0),
-            np.stack(K_adj_n[:n_valid], axis=0),
-            (pad_info_n[0]["out_h"], pad_info_n[0]["out_w"]),
-        )
+        # ref_view = 0: the first selected view (highest object pixel support) is
+        # the reference.  This was set during covisibility selection above.
 
         # ── 6. Object voxel seed (cond_pcs) ─────────────────────────────────
         if has_pc:
@@ -442,7 +578,7 @@ class Trellis2MVDataset(Dataset):
             "item contributes no loss (pc_valid=False)",
             stacklevel=3,
         )
-        n = getattr(self.data_cfg, "num_views", 4) or 4
+        n = getattr(self.data_cfg, "num_views", 8) or 8
         load_images = self.data_cfg.load_images and self.image_preprocessor is not None
         ret = {
             "uid": uid,

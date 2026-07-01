@@ -50,10 +50,16 @@ class DataConfig:
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False
     # Multi-view
-    num_views: int = 1
+    num_views: int = 1  # max slots to pad to; actual count determined by covisibility selection
     # Trellis2-MV dataset: path to local HF dataset used to cross-ref images/cameras.
     # Defaults to <dataset_path>/../../3d-front-multiview-full when empty.
     trellis2_hf_path: str = ""
+    # Covisibility-based view selection (Trellis2-MV / mesh_datasets).
+    # Scores all available views by object pixel support, then greedily selects up to
+    # mv_covis_k_max diverse views.  Views with fewer than mv_covis_min_support_pts
+    # in-frame projected object points are excluded before selection.
+    mv_covis_k_max: int = 8
+    mv_covis_min_support_pts: int = 50
 
 
 @dataclass
