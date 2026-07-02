@@ -153,6 +153,17 @@ def _eval_collate(examples):
         padded_pm = [np.concatenate([p, np.zeros((max_n - p.shape[0], H, W), dtype=np.int64)]) for p in pms]
         batch["panoptic_masks"] = torch.tensor(np.stack(padded_pm), dtype=torch.long)
 
+    # GT mesh (canonical frame) + scene->canonical transform, for ground-truth comparison.
+    # Variable-size per item (vertex/face count differs per object) — kept as a plain list,
+    # no padding/stacking, since this harness always runs batch_size=1.
+    if "vertices" in examples[0]:
+        batch["vertices"] = [_to_np(e["vertices"]) for e in examples]
+        batch["faces"] = [_to_np(e["faces"]) for e in examples]
+    if "obj_canon_transform" in examples[0]:
+        batch["obj_canon_transform"] = torch.tensor(
+            np.stack([_to_np(e["obj_canon_transform"]) for e in examples]), dtype=torch.float32
+        )
+
     return batch
 
 

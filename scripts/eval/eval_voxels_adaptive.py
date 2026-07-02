@@ -48,7 +48,8 @@ import datasets as hf_datasets
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.data.mesh import transform_3d_front_multiview
+from metrics.chamfer import chamfer_distance
+from src.data.mesh import get_mesh_dataset, transform_3d_front_multiview
 from src.models.discovery import available_methods, get_discovery_fn
 from src.models.frozen_geo_encoder import (
     _get_per_view_target_ids,
@@ -67,7 +68,13 @@ from eval_voxels import _compute_purity, _eval_collate, _select_ref_view  # noqa
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset",        required=True)
+    p.add_argument("--dataset",        required=True,
+                   help="Path to the 3d-front-multiview dataset, OR (with "
+                        "--dataset-type 3d-front-trellis2-mv) the trellis2 mesh_dataset dir")
+    p.add_argument("--dataset-type",   default="3d-front-multiview",
+                   choices=["3d-front-multiview", "3d-front-trellis2-mv"])
+    p.add_argument("--trellis2-hf-path", default="datasets/3d-front-multiview-full",
+                   help="Local HF dataset trellis2 cross-references for images/cameras/masks")
     p.add_argument("--pi3x-ckpt",      required=True)
     p.add_argument("--num-samples",    type=int, default=100)
     p.add_argument("--out",            default="results/voxel_eval_adaptive")
@@ -126,6 +133,55 @@ def _sample_conf_at_points(
     return best.cpu().numpy()
 
 
+def _sample_canonical_surface(vertices: np.ndarray, faces: np.ndarray, n: int) -> np.ndarray:
+    """Area-weighted uniform surface sampling of the GT canonical mesh. Duplicated from
+    Front3DCollator._sample_canonical_surface (src/data/collator.py) rather than imported,
+    so this eval-only diagnostic doesn't depend on the training collator."""
+    v = np.asarray(vertices, dtype=np.float64)
+    f = np.asarray(faces)
+    if v.ndim != 2 or len(v) == 0:
+        return np.zeros((n, 3), dtype=np.float32)
+    if f.ndim == 2 and f.shape[1] == 3 and len(f) > 0:
+        tris = v[f.astype(np.int64)]
+        cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+        total = areas.sum()
+        if total > 0:
+            probs = areas / total
+            ti = np.random.choice(len(f), size=n, p=probs)
+            uu = np.random.rand(n, 1)
+            ww = np.random.rand(n, 1)
+            over = (uu + ww) > 1
+            uu[over], ww[over] = 1 - uu[over], 1 - ww[over]
+            a, b, c = tris[ti, 0], tris[ti, 1], tris[ti, 2]
+            return (a + uu * (b - a) + ww * (c - a)).astype(np.float32)
+    idx = np.random.randint(0, len(v), size=n)
+    return v[idx].astype(np.float32)
+
+
+def _canonicalize_like_model(obj_voxels: np.ndarray, obj_canon_transform: np.ndarray) -> np.ndarray:
+    """Reproduce EdgeRunner.get_mv_inputs_with_cond's obj_geom_voxels computation exactly:
+    rotate scene-frame obj_voxels by obj_canon_transform's ROTATION only, then re-center /
+    re-scale by the voxels' OWN observed extent (normalize_vertices(0.95) convention).
+
+    This — not a raw scene-frame comparison — is the right way to ground-truth-check
+    discovery. obj_canon_transform's rotation is exact (built from data-loader-known GT
+    transforms), but Pi3X is scale-invariant by design (CLAUDE.md) so obj_voxels' absolute
+    scale/translation in scene frame is NOT metric-trustworthy — comparing them directly
+    against the exact-metric GT mesh would conflate "discovery found the wrong object" with
+    "Pi3X's known depth-scale drift," which are very different problems. Canonicalizing the
+    same way the model itself does isolates shape/region correctness from that drift.
+    """
+    if obj_voxels.shape[0] == 0:
+        return obj_voxels
+    R = obj_canon_transform[:3, :3]
+    v = obj_voxels @ R.T
+    vmin, vmax = v.min(0), v.max(0)
+    center = 0.5 * (vmin + vmax)
+    scale = (2 * 0.95) / max(float((vmax - vmin).max()), 1e-6)
+    return (v - center) * scale
+
+
 def _adaptive_size_stats(conf: np.ndarray, nn_dist: np.ndarray, knn_k: int) -> dict:
     """Spearman corr(confidence, local density) + low/high-confidence-tercile spacing
     ratio. Returns NaNs when too few valid (non-degenerate) voxels are present."""
@@ -164,32 +220,41 @@ def main():
     per_sample_path.write_text("")
     print(f"Streaming per-sample metrics to {per_sample_path}")
 
+    is_trellis2 = args.dataset_type == "3d-front-trellis2-mv"
     data_cfg = DataConfig(
-        type="3d-front-multiview", path=args.dataset, num_views=4, num_points=4096,
-        norm_bound=0.95, load_images=True, image_preprocessor="facebook/dpt-dinov2-small-nyu",
-        image_size_divisor=28, use_masked_obj_pc=True, random_scale=False, random_rotate=False,
+        type=args.dataset_type, path=args.dataset, num_views=(8 if is_trellis2 else 4),
+        num_points=4096, norm_bound=0.95, load_images=True,
+        image_preprocessor="facebook/dpt-dinov2-small-nyu", image_size_divisor=28,
+        use_masked_obj_pc=True, random_scale=False, random_rotate=False,
         random_jitter_point_clouds=False, random_jitter_depth=False, random_shift=False,
+        trellis2_hf_path=args.trellis2_hf_path, mv_covis_k_max=8, mv_covis_min_support_pts=50,
     )
-    print("Loading dataset ...")
-    ds_path = str(Path(args.dataset).absolute())
-    if (Path(args.dataset) / "dataset_dict.json").exists():
-        raw = hf_datasets.load_from_disk(ds_path)
+    print(f"Loading dataset (type={args.dataset_type}) ...")
+    if is_trellis2:
+        # Trellis2MVDataset emits the exact same per-item dict shape as
+        # transform_3d_front_multiview, so the existing _eval_collate works unchanged.
+        _, val_data, _ = get_mesh_dataset(data_cfg)
+        if args.num_samples < len(val_data):
+            val_data = torch.utils.data.Subset(val_data, range(args.num_samples))
     else:
-        raw = hf_datasets.load_dataset(ds_path)
-    image_preprocessor = AutoImageProcessor.from_pretrained(
-        data_cfg.image_preprocessor, size_divisor=data_cfg.image_size_divisor
-    )
-    val_key = next((k for k in ("val", "validation", "test") if k in raw), None)
-    if val_key is None:
-        raise ValueError(f"No val/validation/test split found. Available: {list(raw.keys())}")
-    raw_val = raw[val_key]
-    if args.num_samples < len(raw_val):
-        raw_val = raw_val.select(range(args.num_samples))
-
-    val_data = raw_val.with_transform(
-        partial(transform_3d_front_multiview, is_train=False, data_cfg=data_cfg,
-                image_preprocessor=image_preprocessor)
-    )
+        ds_path = str(Path(args.dataset).absolute())
+        if (Path(args.dataset) / "dataset_dict.json").exists():
+            raw = hf_datasets.load_from_disk(ds_path)
+        else:
+            raw = hf_datasets.load_dataset(ds_path)
+        image_preprocessor = AutoImageProcessor.from_pretrained(
+            data_cfg.image_preprocessor, size_divisor=data_cfg.image_size_divisor
+        )
+        val_key = next((k for k in ("val", "validation", "test") if k in raw), None)
+        if val_key is None:
+            raise ValueError(f"No val/validation/test split found. Available: {list(raw.keys())}")
+        raw_val = raw[val_key]
+        if args.num_samples < len(raw_val):
+            raw_val = raw_val.select(range(args.num_samples))
+        val_data = raw_val.with_transform(
+            partial(transform_3d_front_multiview, is_train=False, data_cfg=data_cfg,
+                    image_preprocessor=image_preprocessor)
+        )
     loader = DataLoader(val_data, batch_size=1, collate_fn=_eval_collate, num_workers=0, shuffle=False)
 
     print(f"Loading Pi3X from {args.pi3x_ckpt} ...")
@@ -252,6 +317,29 @@ def main():
         obj_adapt = _adaptive_size_stats(obj_conf_at_v, obj_nn, args.knn_k)
         ctx_adapt = _adaptive_size_stats(ctx_conf_at_v, ctx_nn, args.knn_k)
 
+        # Ground-truth check: does obj_voxels actually land on the REQUESTED object's real
+        # mesh/shape, not just on *some* self-consistent target? obj_purity/ctx_overlap can't
+        # tell these apart (both are derived from the same seed-projected target ID). Compare
+        # in the model's own canonical frame (see _canonicalize_like_model) so the check is
+        # robust to Pi3X's known scale-invariance rather than conflated with it.
+        gt_coverage_cd = gt_precision_cd = float("nan")
+        if "vertices" in batch and ov_np.shape[0] > 0:
+            verts, faces = batch["vertices"][0], batch["faces"][0]
+            canon_transform = batch["obj_canon_transform"][0].cpu().numpy()
+            if verts is not None and len(verts) > 0:
+                gt_pts_canon = _sample_canonical_surface(verts, faces, n=2048)
+                ov_canon = _canonicalize_like_model(ov_np, canon_transform)
+                gt_t = torch.as_tensor(gt_pts_canon, device=device).unsqueeze(0).float()
+                ov_t = torch.as_tensor(ov_canon, device=device).unsqueeze(0).float()
+                # GT -> obj: how much of the true surface is covered (lower = better coverage)
+                gt_coverage_cd = float(chamfer_distance(
+                    gt_t, ov_t, squared=False, reduction="mean", single_directional=True
+                ).item())
+                # obj -> GT: how close discovered voxels are to the true surface (lower = better precision)
+                gt_precision_cd = float(chamfer_distance(
+                    ov_t, gt_t, squared=False, reduction="mean", single_directional=True
+                ).item())
+
         rec = {
             "uid": uid,
             "obj_purity": obj_purity,
@@ -266,13 +354,15 @@ def main():
             "obj_adaptive_ratio": obj_adapt["adaptive_ratio"],
             "ctx_adaptive_corr": ctx_adapt["adaptive_corr"],
             "ctx_adaptive_ratio": ctx_adapt["adaptive_ratio"],
+            "gt_coverage_cd": gt_coverage_cd,
+            "gt_precision_cd": gt_precision_cd,
         }
         results.append(rec)
         n = len(results)
         with per_sample_path.open("a") as f:
             f.write(json.dumps({"index": n, **rec}) + "\n")
         print(f"  [{n:4d}] {uid[:24]:<24}  obj_purity={obj_purity:.3f}  ctx_overlap={ctx_overlap:.3f}  "
-              f"obj_nn={rec['obj_mean_nn_dist']:.4f}  ctx_nn={rec['ctx_mean_nn_dist']:.4f}  "
+              f"gt_cov={gt_coverage_cd:.4f}  gt_prec={gt_precision_cd:.4f}  "
               f"obj_adapt_corr={rec['obj_adaptive_corr']:.3f}  ctx_adapt_corr={rec['ctx_adaptive_corr']:.3f}")
 
     if not results:
@@ -283,6 +373,7 @@ def main():
         "obj_purity", "ctx_target_overlap", "obj_mean_nn_dist", "ctx_mean_nn_dist",
         "obj_extent_diag", "ctx_extent_diag", "ctx_over_obj_extent_ratio",
         "obj_adaptive_corr", "obj_adaptive_ratio", "ctx_adaptive_corr", "ctx_adaptive_ratio",
+        "gt_coverage_cd", "gt_precision_cd",
     ]
     agg = {}
     for k in metric_keys:
@@ -301,6 +392,27 @@ def main():
     for k in metric_keys:
         a = agg[k]
         print(f"  {k:<28}  mean={a['mean']:.4f}  std={a['std']:.4f}  (n={a['n']})")
+
+    # Cross-tab obj_purity (self-consistency) against gt_precision_cd (ground truth): the
+    # two can disagree — purity only checks "found A self-consistent target," not "found
+    # THE requested object." gt_found threshold is generous (well above typical obj voxel
+    # spacing ~0.01-0.02) so it flags genuine misses, not sampling noise.
+    gt_thresh = 0.05
+    have_gt = [r for r in results if np.isfinite(r["gt_precision_cd"])]
+    if have_gt:
+        purity_hi = lambda r: r["obj_purity"] > 0.5
+        gt_hi     = lambda r: r["gt_precision_cd"] < gt_thresh
+        both      = sum(1 for r in have_gt if purity_hi(r) and gt_hi(r))
+        wrong_obj = sum(1 for r in have_gt if purity_hi(r) and not gt_hi(r))
+        missed    = sum(1 for r in have_gt if not purity_hi(r) and not gt_hi(r))
+        other     = sum(1 for r in have_gt if not purity_hi(r) and gt_hi(r))
+        n = len(have_gt)
+        print(f"\n=== purity vs. ground truth (n={n}, gt_precision_cd threshold={gt_thresh}) ===")
+        print(f"  high purity + found real object (genuinely good):        {both:4d} ({both/n:.1%})")
+        print(f"  high purity + WRONG object (self-consistent but wrong):  {wrong_obj:4d} ({wrong_obj/n:.1%})")
+        print(f"  low purity + missed (correctly flagged failure):         {missed:4d} ({missed/n:.1%})")
+        print(f"  low purity + found real object anyway (odd):             {other:4d} ({other/n:.1%})")
+
     print(f"\nReport -> {out_dir / 'report.json'}")
 
 
