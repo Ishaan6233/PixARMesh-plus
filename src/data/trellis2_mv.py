@@ -165,6 +165,19 @@ def _select_diverse_views(
     if not candidates:
         # No view meets threshold; take all sorted by support (best-effort)
         candidates = sorted(range(N), key=lambda n: -float(pixel_support[n]))
+    elif len(candidates) < k_max:
+        # Fewer than k_max views clear the support threshold: backfill with the
+        # next-best sub-threshold views (real, distinct data) instead of letting
+        # the caller pad the remaining slots by repeating an already-selected
+        # view. Same downstream compute cost (the padded slot is processed by
+        # Pi3X either way) but strictly more signal — a weak real view still
+        # contributes some coverage, a duplicate contributes none (view_mask
+        # gates it out entirely).
+        backfill = sorted(
+            (n for n in range(N) if n not in candidates),
+            key=lambda n: -float(pixel_support[n]),
+        )
+        candidates = candidates + backfill[: k_max - len(candidates)]
 
     if len(candidates) <= k_max:
         return sorted(candidates, key=lambda n: -float(pixel_support[n]))
