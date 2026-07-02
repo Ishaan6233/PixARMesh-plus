@@ -348,10 +348,25 @@ class Trellis2MVDataset(Dataset):
         T_output_from_norm = np.array(cond["T_output_from_norm"], dtype=np.float32)  # gravity_norm→world
         sc_pts_norm = np.array(cond["scene_point_clouds"], dtype=np.float32)  # (M, 3) gravity_norm frame
         sc_pts_world = (T_output_from_norm[:3, :3] @ sc_pts_norm.T + T_output_from_norm[:3, 3:]).T  # (M,3)
-        bboxes_norm = np.array(cond["bboxes"], dtype=np.float32)  # (1,8,3) gravity_norm frame
+        # (K,8,3) gravity_norm frame — ALL objects in the scene, not just this one (despite
+        # the field's per-object-looking name; only ~3% of cond files here actually have a
+        # single box). The previous hardcoded [0] silently used a different object's box for
+        # any object that wasn't scene-index 0, corrupting view selection + seed cropping for
+        # most multi-object scenes. Identify the right box by matching each candidate box's
+        # centroid to this object's own transform translation (object_to_norm_transforms is
+        # confirmed per-object-correct: distinct objects in the same scene have distinct
+        # translations). Tried indexing by the uid "__objNNNN" suffix first — it agrees with
+        # nearest-centroid on ~98% of a 500-object sample, but on the other ~2% picks a box
+        # several scene-units away (wrong object entirely), so nearest-centroid is the more
+        # robust — self-verifying, not dependent on an unconfirmed naming convention — choice.
+        bboxes_norm = np.array(cond["bboxes"], dtype=np.float32)
         T_obj_to_norm = np.array(cond["object_to_norm_transforms"], dtype=np.float32)  # (4,4)
         uid = cond["uid"]
         scene_id = cond["scene_id"]
+        obj_centroids_norm = bboxes_norm.mean(axis=1)   # (K, 3)
+        obj_idx_in_scene = int(
+            np.linalg.norm(obj_centroids_norm - T_obj_to_norm[:3, 3], axis=1).argmin()
+        )
 
         # ── 3. Local HF row ──────────────────────────────────────────────────
         hf_idx = self._scene_id_to_idx.get(scene_id)
@@ -386,7 +401,7 @@ class Trellis2MVDataset(Dataset):
 
         # Object-region points in world frame for scoring (computed from pre-norm data)
         bboxes_world_corners = (
-            T_output_from_norm[:3, :3] @ bboxes_norm[0].T + T_output_from_norm[:3, 3:]
+            T_output_from_norm[:3, :3] @ bboxes_norm[obj_idx_in_scene].T + T_output_from_norm[:3, 3:]
         ).T  # (8, 3)
         bbox_min_w = bboxes_world_corners.min(0) - 0.1
         bbox_max_w = bboxes_world_corners.max(0) + 0.1
@@ -493,7 +508,7 @@ class Trellis2MVDataset(Dataset):
 
         # ── 6. Object voxel seed (cond_pcs) ─────────────────────────────────
         if has_pc:
-            obj_bbox_scene = bboxes_scene[0]  # (8,3) corners in scene frame
+            obj_bbox_scene = bboxes_scene[obj_idx_in_scene]  # (8,3) corners in scene frame
             bbox_min = obj_bbox_scene.min(axis=0) - 0.05
             bbox_max = obj_bbox_scene.max(axis=0) + 0.05
             in_bbox = (
