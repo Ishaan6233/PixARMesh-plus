@@ -167,13 +167,26 @@ class ModelConfig:
     # panoptic pixels matching the target instance are excluded from the object-voxel
     # encoder path (scene context voxels still use all valid views).
     mv_covis_min_support_pix: int = 200
+    # Per-view rogue gate (0 = off): drop whole views whose mean sigmoid(conf) falls
+    # below this before discovery/fusion. Pi3X scale-rogue views (8.9% of views, the
+    # entire cross-view r_std tail) sit at ~0.38 mean conf vs ~0.75 for inliers, and
+    # per-POINT thresholds cannot stop them — scale error is a view-level property.
+    # Never drops below mv_view_gate_min_views and never drops the reference view.
+    mv_view_conf_gate: float = 0.0
+    mv_view_gate_min_views: int = 2
+    # Append ONE scene-frame obj-AABB token to the prefix. The geometry channels are
+    # canonicalized by observed extent (to cancel Pi3X's unknown scale), which strips
+    # the layout head's pose/size evidence — this token is the only explicit
+    # scene-frame coordinate signal for the target object (2026-07-03 council).
+    mv_obj_aabb_token: bool = False
 
 
 def mv_prefix_len(model_cfg) -> int:
     """Number of conditioning (pc_token) slots the MV path emits, in prefix order
-    [obj-PC latents] + [z_i, z_scene] + num_face. Single source of truth shared by
-    training (train.py) and inference (prepare_mv_model_for_inference) so the collator's
-    prefix_len always matches what the model produces (else masked_scatter mis-sizes)."""
+    [obj-PC latents] + [z_i, z_scene] + [obj-AABB] + num_face. Single source of truth
+    shared by training (train.py) and inference (prepare_mv_model_for_inference) so the
+    collator's prefix_len always matches what the model produces (else masked_scatter
+    mis-sizes)."""
     n = 0
     if getattr(model_cfg, "mv_obj_pc_cond", False):
         n += model_cfg.pc_latent_len
@@ -181,4 +194,6 @@ def mv_prefix_len(model_cfg) -> int:
         model_cfg, "mv_voxel_encoder", False
     ):
         n += model_cfg.mv_num_obj_queries + model_cfg.mv_num_scene_queries
+    if getattr(model_cfg, "mv_obj_aabb_token", False):
+        n += 1
     return n + 1  # num_face

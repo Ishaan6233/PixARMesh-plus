@@ -153,6 +153,15 @@ class ShapeOPT(OPTForCausalLM):
             # appearance sampling. Restore the intended identity start.
             self.mv_voxel_encoder.reset_offset_net()
 
+        # Scene-frame obj-AABB prefix token: the geometry channels are canonicalized
+        # by observed extent (to cancel Pi3X's unknown scale), so without this token
+        # the decoder receives NO explicit scene-frame coordinates for the target
+        # object and must regress layout from z_scene's coarse context alone.
+        self.mv_aabb_embed = None
+        if getattr(config, "mv_obj_aabb_token", False):
+            self.mv_aabb_embed = nn.Linear(6, config.word_embed_proj_dim)
+            self.mv_aabb_embed.apply(self._init_weights)
+
     def _init_weights(self, module):
         return PreTrainedModel._init_weights(self, module)
 
@@ -363,6 +372,34 @@ class ShapeOPT(OPTForCausalLM):
         pi3x_depth = lp[..., 2]                 # (B, N, H, W)
         st         = scene_transforms.to(device, dtype=torch.float32)
         K_f        = K_per_view.float().to(device)
+
+        # --- Per-view rogue gate ---
+        # Pi3X scale-rogue views (8.9% of views; the entire cross-view r_std tail)
+        # have mean sigmoid-conf ~0.38 vs ~0.75 for inliers, and per-POINT conf
+        # thresholds cannot stop them: scale error is a view-level property, so every
+        # surviving point of a rogue view is wrong-scale. Gate whole views by mean
+        # confidence BEFORE discovery/fusion; never drop below mv_view_gate_min_views
+        # (coverage first in low-view scenes) and never drop the reference view (the
+        # seed is built from it).
+        view_gate = float(getattr(self.config, "mv_view_conf_gate", 0.0) or 0.0)
+        if view_gate > 0.0 and pi3x_out.get("conf") is not None:
+            mean_view_conf = pi3x_out["conf"][..., 0].float().mean(dim=(-1, -2))  # (B, N)
+            gate_ok = mean_view_conf >= view_gate
+            if ref_view is not None:
+                gate_ok.scatter_(
+                    1, ref_view.to(gate_ok.device).long().view(-1, 1), True
+                )
+            min_keep = int(getattr(self.config, "mv_view_gate_min_views", 2))
+            kept = (view_mask & gate_ok).sum(dim=-1)
+            if bool((kept < min_keep).any()):
+                ranked = mean_view_conf.masked_fill(~view_mask, -1.0)
+                k = min(min_keep, ranked.shape[1])
+                force = torch.zeros_like(gate_ok)
+                force.scatter_(1, ranked.topk(k, dim=-1).indices, True)
+                gate_ok = torch.where(
+                    (kept < min_keep).view(-1, 1), gate_ok | force, gate_ok
+                )
+            view_mask = view_mask & gate_ok
 
         # --- Instance discovery via Grounded-SAM consensus voting ---
         # For every Pi3X 3D point: project to all views, collect mask IDs,
@@ -590,15 +627,24 @@ class ShapeOPT(OPTForCausalLM):
         )
         inputs_embeds = self.model.decoder.embed_tokens(input_ids_clone)
 
-        # Fill pc_token slots, in order: [obj-PC latents] + [z_i, z_scene] + num_face.
-        # Channels are included only when produced (see flags above); the total token
-        # count must equal prefix_len (the collator emits that many pc_token slots).
+        # Fill pc_token slots, in order: [obj-PC latents] + [z_i, z_scene] + [obj-AABB]
+        # + num_face. Channels are included only when produced (see flags above); the
+        # total token count must equal prefix_len (the collator emits that many slots).
         cond_parts = []
         if obj_pc_embeds is not None:
             cond_parts.append(obj_pc_embeds.to(inputs_embeds.dtype))   # (B, pc_latent_len, D)
         if z_i is not None:
             cond_parts.append(z_i.to(inputs_embeds.dtype))             # (B, M, D)
             cond_parts.append(z_scene.to(inputs_embeds.dtype))         # (B, S, D)
+        if self.mv_aabb_embed is not None:
+            # Scene-frame AABB of the observed obj voxels — the only explicit
+            # scene-frame coordinate evidence for THIS object's layout tokens.
+            aabb = torch.cat(
+                [obj_voxels.amin(dim=1), obj_voxels.amax(dim=1)], dim=-1
+            )  # (B, 6)
+            cond_parts.append(
+                self.mv_aabb_embed(aabb.to(inputs_embeds.dtype)).unsqueeze(1)
+            )  # (B, 1, D)
         cond_parts.append(num_face_embeds.to(inputs_embeds.dtype))     # (B, 1, D)
         all_cond = torch.cat(cond_parts, dim=1).flatten(0, 1)          # (B*prefix_cond, D)
         # Guard the prefix_len <-> produced-token invariant: masked_scatter silently

@@ -5,7 +5,7 @@ defaults:
 all:
   name: edgerunner-3d-front-trellis2-mv-stage1
 
-# Stage 1: layout-only, AUGMENT conditioning (obj-PC 2048 + z_i 257 + z_scene 64 + 1 = 2370).
+# Stage 1: layout-only, AUGMENT conditioning (obj-PC 2048 + z_i 257 + z_scene 64 + aabb 1 + 1 = 2371).
 # Trains FROM SCRATCH off the EdgeRunner base — same recipe as MV stage1.
 model:
   local_path: zx1239856/edgerunner

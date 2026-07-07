@@ -6,7 +6,7 @@
 # current bbox-centering pipeline. Reference view chosen by covisibility.
 #
 # Model prefix: mv_obj_pc_cond=false here → z_i (257) + z_scene (64) + num_face (1) = 322.
-# Stage configs override mv_obj_pc_cond: true → prefix = 2048+257+64+1 = 2370.
+# Stage configs override mv_obj_pc_cond: true → prefix = 2048+257+64+1(aabb)+1 = 2371.
 
 spec:
   resolution: 518
@@ -79,6 +79,12 @@ model:
   mv_min_views: 2
   mv_depth_rtol: 100.0
   mv_intra_obj_register: false
+  # Per-view rogue gate: drop views with mean sigmoid(conf) below 0.45 (rogue views
+  # sit at ~0.38, inliers ~0.75 — measured 2026-07-03); ref view + min 2 views kept.
+  mv_view_conf_gate: 0.45
+  # Scene-frame obj-AABB prefix token (+1 to derived prefix_len): restores the layout
+  # head's pose/size evidence that canonicalization strips (2026-07-03 council).
+  mv_obj_aabb_token: true
   mv_register_iters: 4
   mv_geom_norm_quantile: 0.05
   mv_conf_threshold: 0.5
