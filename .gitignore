@@ -206,3 +206,6 @@ checkpoints/**/*.pth
 
 #CLAUDE
 CLAUDE.md
+
+# graphify knowledge-graph outputs (regenerable via /graphify)
+graphify-out/

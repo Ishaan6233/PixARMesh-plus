@@ -33,3 +33,8 @@ train:
     bf16: true
     dataloader_num_workers: 4
     dataloader_prefetch_factor: 2
+    # Same fix as edgerunner_3d_front_multiview.yaml (143bf88): the MV forward leaves
+    # some trainable extractor params unused (mv_voxel_encoder replaces MICHE), which
+    # trips DDP's reducer on iteration 2. This config inherits from the SV
+    # global_obj_pose base, not the MV config, so it needs the flag itself.
+    ddp_find_unused_parameters: true
