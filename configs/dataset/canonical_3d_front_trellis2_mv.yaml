@@ -32,6 +32,14 @@ src_data:
   num_views: 8        # pad-to slots; actual views chosen by covisibility (mv_covis_k_max)
   mv_covis_k_max: 8   # max diverse views to select per object
   mv_covis_min_support_pts: 50  # min projected obj points for a view to be eligible
+  # Drop degenerate instances (<2-view HF rows + truly object-blind objects); sidecar
+  # from scripts/data/build_conditioning_filter.py, built in the SAME frame mode
+  # (~9% dropped frame-corrected; the earlier "12.3%" was measured in the broken frame).
+  mv_filter_degenerate: true
+  # Exact norm→HF-world frame correction. Without it Pi3X geometry registers into a
+  # frame rotated ~90° from the seeds/bboxes/GT layout, and covisibility marks 47.7%
+  # of objects blind — 99.2% of those are visible once corrected (measured 2026-07-03).
+  mv_frame_correction: true
   num_points: ${dataset.spec.num_points}
   norm_bound: ${dataset.spec.normalization.bound}
   with_normals: false

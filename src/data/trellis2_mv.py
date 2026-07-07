@@ -14,24 +14,20 @@ Reference view is selected by covisibility: the local camera whose visible
 scene points overlap most with all other local cameras.
 """
 
-import os
-import sys
 import csv
 import pickle
+import sys
 import types
-import random
+from pathlib import Path
 
 import numpy as np
 import torch
-from pathlib import Path
 from torch.utils.data import Dataset
-from transformers import AutoImageProcessor
 
 import datasets as hf_datasets
-
-from src.utils.config import DataConfig
 from src.data import utils
-from src.data.mesh import subsample_point_clouds, get_instance_mesh
+from src.data.mesh import get_instance_mesh, subsample_point_clouds
+from src.utils.config import DataConfig
 
 # ── Numpy 2.x compatibility shim ────────────────────────────────────────────
 # mesh_dumps pickles were serialised with numpy 2.x (numpy._core); register
@@ -48,6 +44,49 @@ if np.__version__ < "2":
 
 _COVIS_SAMPLE = 2048  # downsample scene pts before covisibility loop (speed)
 _OBJ_PTS_SAMPLE = 512  # max object pts used for per-view covisibility scoring
+
+
+def load_conditioning_filter(root, expected_frame_correction: bool | None = None) -> set:
+    """Keep-set of instance sha256s from the degenerate-conditioning sidecar.
+
+    Built by scripts/data/build_conditioning_filter.py: drops instances whose HF row
+    has <2 views or whose object projects in-frame in NO view (covis support all 0).
+    The keep-set is only valid for the frame mode it was scored in — a broken-frame
+    sidecar marks 47.7% of objects blind (99.2% of them actually visible), so
+    `expected_frame_correction` is checked against conditioning_filter.meta.json.
+    """
+    path = Path(root) / "conditioning_filter.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"mv_filter_degenerate=True but {path} does not exist; build it with:\n"
+            "  PYTHONPATH=. python scripts/data/build_conditioning_filter.py "
+            f"--mesh-dataset {root}"
+        )
+    meta_path = Path(root) / "conditioning_filter.meta.json"
+    if expected_frame_correction is not None:
+        if not meta_path.exists():
+            # A CSV without meta is exactly what a stale pre-fix (frame-broken, 44%-keep)
+            # sidecar looks like — refusing is the only safe default.
+            raise ValueError(
+                f"{path} has no conditioning_filter.meta.json, so its frame mode is "
+                "unknown (a pre-frame-correction sidecar silently drops ~56% of "
+                "instances); rebuild it with scripts/data/build_conditioning_filter.py."
+            )
+        import json
+
+        built_fc = bool(json.loads(meta_path.read_text()).get("frame_correction"))
+        if built_fc != bool(expected_frame_correction):
+            raise ValueError(
+                f"conditioning_filter.csv was built with frame_correction={built_fc} "
+                f"but the loader runs with mv_frame_correction={expected_frame_correction}; "
+                "rebuild the sidecar with scripts/data/build_conditioning_filter.py."
+            )
+    keep = set()
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if str(row["keep"]).strip().lower() in ("true", "1"):
+                keep.add(row["sha256"])
+    return keep
 
 
 def _decode_pan_arr(m) -> np.ndarray:
@@ -140,6 +179,90 @@ def _covisibility_ref_view(
     return int(np.argmax(scores))
 
 
+def norm_to_world_transform(cond: dict, hf_obj_transform: np.ndarray) -> np.ndarray:
+    """Exact per-scene norm→HF-world transform from matched object transforms.
+
+    cond["T_output_from_norm"] is a PURE UNIFORM SCALE (verified 40/40 sampled
+    instances, 2026-07-03) — it does NOT reach the HF camera world; the true frame
+    offset is a per-scene rigid+scale transform (median 90° rotation). Both the HF row
+    (`objects.transforms[0]`, object-canonical→HF-world) and mv_cond
+    (`object_to_norm_transforms`, object-canonical→norm) describe the SAME object, so
+
+        M = T_hf_obj @ inv(T_obj_to_norm)     (norm → HF-world)
+
+    is exact and identical across all objects of a scene (max deviation 0.0 measured).
+    Without it, scene_transforms register Pi3X geometry into a frame rotated ~90°
+    from the seeds/bboxes/GT-layout frame, and covisibility scoring marks 47.7% of
+    instances object-blind while their objects are plainly visible (panoptic masks).
+    """
+    T_on = np.array(cond["object_to_norm_transforms"], dtype=np.float32)
+    return (np.array(hf_obj_transform, dtype=np.float32) @ np.linalg.inv(T_on)).astype(
+        np.float32
+    )
+
+
+def target_box_index(bboxes_norm: np.ndarray, T_obj_to_norm: np.ndarray) -> int:
+    """Index of this object's box among cond["bboxes"] (K,8,3), by nearest centroid.
+
+    cond["bboxes"] holds ALL objects of the scene (only ~3% of cond files are
+    single-box); object_to_norm_transforms is per-object-correct, so match each
+    candidate box's centroid to the object's own transform translation. The uid
+    "__objNNNN" suffix agrees on ~98% of a 500-object sample but picks a box several
+    scene-units away on the other ~2%, so nearest-centroid is the robust choice.
+    """
+    centroids = np.asarray(bboxes_norm).mean(axis=1)  # (K, 3)
+    return int(np.linalg.norm(centroids - np.asarray(T_obj_to_norm)[:3, 3], axis=1).argmin())
+
+
+def covis_object_supports(
+    cond: dict,
+    wrd2cams: np.ndarray,
+    Ks: np.ndarray,
+    img_hw: tuple,
+    rng=None,
+    T_norm_to_world: np.ndarray | None = None,
+) -> tuple:
+    """Object-region covisibility supports, exactly as the training loader computes them.
+
+    Single source of truth shared by __getitem__, scripts/eval/eval_pi3x_depth.py and
+    scripts/data/build_conditioning_filter.py. `rng` (np.random.RandomState) makes the
+    object-point subsample deterministic; None preserves the loader's global-RNG draw.
+
+    T_norm_to_world: the norm→HF-world transform used to project points through the HF
+    cameras. Pass `norm_to_world_transform(cond, hf_row_obj_transform)` for the
+    frame-correct projection; None falls back to cond["T_output_from_norm"] (pure
+    scale — the historical, frame-broken behavior kept for A/B measurement).
+
+    Returns (obj_pts_for_scoring (M,3) world frame, pixel_support (N,) float32).
+    """
+    if T_norm_to_world is not None:
+        T_out = np.array(T_norm_to_world, dtype=np.float32)
+    else:
+        T_out = np.array(cond["T_output_from_norm"], dtype=np.float32)
+    sc_pts_norm = np.array(cond["scene_point_clouds"], dtype=np.float32)
+    bboxes_norm = np.array(cond["bboxes"], dtype=np.float32)
+    T_obj = np.array(cond["object_to_norm_transforms"], dtype=np.float32)
+    obj_idx = target_box_index(bboxes_norm, T_obj)
+
+    # Crop in the canonical/norm frame, where the stored object box is defined.
+    # Cropping after the norm->world frame correction would turn a rotated box into a
+    # looser world-axis AABB and can scoop nearby objects into the support count.
+    corners_n = bboxes_norm[obj_idx]
+    in_bbox = (
+        (sc_pts_norm >= corners_n.min(0) - 0.1)
+        & (sc_pts_norm <= corners_n.max(0) + 0.1)
+    ).all(axis=1)
+    # No whole-scene fallback: an empty crop means the object has no points in the
+    # scene cloud at all — object-blind-equivalent — so let the supports come out
+    # all-zero instead of scoring (and seeding) on the entire scene.
+    obj_pts_norm = sc_pts_norm[in_bbox]
+    obj_pts = (T_out[:3, :3] @ obj_pts_norm.T + T_out[:3, 3:]).T
+    if len(obj_pts) > _OBJ_PTS_SAMPLE:
+        chooser = rng if rng is not None else np.random
+        obj_pts = obj_pts[chooser.choice(len(obj_pts), _OBJ_PTS_SAMPLE, replace=False)]
+    return obj_pts, _covisibility_scores(obj_pts, wrd2cams, Ks, img_hw)
+
+
 def _select_diverse_views(
     obj_pts_world: np.ndarray,
     wrd2cams: np.ndarray,
@@ -160,6 +283,14 @@ def _select_diverse_views(
     """
     H, W = img_hw
     N = len(wrd2cams)
+
+    if float(np.max(pixel_support)) <= 0:
+        # Object-blind: the object projects in-frame in NO view. Previously this fell
+        # through to the greedy loop, whose `sup < 1: continue` skipped every view and
+        # silently returned one arbitrary view that cannot see the object (measured on
+        # 741/18,334 train instances, 2026-07-03). Fail explicitly; callers mark the
+        # instance invalid so it contributes no loss.
+        return []
 
     candidates = [n for n in range(N) if pixel_support[n] >= min_support_pts]
     if not candidates:
@@ -255,7 +386,6 @@ class Trellis2MVDataset(Dataset):
 
         # ── Load instance list ───────────────────────────────────────────────
         meta_path = self.root / "metadata.csv"
-        split_tag = "train" if is_train else "val"
         self.instances: list[str] = []  # sha256 keys
         with open(meta_path, newline="") as f:
             reader = csv.DictReader(f)
@@ -273,6 +403,21 @@ class Trellis2MVDataset(Dataset):
         else:
             keep = sorted(all_idx[:n_val])
         self.instances = [self.instances[i] for i in keep]
+
+        # Degenerate-conditioning filter (applied AFTER the 95/5 split so each
+        # instance's train/val membership is unchanged by filtering).
+        if getattr(data_cfg, "mv_filter_degenerate", False):
+            keep_set = load_conditioning_filter(
+                self.root,
+                expected_frame_correction=getattr(data_cfg, "mv_frame_correction", False),
+            )
+            n_before = len(self.instances)
+            self.instances = [s for s in self.instances if s in keep_set]
+            print(
+                f"[Trellis2MVDataset] mv_filter_degenerate: kept "
+                f"{len(self.instances)}/{n_before} instances "
+                f"({n_before - len(self.instances)} degenerate dropped)"
+            )
 
         # ── Load HF dataset and build scene_id → row index ──────────────────
         hf_path_abs = Path(hf_path).absolute().as_posix()
@@ -294,6 +439,20 @@ class Trellis2MVDataset(Dataset):
         self._scene_id_to_idx: dict[str, int] = {}
         for i, sid in enumerate(hf_split["scene_id"]):
             self._scene_id_to_idx[sid] = i
+        # Per-object row lookup: HF rows are per-object (same scene rows share
+        # images/cameras but objects.transforms is THIS row's object). The frame
+        # correction needs the row matching the instance's uid, not the scene's
+        # last row.
+        self._uid_to_idx: dict[str, int] = {}
+        if "uid" in hf_split.column_names:
+            for i, u in enumerate(hf_split["uid"]):
+                self._uid_to_idx[u if isinstance(u, str) else u[0]] = i
+        if getattr(data_cfg, "mv_frame_correction", False) and not self._uid_to_idx:
+            raise ValueError(
+                f"mv_frame_correction=True requires a 'uid' column in the HF dataset "
+                f"({hf_path}); without it every item would silently degrade to a "
+                "no-loss empty (frame offset unrecoverable)."
+            )
 
         # ── Cache column existence flags ─────────────────────────────────────
         self._hf_has_panoptic = (
@@ -305,6 +464,7 @@ class Trellis2MVDataset(Dataset):
             else ("panoptic_mask" if "panoptic_mask" in hf_split.features else None)
         )
         self._cached_img_chw: tuple | None = None  # (C, H, W) populated on first image load
+        self._cached_pan_hw: tuple | None = None   # (H, W) populated on first panoptic load
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -347,34 +507,53 @@ class Trellis2MVDataset(Dataset):
         T_norm_from_output = np.array(cond["T_norm_from_output"], dtype=np.float32)  # world→gravity_norm
         T_output_from_norm = np.array(cond["T_output_from_norm"], dtype=np.float32)  # gravity_norm→world
         sc_pts_norm = np.array(cond["scene_point_clouds"], dtype=np.float32)  # (M, 3) gravity_norm frame
-        sc_pts_world = (T_output_from_norm[:3, :3] @ sc_pts_norm.T + T_output_from_norm[:3, 3:]).T  # (M,3)
-        # (K,8,3) gravity_norm frame — ALL objects in the scene, not just this one (despite
-        # the field's per-object-looking name; only ~3% of cond files here actually have a
-        # single box). The previous hardcoded [0] silently used a different object's box for
-        # any object that wasn't scene-index 0, corrupting view selection + seed cropping for
-        # most multi-object scenes. Identify the right box by matching each candidate box's
-        # centroid to this object's own transform translation (object_to_norm_transforms is
-        # confirmed per-object-correct: distinct objects in the same scene have distinct
-        # translations). Tried indexing by the uid "__objNNNN" suffix first — it agrees with
-        # nearest-centroid on ~98% of a 500-object sample, but on the other ~2% picks a box
-        # several scene-units away (wrong object entirely), so nearest-centroid is the more
-        # robust — self-verifying, not dependent on an unconfirmed naming convention — choice.
+        # (K,8,3) gravity_norm frame — ALL objects in the scene, not just this one; the
+        # previous hardcoded [0] silently used a different object's box (see
+        # target_box_index for the selection rationale).
         bboxes_norm = np.array(cond["bboxes"], dtype=np.float32)
         T_obj_to_norm = np.array(cond["object_to_norm_transforms"], dtype=np.float32)  # (4,4)
         uid = cond["uid"]
         scene_id = cond["scene_id"]
-        obj_centroids_norm = bboxes_norm.mean(axis=1)   # (K, 3)
-        obj_idx_in_scene = int(
-            np.linalg.norm(obj_centroids_norm - T_obj_to_norm[:3, 3], axis=1).argmin()
-        )
+        obj_idx_in_scene = target_box_index(bboxes_norm, T_obj_to_norm)
 
         # ── 3. Local HF row ──────────────────────────────────────────────────
-        hf_idx = self._scene_id_to_idx.get(scene_id)
+        # Prefer the per-object row (uid match): images/cameras are identical across
+        # a scene's rows, but objects.transforms — needed for the frame correction —
+        # belongs to this row's object.
+        hf_idx = self._uid_to_idx.get(uid, self._scene_id_to_idx.get(scene_id))
         if hf_idx is None:
             return self._make_empty(uid, vertices, faces)
 
         row = self._hf[hf_idx]
         n_avail = len(row["wrd2cam_rects"])
+        if n_avail < 2:
+            # Multi-view conditioning is impossible on a single-view row; enforce the
+            # sidecar's min-views rule at runtime so filter-off paths are safe too.
+            return self._make_empty(
+                uid, vertices, faces, reason=f"single-view HF row (n_views={n_avail})"
+            )
+
+        # ── 3b. Frame correction (norm → HF-world) ──────────────────────────
+        # cond["T_output_from_norm"] is a pure scale and does NOT reach the HF camera
+        # world (median 90° per-scene rotation missing); see norm_to_world_transform.
+        # T_n2w is used for covisibility scoring, scene_transforms, and seed 2D
+        # projection so conditioning geometry and supervision share ONE frame.
+        T_n2w = None
+        if getattr(data_cfg, "mv_frame_correction", False):
+            hf_obj = row.get("objects") if isinstance(row, dict) else None
+            if (
+                hf_idx == self._uid_to_idx.get(uid)
+                and hf_obj is not None
+                and hf_obj.get("transforms")
+            ):
+                T_n2w = norm_to_world_transform(cond, hf_obj["transforms"][0])
+            else:
+                # No exact object match — the frame offset is unrecoverable; a
+                # misregistered instance trains wrong, so contribute no loss.
+                return self._make_empty(
+                    uid, vertices, faces,
+                    reason="frame correction unavailable (no uid-matched HF row)",
+                )
 
         # Covisibility-based view selection ─────────────────────────────────
         # Load lightweight camera data for ALL available views first, score each
@@ -399,25 +578,22 @@ class Trellis2MVDataset(Dataset):
         k0 = all_Ks_raw[0]
         raw_img_hw = (int(round(float(k0[1, 2]) * 2)), int(round(float(k0[0, 2]) * 2)))
 
-        # Object-region points in world frame for scoring (computed from pre-norm data)
-        bboxes_world_corners = (
-            T_output_from_norm[:3, :3] @ bboxes_norm[obj_idx_in_scene].T + T_output_from_norm[:3, 3:]
-        ).T  # (8, 3)
-        bbox_min_w = bboxes_world_corners.min(0) - 0.1
-        bbox_max_w = bboxes_world_corners.max(0) + 0.1
-        in_bbox_w = (
-            (sc_pts_world >= bbox_min_w) & (sc_pts_world <= bbox_max_w)
-        ).all(axis=1)
-        obj_pts_for_scoring = sc_pts_world[in_bbox_w] if in_bbox_w.any() else sc_pts_world
-        if len(obj_pts_for_scoring) > _OBJ_PTS_SAMPLE:
-            rng_idx = np.random.choice(len(obj_pts_for_scoring), _OBJ_PTS_SAMPLE, replace=False)
-            obj_pts_for_scoring = obj_pts_for_scoring[rng_idx]
-
-        pixel_support = _covisibility_scores(obj_pts_for_scoring, all_wrd2cams, all_Ks_raw, raw_img_hw)
+        # Object-region points in world frame for scoring (shared helper — same code
+        # path as build_conditioning_filter.py and eval_pi3x_depth.py)
+        obj_pts_for_scoring, pixel_support = covis_object_supports(
+            cond, all_wrd2cams, all_Ks_raw, raw_img_hw, T_norm_to_world=T_n2w
+        )
         selected_views = _select_diverse_views(
             obj_pts_for_scoring, all_wrd2cams, all_Ks_raw, raw_img_hw,
             pixel_support, k_max=min(k_max, n_avail), min_support_pts=min_sup,
         )
+        if not selected_views:
+            # Object-blind instance (support 0 in every view): no view can condition
+            # this object — contribute no loss instead of training on a blind view.
+            return self._make_empty(
+                uid, vertices, faces,
+                reason="object projects in-frame in no view (covis support all 0)",
+            )
 
         # Pad to pad_slots with the last selected view (maintains fixed tensor size)
         n_selected = len(selected_views)
@@ -438,16 +614,23 @@ class Trellis2MVDataset(Dataset):
         images_n = [row["images"][v] for v in _vidx]
 
         # ── 4. Per-view images, K_adj, and raw scene_transforms ─────────────
-        # scene_trans_raw_n[n] = T_norm_from_output @ inv(wrd2cam_n) maps
-        # camera_n → gravity_norm frame (no bbox-normalization yet, same as
-        # M_rot_4d @ cam_to_ref in transform_3d_front_multiview).
+        # scene_trans_raw_n[n] maps camera_n → gravity_norm frame (no
+        # bbox-normalization yet, same as M_rot_4d @ cam_to_ref in
+        # transform_3d_front_multiview). With mv_frame_correction, world→norm is
+        # inv(T_n2w) — the frame-exact inverse of norm→HF-world; the legacy
+        # T_norm_from_output is a pure scale that leaves a ~90° per-scene rotation
+        # between Pi3X geometry and the seeds/bboxes/GT-layout frame.
+        T_world_to_norm = (
+            np.linalg.inv(T_n2w).astype(np.float32) if T_n2w is not None
+            else T_norm_from_output
+        )
         scene_trans_raw_n = []
         K_adj_n = []
         pad_info_n = []
         pv_n_list = []
         for n in range(N_views):
             scene_trans_raw_n.append(
-                (T_norm_from_output @ np.linalg.inv(wrd2cam_rects_n[n])).astype(np.float32)
+                (T_world_to_norm @ np.linalg.inv(wrd2cam_rects_n[n])).astype(np.float32)
             )
             K_n = Ks_raw_n[n].copy()
             pad_left = pad_top = 0
@@ -501,7 +684,9 @@ class Trellis2MVDataset(Dataset):
         obj_canon_transform = (np.linalg.inv(T_obj_to_norm) @ S_inv).astype(np.float32)
 
         # Used later to project scene-frame pts back to world for 2D pixel coords
-        T_scene_to_world = (T_output_from_norm @ S_inv).astype(np.float32)
+        T_scene_to_world = (
+            (T_n2w if T_n2w is not None else T_output_from_norm) @ S_inv
+        ).astype(np.float32)
 
         # ref_view = 0: the first selected view (highest object pixel support) is
         # the reference.  This was set during covisibility selection above.
@@ -518,7 +703,13 @@ class Trellis2MVDataset(Dataset):
             )
             obj_pts_scene = sc_pts_scene[in_bbox]  # (K, 3) scene frame
             if len(obj_pts_scene) == 0:
-                obj_pts_scene = sc_pts_scene  # fallback
+                # No whole-scene fallback (same policy as covis_object_supports): seeding
+                # on the entire scene gives every object identical, target-free
+                # conditioning — worse than contributing no loss.
+                return self._make_empty(
+                    uid, vertices, faces,
+                    reason="empty seed crop (no scene points in object bbox)",
+                )
 
             dummy_2d = np.zeros((len(obj_pts_scene), 2), dtype=np.float32)
             sampled_pc, sampled_pc_2d, pc_valid, sample_inds = subsample_point_clouds(
@@ -566,8 +757,11 @@ class Trellis2MVDataset(Dataset):
         # ── 8. Assemble output ───────────────────────────────────────────────
         ret = {
             "uid": uid,
-            "bboxes": bboxes_scene,   # (1, 8, 3) in [-bound, bound]
-            "obj_indices": 0,
+            "bboxes": bboxes_scene,   # (K, 8, 3) ALL scene objects, in [-bound, bound]
+            # The collator indexes bboxes[obj_indices] for the layout supervision target
+            # (and eval_layout_mv / infer do the same for gt-layout); it MUST point at
+            # this instance's own box, not scene-object 0.
+            "obj_indices": obj_idx_in_scene,
             "vertices": vertices,
             "faces": faces,
         }
@@ -592,18 +786,20 @@ class Trellis2MVDataset(Dataset):
 
         return ret
 
-    def _make_empty(self, uid: str, vertices, faces) -> dict:
-        """Fallback item when scene_id is not found in HF dataset.
+    def _make_empty(self, uid: str, vertices, faces, reason: str | None = None) -> dict:
+        """Fallback item for instances that cannot be conditioned.
 
-        point_clouds_valid=False causes the collator to mask all loss for this item,
-        so zero bboxes / identity transforms do not affect training. pixel_values and
-        panoptic_masks are included so the collator's batch-level key-detection
-        (based on examples[0]) doesn't KeyError when a fallback appears mid-batch.
+        Used when scene_id is missing from the HF dataset, or when the object is
+        object-blind (covisibility support 0 in every view). point_clouds_valid=False
+        causes the collator to mask all loss for this item, so zero bboxes / identity
+        transforms do not affect training. pixel_values and panoptic_masks are included
+        so the collator's batch-level key-detection (based on examples[0]) doesn't
+        KeyError when a fallback appears mid-batch.
         """
         import warnings
         warnings.warn(
-            f"[Trellis2MVDataset] scene_id not found in HF data for uid={uid!r}; "
-            "item contributes no loss (pc_valid=False)",
+            f"[Trellis2MVDataset] {reason or 'scene_id not found in HF data'} for "
+            f"uid={uid!r}; item contributes no loss (pc_valid=False)",
             stacklevel=3,
         )
         n = getattr(self.data_cfg, "num_views", 8) or 8

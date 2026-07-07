@@ -228,6 +228,9 @@ def main():
         use_masked_obj_pc=True, random_scale=False, random_rotate=False,
         random_jitter_point_clouds=False, random_jitter_depth=False, random_shift=False,
         trellis2_hf_path=args.trellis2_hf_path, mv_covis_k_max=8, mv_covis_min_support_pts=50,
+        # Match the live trellis2 training config: frame-correct scene_transforms/covis
+        # (the diagnostic must measure the frame the model actually trains in).
+        mv_frame_correction=is_trellis2,
     )
     print(f"Loading dataset (type={args.dataset_type}) ...")
     if is_trellis2:

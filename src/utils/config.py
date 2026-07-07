@@ -1,5 +1,5 @@
-from typing import Optional, List
 from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 @dataclass
@@ -60,6 +60,15 @@ class DataConfig:
     # in-frame projected object points are excluded before selection.
     mv_covis_k_max: int = 8
     mv_covis_min_support_pts: int = 50
+    # Drop instances with degenerate conditioning (HF row has <2 views, or the object
+    # projects in-frame in NO view). Requires the conditioning_filter.csv sidecar from
+    # scripts/data/build_conditioning_filter.py next to the trellis2 metadata.csv.
+    mv_filter_degenerate: bool = False
+    # Exact per-scene norm→HF-world frame correction (norm_to_world_transform): aligns
+    # covisibility scoring, scene_transforms, and seed 2D projection with the HF camera
+    # world. Requires a uid column in the HF dataset and a sidecar built in the same
+    # frame (checked against conditioning_filter.meta.json).
+    mv_frame_correction: bool = False
 
 
 @dataclass
