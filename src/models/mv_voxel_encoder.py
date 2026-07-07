@@ -421,9 +421,14 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
 
         # Variance-aware deformable offsets
         offsets = torch.tanh(self.offset_net(voxel_feats)) * 0.1   # (B, V, 2)
-        pix_refined = (
-            pix_coords + offsets.unsqueeze(2).expand(B, V, N, 2)
-        ).clamp(-1.0, 1.0)                                          # (B, V, N, 2)
+        pix_refined_raw = pix_coords + offsets.unsqueeze(2).expand(B, V, N, 2)
+        # Keys are sampled AT the refined coords, so key visibility must be evaluated
+        # there too: a border voxel whose refined sample leaves the frame yields
+        # (near-)zero features and must not be attended to as if visible. An offset
+        # cannot rescue an originally-invisible view either, hence AND with vis_mask
+        # below (the borderline-object case is exactly MV's edge advantage).
+        inframe_ref = (pix_refined_raw.abs() < 1.0).all(dim=-1)     # (B, V, N)
+        pix_refined = pix_refined_raw.clamp(-1.0, 1.0)              # (B, V, N, 2)
 
         # Resample with refined coordinates
         dino_ref = _sample_features(dino_feats, pix_refined)
@@ -440,7 +445,7 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         C_total = refined_feats.shape[-1]
         kv_in = self.deform_kv_proj(refined_feats.reshape(B * V, N, C_total))  # (B*V, N, D)
         q_in  = voxel_feats.reshape(B * V, 1, self.voxel_dim)
-        pad   = ~vis_mask.reshape(B * V, N)
+        pad   = ~(vis_mask & inframe_ref).reshape(B * V, N)
 
         # Guard: if a voxel is invisible in all views, unmask view 0 to avoid NaN
         all_masked    = pad.all(dim=1, keepdim=True)
