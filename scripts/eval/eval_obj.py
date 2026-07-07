@@ -1,4 +1,5 @@
 import argparse
+import csv
 import jsonlines
 import datasets
 import open3d as o3d
@@ -48,6 +49,100 @@ def get_mesh(mesh_path: Path):
     return None
 
 
+def _load_hf_split(path: str, preferred=("validation", "val", "test", "train")):
+    local_path = Path(path).absolute().as_posix()
+    try:
+        data = datasets.load_from_disk(local_path)
+    except Exception:
+        data = datasets.load_dataset(local_path)
+    if isinstance(data, datasets.Dataset):
+        return data
+    split = next(s for s in preferred if s in data)
+    return data[split]
+
+
+def build_trellis2_mv_eval_subset(
+    trellis2_path: str,
+    hf_path: str,
+    compute_mask_area: bool = True,
+):
+    """Evaluation subset matching Trellis2MVDataset(is_train=False).
+
+    Trellis2-MV inference emits only the deterministic 5% validation split from
+    the per-object mesh dataset. The older --mv-dataset path scores an entire HF
+    split, which gives the wrong denominator for Trellis2 checkpoints.
+    """
+    import torch
+
+    root = Path(trellis2_path)
+    instances = []
+    with (root / "metadata.csv").open(newline="") as f:
+        for row in csv.DictReader(f):
+            instances.append(row["sha256"])
+
+    rng = np.random.RandomState(42)
+    all_idx = list(range(len(instances)))
+    rng.shuffle(all_idx)
+    n_val = max(1, int(0.05 * len(all_idx)))
+    val_instances = [instances[i] for i in sorted(all_idx[:n_val])]
+
+    filter_path = root / "conditioning_filter.csv"
+    if filter_path.exists():
+        keep = set()
+        with filter_path.open(newline="") as f:
+            for row in csv.DictReader(f):
+                if str(row["keep"]).strip().lower() in ("true", "1"):
+                    keep.add(row["sha256"])
+        val_instances = [sha for sha in val_instances if sha in keep]
+
+    hf = _load_hf_split(hf_path, preferred=("train", "validation", "val", "test"))
+    keep_cols = ("uid", "objects")
+    if compute_mask_area:
+        keep_cols = keep_cols + ("panoptic_masks", "panoptic_mask")
+    hf = hf.remove_columns([c for c in hf.column_names if c not in keep_cols])
+    uid_to_row = {u if isinstance(u, str) else u[0]: i for i, u in enumerate(hf["uid"])}
+
+    subset = []
+    missing = 0
+    for sha in val_instances:
+        cond_path = root / "mv_cond" / f"{sha}.pt"
+        cond = torch.load(cond_path, map_location="cpu", weights_only=False)["cond"]
+        uid = cond["uid"]
+        row_idx = uid_to_row.get(uid)
+        if row_idx is None:
+            missing += 1
+            continue
+        row = hf[row_idx]
+        objs = row.get("objects")
+        mids = objs.get("model_ids") if objs else None
+        if not mids:
+            missing += 1
+            continue
+        model_id = mids[0]
+
+        area = 10 ** 9
+        if compute_mask_area:
+            pan = row.get("panoptic_masks")
+            if pan is None:
+                pan = row.get("panoptic_mask")
+            inst_ids = objs.get("inst_ids") if objs else None
+            if pan is not None and inst_ids:
+                ref_mask = pan[0] if isinstance(pan, list) else pan
+                try:
+                    masks = get_masks_by_ids(ref_mask, [inst_ids[0]])
+                    area = int(np.asarray(masks[0]).sum())
+                except Exception:
+                    area = 10 ** 9
+
+        subset.append(
+            {"uid": uid, "obj_id": None, "model_id": model_id, "mask_area": area}
+        )
+
+    if missing:
+        print(f"[eval_obj] WARNING: skipped {missing} Trellis2 val items missing HF metadata")
+    return subset
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="datasets/3d-front-ar-packed")
@@ -85,6 +180,28 @@ def main():
              "3d-front-multiview uid->model_id map (one item per object).",
     )
     parser.add_argument("--mv-path", type=str, default="datasets/3d-front-multiview")
+    parser.add_argument(
+        "--trellis2-mv-dataset",
+        action="store_true",
+        help="Evaluate Trellis2-MV PLYs on the same deterministic filtered 5% val split "
+             "used by configs/edgerunner_3d_front_trellis2_mv*.yaml.",
+    )
+    parser.add_argument(
+        "--trellis2-path",
+        type=str,
+        default="datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-qfcat-obj015-light-bgtex-20260629",
+    )
+    parser.add_argument(
+        "--trellis2-hf-path",
+        type=str,
+        default="datasets/3d-front-multiview-full",
+    )
+    parser.add_argument(
+        "--trellis2-no-mask-area",
+        action="store_true",
+        help="Do not decode HF panoptic masks for Trellis2 mask-area filtering; all "
+             "Trellis2 val objects pass --mask-area-thresh. Use only for diagnostics.",
+    )
     args = parser.parse_args()
 
     accelerator = Accelerator()
@@ -94,7 +211,14 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.mv_dataset:
+    if args.trellis2_mv_dataset:
+        subset = build_trellis2_mv_eval_subset(
+            args.trellis2_path,
+            args.trellis2_hf_path,
+            compute_mask_area=not args.trellis2_no_mask_area,
+        )
+        sharded_subset = subset[accelerator.process_index :: accelerator.num_processes]
+    elif args.mv_dataset:
         # Multi-view: one item per object PLY (<uid>.ply); GT via uid->model_id map.
         from src.utils.inference import build_mv_uid_to_model_id
         from src.utils.config import DataConfig
