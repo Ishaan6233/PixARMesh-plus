@@ -105,6 +105,7 @@ def get_model(
         extra_args["with_ctx_pc"] = model_cfg.with_ctx_pc
         extra_args["img_cond_drop_prob"] = model_cfg.img_cond_drop_prob
         extra_args["loss_layout_scale"] = model_cfg.loss_layout_scale
+        extra_args["loss_layout_ordinal_sigma"] = model_cfg.loss_layout_ordinal_sigma
         if model_cfg.sep_token_id is not None:
             extra_args["sep_token_id"] = model_cfg.sep_token_id
         # MV voxel encoder fields — override stale values in single-view checkpoints
@@ -120,7 +121,9 @@ def get_model(
             # instead of the configured values (e.g. mv_min_views: 2 → was using 3).
             "mv_min_views", "mv_conf_threshold", "mv_depth_rtol", "mv_pool_size",
             "mv_intra_obj_register", "mv_register_iters",
-            "mv_geom_norm_quantile", "mv_use_geometry",
+            "mv_geom_norm_quantile", "mv_use_geometry", "mv_voxel_sampling",
+            "mv_covis_min_support_pix", "mv_view_conf_gate",
+            "mv_view_gate_min_views", "mv_obj_aabb_token",
         ]
         for _f in _mv_fields:
             if hasattr(model_cfg, _f):
@@ -150,6 +153,12 @@ def get_model(
     # config here. Without this, config.mv_voxel_encoder is absent and ShapeOPT
     # never builds the multi-view encoder.
     if model_cfg is not None:
+        if "loss_layout_ordinal_sigma" in extra_args:
+            setattr(
+                config,
+                "loss_layout_ordinal_sigma",
+                extra_args["loss_layout_ordinal_sigma"],
+            )
         for _f in _mv_fields:
             if _f in extra_args:
                 setattr(config, _f, extra_args[_f])
