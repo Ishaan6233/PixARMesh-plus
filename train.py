@@ -1,25 +1,27 @@
-import datasets
-import hydra
-import transformers
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
+
+import hydra
+import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from omegaconf import OmegaConf
+
+import datasets
+from src.data.collator import get_mesh_data_collator
+from src.data.mesh import MeshProcessor, get_mesh_dataset
 from src.models.utils import (
-    get_model,
     get_condition_encoder,
     get_image_condition_encoder,
+    get_model,
     get_pi3x_encoder,
 )
-from src.data.collator import get_mesh_data_collator
-from src.data.mesh import get_mesh_dataset, MeshProcessor
-from src.utils.logging import JsonlLoggerCallback
-from src.utils.trainer import CustomSFTTrainer, CustomSFTConfig
-from src.utils.config import DataConfig, ModelConfig, mv_prefix_len
 from src.utils.ckpt import get_last_checkpoint
+from src.utils.config import DataConfig, ModelConfig, mv_prefix_len
+from src.utils.logging import JsonlLoggerCallback
 from src.utils.sig import SaveAndStopOnSignalCallback, install_sigusr1_handler
+from src.utils.trainer import CustomSFTConfig, CustomSFTTrainer
 
 logger = get_logger(__name__)
 
