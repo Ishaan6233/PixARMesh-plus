@@ -90,6 +90,9 @@ def parse_args():
                    help="Instance-discovery method to screen (MV segmentation "
                         "tournament). One of: registry names "
                         f"{available_methods()}. Default = consensus baseline.")
+    p.add_argument("--voxel-sampling", default="fps",
+                   choices=["fps", "grid", "adaptive", "adaptive_grid"],
+                   help="Object-voxel downsampler after discovery.")
     p.add_argument("--no-ply",         action="store_true",
                    help="Skip per-sample PLY export (recommended for large runs)")
     return p.parse_args()
@@ -461,6 +464,7 @@ def main():
                         adaptive_fallback   = False,
                         mask_seeded_pool    = args.mask_seeded_pool,
                         boundary_bias_alpha = args.boundary_bias_alpha,
+                        voxel_sampling      = args.voxel_sampling,
                         return_diagnostics  = True,
                     )
 
@@ -534,6 +538,7 @@ def main():
                     adaptive_fallback   = adaptive_fallback,
                     mask_seeded_pool    = args.mask_seeded_pool,
                     boundary_bias_alpha = args.boundary_bias_alpha,
+                    voxel_sampling      = args.voxel_sampling,
                     return_diagnostics  = True,
                 )
 

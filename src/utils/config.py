@@ -161,7 +161,8 @@ class ModelConfig:
     mv_geom_norm_quantile: float = 0.0
     mv_use_geometry: bool = True
     # Sampling strategy for obj_voxels after discovery: "fps" = score-seeded FPS (default,
-    # maximises spread), "grid" = voxel-grid (fairer for thin/occluded structures).
+    # maximises spread), "grid" = fixed voxel-grid reps, "adaptive" = occupied-cell
+    # reps at an adaptive grid resolution followed by score-seeded FPS.
     mv_voxel_sampling: str = "fps"
     # Per-object pixel-support gate for IBRNet fusion: views with fewer than this many
     # panoptic pixels matching the target instance are excluded from the object-voxel

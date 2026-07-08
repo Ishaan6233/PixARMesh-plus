@@ -271,7 +271,7 @@ def _voxel_grid_sample(
     scores: "torch.Tensor | None", # (M,) float or None — higher = preferred
     n_sample: int,
     grid_res: int = 32,
-) -> "tuple[torch.Tensor, torch.Tensor | None]":
+) -> "tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]":
     """Voxel-grid downsampling: one point per occupied voxel cell.
 
     Divides the point cloud into a grid_res³ occupancy grid and selects the
@@ -279,9 +279,9 @@ def _voxel_grid_sample(
     to thin/occluded structures (chair legs, door frames) that FPS under-samples
     because FPS maximises spread and biases toward outliers at the bbox boundary.
 
-    Returns: (sampled_pts (≤n_sample, 3), sampled_scores or None)
+    Returns: (sampled_pts (n_sample, 3), sampled_scores or None, selected_indices)
     If fewer than n_sample cells are occupied, pads by repeating the last point.
-    If more cells than n_sample, keeps the top-score cells.
+    If more cells than n_sample, uses score-seeded FPS over occupied-cell reps.
     """
     M = pts.shape[0]
     device = pts.device
@@ -289,8 +289,23 @@ def _voxel_grid_sample(
 
     if M == 0:
         z = torch.zeros(n_sample, 3, device=device, dtype=dtype)
-        return z, None
+        return z, None, torch.zeros(n_sample, dtype=torch.long, device=device)
 
+    rep_idx = _voxel_cell_representative_indices(pts, scores, grid_res)
+    sel_idx = _sample_or_pad_indices(pts, scores, rep_idx, n_sample)
+    sel_pts = pts[sel_idx]
+    sel_scr = scores[sel_idx] if scores is not None else None
+    return sel_pts, sel_scr, sel_idx
+
+
+def _voxel_cell_representative_indices(
+    pts: torch.Tensor,
+    scores: "torch.Tensor | None",
+    grid_res: int,
+) -> torch.Tensor:
+    """Return raw-point indices for one representative per occupied grid cell."""
+    M = pts.shape[0]
+    device = pts.device
     vmin = pts.min(0).values
     extent = (pts.max(0).values - vmin).clamp(min=1e-6)
     gc = ((pts - vmin) / extent * (grid_res - 1)).long().clamp(0, grid_res - 1)  # (M, 3)
@@ -306,34 +321,136 @@ def _voxel_grid_sample(
     order = sort_key.argsort()
 
     cid_sorted = cid[order]
-    pts_sorted = pts[order]
-    scr_sorted = scores[order] if scores is not None else None
 
     # Keep only the first occurrence per cell (= highest score in that cell)
     keep = torch.cat([
         torch.ones(1, dtype=torch.bool, device=device),
         cid_sorted[1:] != cid_sorted[:-1],
     ])
-    sel_pts = pts_sorted[keep]                             # (n_cells, 3)
-    sel_scr = scr_sorted[keep] if scr_sorted is not None else None
-    n_cells = sel_pts.shape[0]
+    return order[keep]
 
-    if n_cells <= n_sample:
-        # Pad to n_sample by repeating the last point
-        if n_cells < n_sample:
-            rep = sel_pts[-1:].expand(n_sample - n_cells, 3)
-            sel_pts = torch.cat([sel_pts, rep], dim=0)
-            if sel_scr is not None:
-                rep_s = sel_scr[-1:].expand(n_sample - n_cells)
-                sel_scr = torch.cat([sel_scr, rep_s], dim=0)
-        return sel_pts, sel_scr
 
-    # More occupied cells than n_sample: keep top-score cells (or first n if no scores)
-    if sel_scr is not None:
-        top_idx = sel_scr.topk(n_sample, largest=True, sorted=False).indices
-    else:
-        top_idx = torch.arange(n_sample, device=device)
-    return sel_pts[top_idx], (sel_scr[top_idx] if sel_scr is not None else None)
+def _score_seeded_fps_indices(
+    pts: torch.Tensor,
+    scores: "torch.Tensor | None",
+    n_sample: int,
+) -> torch.Tensor:
+    """FPS indices, optionally seeded by putting the highest-score point first."""
+    M = pts.shape[0]
+    device = pts.device
+    if M == 0:
+        return torch.zeros(n_sample, dtype=torch.long, device=device)
+    if n_sample >= M:
+        idx = torch.arange(M, device=device, dtype=torch.long)
+        if n_sample > M:
+            idx = torch.cat([idx, idx[-1:].expand(n_sample - M)], dim=0)
+        return idx
+
+    order = (scores.argsort(descending=True)
+             if (scores is not None and scores.shape[0] == M)
+             else torch.arange(M, device=device))
+    _, rel = sample_farthest_points(
+        pts[order].float().unsqueeze(0), K=n_sample, random_start_point=False
+    )
+    return order[rel.squeeze(0)]
+
+
+def _unique_first_indices(idx: torch.Tensor, n_sample: int, max_index: int) -> torch.Tensor:
+    """Keep first occurrences from idx, then pad by repeating the last kept index."""
+    device = idx.device
+    if idx.numel() == 0:
+        return torch.zeros(n_sample, dtype=torch.long, device=device)
+    pos = torch.arange(idx.numel(), dtype=torch.long, device=device)
+    first_pos = torch.full((max_index,), idx.numel(), dtype=torch.long, device=device)
+    first_pos.scatter_reduce_(0, idx.long(), pos, reduce="amin", include_self=True)
+    present = first_pos < idx.numel()
+    unique = torch.nonzero(present, as_tuple=False).squeeze(1)
+    merged = unique[first_pos[present].argsort()][:n_sample]
+    if merged.numel() == 0:
+        merged = idx[:1].long()
+    if merged.numel() < n_sample:
+        merged = torch.cat([merged, merged[-1:].expand(n_sample - merged.numel())], dim=0)
+    return merged
+
+
+def _sample_or_pad_indices(
+    pts: torch.Tensor,
+    scores: "torch.Tensor | None",
+    candidate_idx: torch.Tensor,
+    n_sample: int,
+) -> torch.Tensor:
+    """Choose n_sample raw indices from candidates, filling sparse grids with raw FPS."""
+    M = pts.shape[0]
+    if candidate_idx.numel() >= n_sample:
+        rel = _score_seeded_fps_indices(
+            pts[candidate_idx],
+            scores[candidate_idx] if scores is not None else None,
+            n_sample,
+        )
+        return candidate_idx[rel]
+    if M > candidate_idx.numel():
+        fps_idx = _score_seeded_fps_indices(pts, scores, n_sample)
+        return _unique_first_indices(torch.cat([candidate_idx, fps_idx], dim=0), n_sample, M)
+    if candidate_idx.numel() == 0:
+        return torch.zeros(n_sample, dtype=torch.long, device=pts.device)
+    return torch.cat([
+        candidate_idx,
+        candidate_idx[-1:].expand(n_sample - candidate_idx.numel()),
+    ], dim=0)
+
+
+def _adaptive_voxel_fps_sample(
+    pts: torch.Tensor,
+    scores: "torch.Tensor | None",
+    n_sample: int,
+    grid_res_candidates: tuple[int, ...] = (32, 48, 64, 96),
+    oversample: float = 2.0,
+) -> "tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]":
+    """Adaptive voxel representatives followed by score-seeded FPS.
+
+    First keep coarse occupied-cell representatives (32³) because they protect
+    thin structures from being erased by nearby dense surfaces.  If that leaves
+    unused slots, fill them from a finer representative set chosen by occupied
+    cell count, using score-seeded FPS only for the fill.  This is multiscale:
+    coarse cells guarantee coverage, finer cells spend the remaining budget.
+    """
+    M = pts.shape[0]
+    device = pts.device
+    if M == 0:
+        z = torch.zeros(n_sample, 3, device=device, dtype=pts.dtype)
+        return z, None, torch.zeros(n_sample, dtype=torch.long, device=device)
+
+    base_idx = _voxel_cell_representative_indices(pts, scores, grid_res_candidates[0])
+    if base_idx.numel() >= n_sample:
+        sel_idx = _sample_or_pad_indices(pts, scores, base_idx, n_sample)
+        sel_pts = pts[sel_idx]
+        sel_scr = scores[sel_idx] if scores is not None else None
+        return sel_pts, sel_scr, sel_idx
+
+    target = min(M, max(n_sample, int(round(n_sample * oversample))))
+    best_idx = None
+    best_count = -1
+    for grid_res in grid_res_candidates[1:]:
+        rep_idx = _voxel_cell_representative_indices(pts, scores, grid_res)
+        n_rep = int(rep_idx.numel())
+        if n_rep > best_count:
+            best_idx = rep_idx
+            best_count = n_rep
+        if n_rep >= target:
+            best_idx = rep_idx
+            break
+
+    assert best_idx is not None
+    fill_rel = _score_seeded_fps_indices(
+        pts[best_idx],
+        scores[best_idx] if scores is not None else None,
+        n_sample,
+    )
+    fill_idx = best_idx[fill_rel]
+    sel_idx = _unique_first_indices(torch.cat([base_idx, fill_idx], dim=0), n_sample, M)
+    sel_pts = pts[sel_idx]
+    sel_scr = scores[sel_idx] if scores is not None else None
+    return sel_pts, sel_scr, sel_idx
 
 
 def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dtype,
@@ -361,27 +478,35 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
         capped_geom.append(g)
     pts_list, scores_list, geom_list = capped_pts, capped_scores, capped_geom
 
-    # ---- Voxel-grid path: per-item (different bboxes), no batching needed ----
-    if sampling_mode == "grid":
+    # ---- Voxel/grid-adaptive paths: per-item (different bboxes), no batching needed ----
+    if sampling_mode in {"grid", "adaptive", "adaptive_grid"}:
         obj_out, geom_out = [], []
         for b, (p, s, g) in enumerate(zip(pts_list, scores_list, geom_list)):
             p = p.to(device).float()
             s = s.to(device).float() if s is not None else None
             g = g.to(device).float() if g is not None else None
-            sel_pts, sel_scr = _voxel_grid_sample(p, s, n_sample)
-            obj_out.append(sel_pts)
-            # Align the registered geometry twin: gather by the same indices that
-            # voxel-grid uses.  Since _voxel_grid_sample returns the actual chosen
-            # points (not indices), we match by nearest neighbour in the selected set.
-            # Simpler: run voxel-grid on (g or p) with the same scores.
-            if g is not None:
-                geom_sel, _ = _voxel_grid_sample(g, s, n_sample)
+            if p.shape[0] == 0:
+                z = torch.zeros(n_sample, 3, device=device)
+                obj_out.append(z)
+                geom_out.append(z)
+                continue
+            if sampling_mode == "grid":
+                sel_pts, _sel_scr, sel_idx = _voxel_grid_sample(p, s, n_sample)
             else:
-                geom_sel = sel_pts
+                sel_pts, _sel_scr, sel_idx = _adaptive_voxel_fps_sample(p, s, n_sample)
+            obj_out.append(sel_pts)
+            # Keep the registered geometry twin exactly index-aligned with the
+            # scene-frame projection cloud.
+            geom_sel = g[sel_idx] if g is not None else sel_pts
             geom_out.append(geom_sel)
         obj_t  = torch.stack(obj_out, dim=0).to(out_dtype)
         geom_t = torch.stack(geom_out, dim=0).to(out_dtype)
         return obj_t, geom_t
+
+    if sampling_mode != "fps":
+        raise ValueError(
+            f"Unknown voxel sampling mode {sampling_mode!r}; expected 'fps', 'grid', or 'adaptive'."
+        )
 
     # ---- FPS path (default) ----
     B = len(pts_list)
@@ -758,7 +883,7 @@ def discover_instance_points_mv(
     return_diagnostics: bool = False,
     return_pool_diagnostics: bool = False,
     return_target_ids: bool = False,
-    voxel_sampling: str = "fps",  # "fps" (default) or "grid" (voxel-grid, fairer for thin structures)
+    voxel_sampling: str = "fps",  # "fps", "grid", or "adaptive" (voxel reps + FPS)
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict]:
     """Grounded-SAM direct-mask instance discovery with adaptive voxelization.
 

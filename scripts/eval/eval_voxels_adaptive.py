@@ -87,6 +87,9 @@ def parse_args():
     p.add_argument("--conf-threshold", type=float, default=0.5)
     p.add_argument("--mask-seeded-pool", action="store_true", default=True)
     p.add_argument("--method",         default="consensus")
+    p.add_argument("--voxel-sampling", default="fps",
+                   choices=["fps", "grid", "adaptive", "adaptive_grid"],
+                   help="Object-voxel downsampler after discovery.")
     p.add_argument("--knn-k",          type=int, default=4,
                    help="k for local-density estimate (mean dist to k nearest neighbours)")
     return p.parse_args()
@@ -297,6 +300,7 @@ def main():
                 conf=conf, pool_size=args.pool_size, min_views=args.min_views,
                 conf_threshold=args.conf_threshold, depth_rtol=args.depth_rtol,
                 adaptive_fallback=True, mask_seeded_pool=args.mask_seeded_pool,
+                voxel_sampling=args.voxel_sampling,
                 return_diagnostics=True, return_target_ids=True,
             )
 

@@ -53,6 +53,7 @@ class DiscoveryRegistryTest(unittest.TestCase):
             "pool_size", "min_views", "depth_rtol", "adaptive_fallback",
             "mask_seeded_pool", "boundary_bias_alpha", "intra_obj_register",
             "register_iters", "return_target_ids", "return_diagnostics",
+            "voxel_sampling",
         }
         for name in available_methods():
             params = set(inspect.signature(get_discovery_fn(name)).parameters)

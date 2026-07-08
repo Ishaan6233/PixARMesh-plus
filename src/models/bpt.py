@@ -318,6 +318,7 @@ class BPTModel(PreTrainedModel):
                 conf                = pi3x_out["conf"],
                 mask_seeded_pool    = getattr(self.config, "mv_mask_seeded_pool",    False),
                 boundary_bias_alpha = getattr(self.config, "mv_boundary_bias_alpha", 0.0),
+                voxel_sampling      = getattr(self.config, "mv_voxel_sampling", "fps"),
             )
         else:
             from .frozen_geo_encoder import _apply_scene_transform

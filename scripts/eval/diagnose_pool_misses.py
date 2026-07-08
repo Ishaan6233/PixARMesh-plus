@@ -84,6 +84,9 @@ def parse_args():
                    help="Instance-discovery method to diagnose (MV segmentation "
                         f"tournament). One of: {available_methods()}. "
                         "Default = consensus baseline.")
+    p.add_argument("--voxel-sampling",     default="fps",
+                   choices=["fps", "grid", "adaptive", "adaptive_grid"],
+                   help="Object-voxel downsampler after discovery.")
     return p.parse_args()
 
 
@@ -200,6 +203,7 @@ def main():
                 adaptive_fallback       = False,
                 mask_seeded_pool        = args.mask_seeded_pool,
                 boundary_bias_alpha     = args.boundary_bias_alpha,
+                voxel_sampling          = args.voxel_sampling,
                 return_diagnostics      = True,
                 return_pool_diagnostics = True,
             )
