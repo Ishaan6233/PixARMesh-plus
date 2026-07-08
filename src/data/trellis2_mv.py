@@ -8,7 +8,9 @@ Images and camera parameters are cross-referenced from a local HuggingFace
 3d-front-multiview[-full] dataset by scene_id.  The pre-computed
 T_norm_from_output (world→gravity-aligned norm frame) is combined with the HF
 dataset's wrd2cam_rects to produce scene_transforms without needing the
-original 21-view source renders.
+original 21-view source renders.  HF wrd2cam_rects are y-up/z-forward camera
+frames, so the loader adapts them to the OpenCV camera frame consumed by K,
+Pi3X local_points, and grid_sample projection.
 
 Reference view is selected by covisibility: the local camera whose visible
 scene points overlap most with all other local cameras.
@@ -44,6 +46,39 @@ if np.__version__ < "2":
 
 _COVIS_SAMPLE = 2048  # downsample scene pts before covisibility loop (speed)
 _OBJ_PTS_SAMPLE = 512  # max object pts used for per-view covisibility scoring
+_CAM_YUP_TO_OPENCV_4 = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
+_CAM_YUP_TO_OPENCV_3 = np.diag(np.array([-1, -1, 1], dtype=np.float32))
+
+
+def _world_points_to_opencv_camera(
+    points_world: np.ndarray,
+    wrd2cam_yup: np.ndarray,
+) -> np.ndarray:
+    """Project HF world points into the OpenCV camera frame used by K/Pi3X."""
+    pts = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+    pts_h = np.concatenate([pts, np.ones((len(pts), 1), dtype=np.float32)], axis=1)
+    pts_cam_yup = (np.asarray(wrd2cam_yup, dtype=np.float32) @ pts_h.T).T[:, :3]
+    return (pts_cam_yup @ _CAM_YUP_TO_OPENCV_3.T).astype(np.float32)
+
+
+def _project_world_points_to_normalized_pixels(
+    points_world: np.ndarray,
+    wrd2cam_yup: np.ndarray,
+    K: np.ndarray,
+    out_h: int,
+    out_w: int,
+) -> np.ndarray:
+    """Project HF world points with the y-up→OpenCV adapter and grid_sample coords."""
+    pts_cam = _world_points_to_opencv_camera(points_world, wrd2cam_yup)
+    K = np.asarray(K, dtype=np.float32)
+    z = pts_cam[:, 2]
+    px = np.where(z > 1e-4, pts_cam[:, 0] / z, 0.0)
+    py = np.where(z > 1e-4, pts_cam[:, 1] / z, 0.0)
+    u = K[0, 0] * px + K[0, 2]
+    v = K[1, 1] * py + K[1, 2]
+    u_norm = (u + 0.5) / float(out_w) * 2.0 - 1.0
+    v_norm = (v + 0.5) / float(out_h) * 2.0 - 1.0
+    return np.stack([u_norm, v_norm], axis=1).astype(np.float32)
 
 
 def load_conditioning_filter(root, expected_frame_correction: bool | None = None) -> set:
@@ -614,12 +649,11 @@ class Trellis2MVDataset(Dataset):
         images_n = [row["images"][v] for v in _vidx]
 
         # ── 4. Per-view images, K_adj, and raw scene_transforms ─────────────
-        # scene_trans_raw_n[n] maps camera_n → gravity_norm frame (no
-        # bbox-normalization yet, same as M_rot_4d @ cam_to_ref in
-        # transform_3d_front_multiview). With mv_frame_correction, world→norm is
-        # inv(T_n2w) — the frame-exact inverse of norm→HF-world; the legacy
-        # T_norm_from_output is a pure scale that leaves a ~90° per-scene rotation
-        # between Pi3X geometry and the seeds/bboxes/GT-layout frame.
+        # scene_trans_raw_n[n] maps OpenCV camera_n → gravity_norm frame (no
+        # bbox-normalization yet). mv_frame_correction only recovers the exact
+        # norm↔HF-world frame; the HF cameras themselves are y-up/z-forward
+        # (x-left, y-up), so OpenCV/Pi3X camera points need the same
+        # diag(-1,-1,1) adapter used by the SV path.
         T_world_to_norm = (
             np.linalg.inv(T_n2w).astype(np.float32) if T_n2w is not None
             else T_norm_from_output
@@ -630,7 +664,11 @@ class Trellis2MVDataset(Dataset):
         pv_n_list = []
         for n in range(N_views):
             scene_trans_raw_n.append(
-                (T_world_to_norm @ np.linalg.inv(wrd2cam_rects_n[n])).astype(np.float32)
+                (
+                    T_world_to_norm
+                    @ np.linalg.inv(wrd2cam_rects_n[n])
+                    @ _CAM_YUP_TO_OPENCV_4
+                ).astype(np.float32)
             )
             K_n = Ks_raw_n[n].copy()
             pad_left = pad_top = 0
@@ -724,19 +762,12 @@ class Trellis2MVDataset(Dataset):
 
             pts3d_h = np.concatenate([pts3d, np.ones((len(pts3d), 1), dtype=np.float32)], axis=1)
             pts3d_world = (T_scene_to_world @ pts3d_h.T).T[:, :3]  # (P, 3) world frame
-            pts3d_cam_h = np.concatenate([pts3d_world, np.ones((len(pts3d_world), 1), dtype=np.float32)], axis=1)
-            pts3d_cam = (wrd2cam_rects_n[ref_view] @ pts3d_cam_h.T).T[:, :3]
             K_ref = K_adj_n[ref_view]
-            z = pts3d_cam[:, 2]
-            px = np.where(z > 1e-4, pts3d_cam[:, 0] / z, 0.0)
-            py = np.where(z > 1e-4, pts3d_cam[:, 1] / z, 0.0)
-            u = K_ref[0, 0] * px + K_ref[0, 2]
-            v = K_ref[1, 1] * py + K_ref[1, 2]
             out_h_ref = pad_info_n[ref_view]["out_h"]
             out_w_ref = pad_info_n[ref_view]["out_w"]
-            u_norm = (u + 0.5) / out_w_ref * 2 - 1
-            v_norm = (v + 0.5) / out_h_ref * 2 - 1
-            sampled_pc_2d = np.stack([u_norm, v_norm], axis=1).astype(np.float32)
+            sampled_pc_2d = _project_world_points_to_normalized_pixels(
+                pts3d_world, wrd2cam_rects_n[ref_view], K_ref, out_h_ref, out_w_ref
+            )
 
         # ── 7. Panoptic masks ────────────────────────────────────────────────
         pan_stack = None

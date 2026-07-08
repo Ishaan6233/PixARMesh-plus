@@ -39,6 +39,8 @@ src_data:
   # Exact norm→HF-world frame correction. Without it Pi3X geometry registers into a
   # frame rotated ~90° from the seeds/bboxes/GT layout, and covisibility marks 47.7%
   # of objects blind — 99.2% of those are visible once corrected (measured 2026-07-03).
+  # Separate loader code adapts HF y-up/z-forward camera coordinates to the OpenCV
+  # camera frame expected by K, Pi3X local_points, and grid_sample projection.
   mv_frame_correction: true
   num_points: ${dataset.spec.num_points}
   norm_bound: ${dataset.spec.normalization.bound}
