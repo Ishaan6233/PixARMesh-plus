@@ -13,6 +13,8 @@
 /datasets/
 /debug/
 /visualize/
+/graphify/
+/graphify-out/
 /results/
 /figures/
 AGENT_*
