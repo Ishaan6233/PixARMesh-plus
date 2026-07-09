@@ -7,7 +7,7 @@ Usage:
 
 Example:
     python scripts/check_training_health.py \
-        --run-dir outputs/bpt-3d-front-global-obj-pose-w-img-ctx-layout-only/20260618-120000 \
+        --run-dir outputs/sv/train/bpt-3d-front-global-obj-pose-w-img-ctx-layout-only/20260618-120000 \
         --stage 1
 """
 import sys

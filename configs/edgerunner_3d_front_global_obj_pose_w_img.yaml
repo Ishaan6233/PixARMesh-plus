@@ -5,3 +5,4 @@ defaults:
 
 all:
   name: edgerunner-3d-front-global-obj-pose-w-img
+  output_dir: outputs/sv/train/${all.name}

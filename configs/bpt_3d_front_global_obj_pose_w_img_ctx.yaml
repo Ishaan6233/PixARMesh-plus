@@ -5,3 +5,4 @@ defaults:
 
 all:
   name: bpt-3d-front-global-obj-pose-w-img-ctx
+  output_dir: outputs/sv/train/${all.name}

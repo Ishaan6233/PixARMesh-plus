@@ -5,8 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TRAIN_PID="${1:-52274}"
-CKPT="${2:-outputs/bpt-3d-front-global-obj-pose-w-img-ctx/20260615-024721/checkpoints/final}"
-OUT="${3:-outputs/eval_bpt_run1}"
+CKPT="${2:-outputs/archive/checkpoints/bpt-3d-front-global-obj-pose-w-img-ctx/20260615-024721/checkpoints/final}"
+OUT="${3:-outputs/sv/infer/eval_bpt_run1}"
 PRED_DIR="${OUT}/obj/bpt/gt_layout_gt_mask_gt_depth"
 
 echo "[eval_bpt] Waiting for training PID ${TRAIN_PID} to exit..."
@@ -28,6 +28,6 @@ echo "[eval_bpt] Inference done at $(date). Running eval_obj..."
 micromamba run -n pixarmesh124 python scripts/eval_obj.py \
     --pred-dir "${PRED_DIR}" \
     --align-sample-points 5000 \
-    --save-dir outputs/evaluations-obj
+    --save-dir outputs/sv/eval
 
 echo "[eval_bpt] Eval complete at $(date)."

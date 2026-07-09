@@ -6,6 +6,7 @@ defaults:
 
 all:
   name: bpt-3d-front-global-obj-pose
+  output_dir: outputs/sv/train/${all.name}
 
 data:
   num_points: 4096

@@ -91,7 +91,7 @@ def main():
         action="store_true",
         help="Whether to overwrite existing eval results",
     )
-    parser.add_argument("--save-dir", type=str, default="outputs/evaluations-obj")
+    parser.add_argument("--save-dir", type=str, default="outputs/sv/eval")
     args = parser.parse_args()
 
     with jsonlines.open(args.metadata, "r") as reader:

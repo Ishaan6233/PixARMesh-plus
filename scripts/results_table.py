@@ -112,7 +112,7 @@ def main():
         parser.error(
             "Specify at least one --model NAME OBJ_JSONL SCENE_DIR.\n"
             "Example:\n"
-            "  --model 'baseline' outputs/evaluations-obj/baseline/eval_obj_results.jsonl ''"
+            "  --model 'baseline' outputs/sv/eval/baseline/eval_obj_results.jsonl ''"
         )
 
     model_data = []

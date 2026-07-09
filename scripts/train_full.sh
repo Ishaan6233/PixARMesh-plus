@@ -45,7 +45,7 @@ fi
 if $USE_BPT; then
     STAGE1_CFG="bpt_3d_front_global_obj_pose_w_img_ctx_layout_only"
     STAGE2_CFG="bpt_3d_front_global_obj_pose_w_img_ctx"
-    S1_OUT_PREFIX="outputs/bpt-3d-front-global-obj-pose-w-img-ctx-layout-only"
+    S1_OUT_PREFIX="outputs/sv/train/bpt-3d-front-global-obj-pose-w-img-ctx-layout-only"
 elif $USE_PI3X; then
     STAGE1_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x_layout_only"
     STAGE2_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x"
@@ -53,7 +53,7 @@ elif $USE_PI3X; then
 else
     STAGE1_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_layout_only"
     STAGE2_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx"
-    S1_OUT_PREFIX="outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only"
+    S1_OUT_PREFIX="outputs/sv/train/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only"
 fi
 
 echo "[train_full] ══════════════════════════════════════════════"

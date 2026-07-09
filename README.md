@@ -135,7 +135,7 @@ python launch.py train.py --config-name=edgerunner_3d_front_global_obj_pose_w_im
 Replace `model.local_path` with the checkpoint path from Stage 1.
 
 ```bash
-python launch.py train.py --config-name=edgerunner_3d_front_global_obj_pose_w_img_ctx model.local_path=outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only/1/checkpoints/final
+python launch.py train.py --config-name=edgerunner_3d_front_global_obj_pose_w_img_ctx model.local_path=outputs/sv/train/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only/1/checkpoints/final
 ```
 
 ## 📊 Evaluation
@@ -152,13 +152,13 @@ You may either:
 1. Inference
 
 ```bash
-accelerate launch --module scripts.infer --model-type edgerunner --run-type obj --checkpoint zx1239856/PixARMesh-EdgeRunner --output outputs/inference
+accelerate launch --module scripts.infer --model-type edgerunner --run-type obj --checkpoint zx1239856/PixARMesh-EdgeRunner --output-dir outputs/sv/infer
 ```
 
 2. Evaluation
 
 ```bash
-accelerate launch --module scripts.eval_obj --pred-dir outputs/inference/obj/edgerunner/gt_layout_gt_mask_pred_depth --save-dir outputs/evaluations-obj/edgerunner
+accelerate launch --module scripts.eval_obj --pred-dir outputs/sv/infer/obj/edgerunner/gt_layout_gt_mask_pred_depth --save-dir outputs/sv/eval/edgerunner
 ```
 
 ### Scene-Level
@@ -166,19 +166,19 @@ accelerate launch --module scripts.eval_obj --pred-dir outputs/inference/obj/edg
 1. Inference
 
 ```bash
-accelerate launch --module scripts.infer --model-type edgerunner --run-type scene --checkpoint zx1239856/PixARMesh-EdgeRunner --output outputs/inference
+accelerate launch --module scripts.infer --model-type edgerunner --run-type scene --checkpoint zx1239856/PixARMesh-EdgeRunner --output-dir outputs/sv/infer
 ```
 
 2. Compose Scene Meshes
 
 ```bash
-python -m scripts.compose_scene --pred-dir outputs/inference/scene/edgerunner/pred_layout_pred_mask_pred_depth
+python -m scripts.compose_scene --pred-dir outputs/sv/infer/scene/edgerunner/pred_layout_pred_mask_pred_depth
 ```
 
 3. Evaluation
 
 ```bash
-accelerate launch --module scripts.eval_scene --pred-dir outputs/inference/scene/edgerunner/pred_layout_pred_mask_pred_depth/scenes --save-dir outputs/evaluation-scene/edgerunner
+accelerate launch --module scripts.eval_scene --pred-dir outputs/sv/infer/scene/edgerunner/pred_layout_pred_mask_pred_depth/scenes --save-dir outputs/sv/eval-scene/edgerunner
 ```
 
 ## 🏷️ License

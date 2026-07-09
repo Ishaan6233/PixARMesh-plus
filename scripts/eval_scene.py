@@ -167,9 +167,7 @@ def main():
     pred_dir = Path(args.pred_dir)
     save_dir = args.save_dir
     if not save_dir:
-        save_dir = (
-            "outputs/evaluations-scene" if not eval_iou else "outputs/evaluations-iou"
-        )
+        save_dir = "outputs/sv/eval-scene" if not eval_iou else "outputs/sv/eval-iou"
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     logger = get_logger(save_dir / "eval.log")
