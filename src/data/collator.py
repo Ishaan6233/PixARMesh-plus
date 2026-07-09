@@ -203,9 +203,8 @@ class Front3DCollator(BaseCollator):
         has_pixel_values = "pixel_values" in examples[0]
         has_ctx_pc = "ctx_point_clouds" in examples[0]
         # scene_transforms is present whenever has_pc=True (computed in transform_3d_front).
-        # Gated on has_pc — NOT has_ctx_pc — because Pi3X needs scene_transform to replace
-        # per-object point clouds (cond_pcs) independently of whether context PCs are used.
-        # Tying it to has_ctx_pc would silently disable Pi3X when num_ctx_points=0.
+        # Gated on has_pc, not has_ctx_pc, so object-level point-cloud consumers still
+        # receive scene transforms when context PCs are disabled.
         has_scene_transform = has_pc and "scene_transforms" in examples[0]
         all_obj_indices = []
         all_obj_bboxes = []

@@ -9,7 +9,6 @@ from .pc_miche.encoder import PointCloudEncoder
 from .pc_edgerunner.encoder import EdgeRunnerPointEncoder
 from .cond import ConditionEncoder
 from .img_cond import ImageConditionEncoder, HighResImageConditionEncoder
-from .frozen_geo_encoder import FrozenGeoEncoder  # noqa: F401 (re-exported for external use)
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +52,11 @@ def _fix_uninit_params(model):
                     nn.init.normal_(p.data, mean=0.0, std=init_std)
 
 
-def get_pi3x_encoder(model_cfg: ModelConfig) -> "FrozenGeoEncoder":
-    """Build the Pi3X frozen geometry encoder from ModelConfig."""
-    from .pi3x_cond import Pi3XFrozenEncoder
-    enc = Pi3XFrozenEncoder.from_model_cfg(model_cfg)
-    return enc.to(torch.bfloat16)
-
-
 def get_model(
     local_model_path,
     model_cfg: ModelConfig,
     cond_encoder=None,
     cond_encoder_img=None,
-    pi3x_encoder=None,
 ):
     extra_args = {}
     if model_cfg is not None:
@@ -144,11 +135,6 @@ def get_model(
                 else:
                     # Frozen params are never in checkpoint → always restore from MICHE
                     model_enc_params[name].data.copy_(pretrained_val)
-    # Attach frozen encoders post-from_pretrained.
-    # Their state_dict() returns {} so from_pretrained won't see them as missing keys.
-    # Both attributes are declared in ShapeOPT.__init__ so hasattr is always True.
-    if pi3x_encoder is not None and hasattr(model, "pi3x_encoder"):
-        model.pi3x_encoder = pi3x_encoder
     # Catch NaN/Inf params left by no_init_weights (absent checkpoint keys → garbage memory
     # → bfloat16 NaN).  This covers ctx_aggregator when loading from the original edgerunner
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values

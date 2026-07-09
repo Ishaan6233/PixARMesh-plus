@@ -402,9 +402,9 @@ def transform_3d_front(
                 all_obj_to_cam_transform_rect = (
                     shift_matrix @ all_obj_to_cam_transform_rect
                 )
-            # Compute the combined camera-frame → normalized-scene-space transform so that
-            # Pi3X local_points (camera frame) can be placed in the same coordinate space
-            # as the existing point clouds without re-running the data pipeline.
+            # Compute the combined camera-frame → normalized-scene-space transform
+            # for consumers that need to place camera-frame points in the same
+            # coordinate space as the existing point clouds.
             # Chain: camera → gravity-align → rot → normalize → shift
             M_gravity = T_gravity_inv @ y_up_matrix
             M_rot_4d = np.eye(4, dtype=np.float32)

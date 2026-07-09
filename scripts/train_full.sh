@@ -3,7 +3,6 @@
 #
 # Usage (inside a tmux session):
 #   bash scripts/train_full.sh                    # EdgeRunner baseline (Depth Pro depth)
-#   bash scripts/train_full.sh --pi3x             # EdgeRunner + Pi3X frozen encoder variant
 #   bash scripts/train_full.sh --bpt              # BPT variant (reproduces paper BPT numbers)
 #   bash scripts/train_full.sh --force-stage1     # force Stage 1 even if checkpoint exists
 #   bash scripts/train_full.sh --stage1-only      # run Stage 1 and exit (do not proceed to Stage 2)
@@ -19,13 +18,11 @@ cd "$(dirname "$0")/.."
 PYTHON="${PYTHON:-micromamba run -n pixarmesh124 python}"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
-USE_PI3X=false
 USE_BPT=false
 FORCE_STAGE1=false
 STAGE1_ONLY=false
 STAGE2_ONLY=false
 for arg in "$@"; do
-    [[ "$arg" == "--pi3x" ]] && USE_PI3X=true
     [[ "$arg" == "--bpt" ]] && USE_BPT=true
     [[ "$arg" == "--force-stage1" ]] && FORCE_STAGE1=true
     [[ "$arg" == "--stage1-only" ]] && STAGE1_ONLY=true
@@ -37,19 +34,10 @@ if $STAGE1_ONLY && $STAGE2_ONLY; then
     exit 1
 fi
 
-if $USE_BPT && $USE_PI3X; then
-    echo "[train_full] ERROR: --bpt and --pi3x are mutually exclusive (no BPT-Pi3X config exists)."
-    exit 1
-fi
-
 if $USE_BPT; then
     STAGE1_CFG="bpt_3d_front_global_obj_pose_w_img_ctx_layout_only"
     STAGE2_CFG="bpt_3d_front_global_obj_pose_w_img_ctx"
     S1_OUT_PREFIX="outputs/sv/train/bpt-3d-front-global-obj-pose-w-img-ctx-layout-only"
-elif $USE_PI3X; then
-    STAGE1_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x_layout_only"
-    STAGE2_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_pi3x"
-    S1_OUT_PREFIX="outputs/edgerunner-3d-front-global-obj-pose-w-img-ctx-pi3x-layout-only"
 else
     STAGE1_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx_layout_only"
     STAGE2_CFG="edgerunner_3d_front_global_obj_pose_w_img_ctx"
@@ -57,7 +45,7 @@ else
 fi
 
 echo "[train_full] ══════════════════════════════════════════════"
-echo "[train_full] BPT: $USE_BPT  Pi3X: $USE_PI3X"
+echo "[train_full] BPT: $USE_BPT"
 echo "[train_full] Stage 1 config: $STAGE1_CFG"
 echo "[train_full] Stage 2 config: $STAGE2_CFG"
 echo "[train_full] ══════════════════════════════════════════════"

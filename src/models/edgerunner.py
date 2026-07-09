@@ -8,7 +8,6 @@ from transformers.models.opt.modeling_opt import OPTDecoder
 from .cond import EdgeRunnerProjector, ContextAggregator
 from .embed import CoordEmbed
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
-from .frozen_geo_encoder import build_geo_ctx_pc, build_geo_obj_pc
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,6 @@ class ShapeOPT(OPTForCausalLM):
         config: ShapeOPTConfig,
         cond_encoder=None,
         cond_encoder_img=None,
-        pi3x_encoder=None,   # frozen image→3D backbone (Pi3X; replaces depth back-projection)
         is_scene=False,
     ):
         super().__init__(config)
@@ -108,9 +106,6 @@ class ShapeOPT(OPTForCausalLM):
             self.projector.apply(self._init_weights)
         self.cond_encoder = cond_encoder
         self.cond_encoder_img = cond_encoder_img
-        # Frozen geometry encoder — declared here so hasattr() is always reliable.
-        # Populated (or left None) by get_model() after from_pretrained().
-        self.pi3x_encoder = pi3x_encoder   # image→3D (Pi3X; replaces depth back-projection)
 
         self.ctx_aggregator = None
         if self.config.with_ctx_pc:
@@ -245,31 +240,6 @@ class ShapeOPT(OPTForCausalLM):
         scene_transform=None,
         **kwargs,
     ):
-        # Pi3X override: replace data-loader point clouds with Pi3X predictions.
-        # Requires both pixel_values (for Pi3X inference) and scene_transform (to convert
-        # camera-frame XYZ → normalised scene space). If scene_transform is absent
-        # (e.g. legacy inference scripts that predate Pi3X), we log once and fall back
-        # to the data-loader point clouds so the model still runs correctly.
-        if self.pi3x_encoder is not None and pixel_values is not None:
-            if scene_transform is None:
-                logger.warning_once(
-                    "Pi3X encoder is active but scene_transform was not provided. "
-                    "Falling back to data-loader point clouds. "
-                    "Populate scene_transforms in the data pipeline to enable Pi3X."
-                )
-            else:
-                # Pi3X.encode() receives pre-normalised images; pass pixel_values directly.
-                pi3x_out = self.pi3x_encoder(pixel_values)
-                lp = pi3x_out["local_points"]   # already in pixel_values.dtype
-                cf = pi3x_out["conf"]
-                # scene_transform: (B, 4, 4).  _apply_scene_transform runs in float32
-                # internally — no need to cast st to bfloat16 here.
-                st = scene_transform.to(pixel_values.device)
-                if ctx_pcs is not None:
-                    ctx_pcs, ctx_pcs_2d = build_geo_ctx_pc(lp, cf, st, ctx_pcs.shape[1])
-                if cond_pcs is not None and cond_pcs_2d is not None:
-                    cond_pcs = build_geo_obj_pc(lp, cond_pcs_2d, st)
-
         output_attentions = (
             output_attentions
             if output_attentions is not None

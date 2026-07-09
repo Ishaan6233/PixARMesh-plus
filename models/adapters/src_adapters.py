@@ -36,7 +36,6 @@ class SrcModelAdapter(BaseModelAdapter):
             get_condition_encoder,
             get_image_condition_encoder,
             get_model,
-            get_pi3x_encoder,
         )
         from src.utils.config import ModelConfig
 
@@ -62,14 +61,11 @@ class SrcModelAdapter(BaseModelAdapter):
             if model_cfg.cond
             else None
         )
-        # Pi3X frozen geometry backbone (replaces Depth Pro + Grounded-SAM).
-        pi3x_enc = get_pi3x_encoder(model_cfg) if model_cfg.use_pi3x else None
         self.model = get_model(
             model_cfg.local_path,
             model_cfg,
             cond_encoder=cond_encoder,
             cond_encoder_img=cond_encoder_img,
-            pi3x_encoder=pi3x_enc,
         )
 
     def forward(self, batch: dict[str, Any]) -> Any:
