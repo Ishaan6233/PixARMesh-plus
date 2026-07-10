@@ -24,6 +24,9 @@ AGENT_*
 # Local Claude Code agent skills (machine-local, not shared source)
 /.claude/skills/
 /.claude/settings.local.json
+# Local cross-agent tooling (machine-local, not shared source)
+/.claude/commands/
+/docs/HANDOFF.md
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
