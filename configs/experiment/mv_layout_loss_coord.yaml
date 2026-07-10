@@ -1,0 +1,9 @@
+# @package _global_
+# Ordinal token supervision plus differentiable expected-coordinate regression.
+model:
+  loss_layout_ordinal_sigma: 2.0
+  loss_layout_ordinal_weight: 1.0
+  loss_layout_coord_weight: 1.0
+  loss_layout_center_weight: 0.0
+  loss_layout_size_weight: 0.0
+

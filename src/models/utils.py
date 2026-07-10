@@ -98,6 +98,8 @@ def get_model(
         extra_args["bos_token_id"] = model_cfg.bos_token_id
         extra_args["eos_token_id"] = model_cfg.eos_token_id
         extra_args["pad_token_id"] = model_cfg.pad_token_id
+        extra_args["num_pos_tokens"] = model_cfg.num_pos_tokens
+        extra_args["pos_token_offset"] = model_cfg.pos_token_offset
         extra_args["max_position_embeddings"] = model_cfg.max_position_embeddings
         extra_args["indicator_token_id"] = model_cfg.indicator_token_id
         extra_args["obj_pc_token_id"] = model_cfg.obj_pc_token_id
@@ -105,6 +107,12 @@ def get_model(
         extra_args["with_ctx_pc"] = model_cfg.with_ctx_pc
         extra_args["img_cond_drop_prob"] = model_cfg.img_cond_drop_prob
         extra_args["loss_layout_scale"] = model_cfg.loss_layout_scale
+        extra_args["loss_layout_ordinal_sigma"] = model_cfg.loss_layout_ordinal_sigma
+        extra_args["loss_layout_ordinal_weight"] = model_cfg.loss_layout_ordinal_weight
+        extra_args["loss_layout_coord_weight"] = model_cfg.loss_layout_coord_weight
+        extra_args["loss_layout_center_weight"] = model_cfg.loss_layout_center_weight
+        extra_args["loss_layout_size_weight"] = model_cfg.loss_layout_size_weight
+        extra_args["loss_layout_geometry_tokens"] = model_cfg.loss_layout_geometry_tokens
         if model_cfg.sep_token_id is not None:
             extra_args["sep_token_id"] = model_cfg.sep_token_id
         # MV voxel encoder fields — override stale values in single-view checkpoints
@@ -152,6 +160,18 @@ def get_model(
     # config here. Without this, config.mv_voxel_encoder is absent and ShapeOPT
     # never builds the multi-view encoder.
     if model_cfg is not None:
+        for _f in [
+            "num_pos_tokens",
+            "pos_token_offset",
+            "loss_layout_ordinal_sigma",
+            "loss_layout_ordinal_weight",
+            "loss_layout_coord_weight",
+            "loss_layout_center_weight",
+            "loss_layout_size_weight",
+            "loss_layout_geometry_tokens",
+        ]:
+            if _f in extra_args:
+                setattr(config, _f, extra_args[_f])
         for _f in _mv_fields:
             if _f in extra_args:
                 setattr(config, _f, extra_args[_f])

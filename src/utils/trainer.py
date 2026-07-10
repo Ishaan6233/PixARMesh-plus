@@ -358,4 +358,16 @@ class CustomSFTTrainer(SFTTrainer):
             loss_object = self.accelerator.gather_for_metrics(loss_object).mean().item()
             self._metrics[mode]["loss_object"].append(loss_object)
 
+        for name in (
+            "loss_layout_token",
+            "loss_layout_ordinal",
+            "loss_layout_coord",
+            "loss_layout_center",
+            "loss_layout_size",
+        ):
+            if name in outputs and getattr(outputs, name) is not None:
+                value = getattr(outputs, name)
+                value = self.accelerator.gather_for_metrics(value).mean().item()
+                self._metrics[mode][name].append(value)
+
         return (loss, outputs) if return_outputs else loss
