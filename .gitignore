@@ -21,6 +21,9 @@ AGENT_*
 /*.glb
 /*.ply
 /logs
+# Local Claude Code agent skills (machine-local, not shared source)
+/.claude/skills/
+/.claude/settings.local.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
