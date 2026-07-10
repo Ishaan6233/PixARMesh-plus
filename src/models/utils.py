@@ -1,4 +1,5 @@
 import logging
+import math
 import torch
 import torch.nn as nn
 from src.utils.config import ModelConfig
@@ -9,28 +10,29 @@ from .pc_miche.encoder import PointCloudEncoder
 from .pc_edgerunner.encoder import EdgeRunnerPointEncoder
 from .cond import ConditionEncoder
 from .img_cond import ImageConditionEncoder, HighResImageConditionEncoder
+from .frozen_geo_encoder import FrozenGeoEncoder, build_geo_encoder  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 
 def _fix_uninit_params(model):
-    """Reinitialize any NaN/Inf/garbage parameters left by from_pretrained.
+    """Reinitialize any NaN/Inf parameters left by from_pretrained's no_init_weights context.
 
-    from_pretrained replaces MISSING-key parameters with new uninitialized bfloat16 tensors
-    (observed in transformers ≥ 5.x). These may contain garbage float32 memory reinterpreted
-    as bfloat16 — values up to ~3e38 that are finite but absurdly large. Such values are not
-    caught by isnan/isinf alone, but their squared norms overflow float32 → loss becomes NaN.
-
-    We treat any floating-point parameter with abs().max() > 1e6 as uninitialized garbage
-    and reinitialize it, in addition to the original NaN/Inf check.
+    from_pretrained runs __init__ under no_init_weights(), which patches kaiming_uniform_/normal_
+    to no-ops. Modules whose keys are absent from the checkpoint are never overwritten, leaving
+    them as uninitialized GPU memory. After casting to bfloat16, garbage float32 values can
+    become bfloat16 NaN and corrupt the entire forward pass.
     """
     init_std = getattr(getattr(model, "config", None), "init_std", 0.02)
     for module in model.modules():
         has_bad = any(
             p.is_floating_point() and (
-                torch.isnan(p.data).any()
-                or torch.isinf(p.data).any()
-                or p.data.abs().max() > 1e6
+                torch.isnan(p.data).any() or torch.isinf(p.data).any()
+                # Uninitialized GPU memory is finite-but-huge (e.g. ~1e31) and does NOT
+                # become NaN/inf — the mv_voxel_encoder (absent from single-view
+                # checkpoints) hits exactly this. Scope the magnitude test to trainable
+                # params so frozen geometry/DINOv2 real weights are never touched.
+                or (p.requires_grad and p.data.abs().max() > 1e4)
             )
             for p in module.parameters(recurse=False)
         )
@@ -52,11 +54,44 @@ def _fix_uninit_params(model):
                     nn.init.normal_(p.data, mean=0.0, std=init_std)
 
 
+def _fix_pointembed_basis(model):
+    """Recompute every PointEmbed Fourier `basis` buffer after from_pretrained.
+
+    `basis` is a deterministic constant, but a buffer absent from the checkpoint is
+    materialized as GARBAGE memory under low_cpu_mem_usage/meta init. That garbage is NOT
+    reliably NaN/Inf — it is often finite-but-huge (observed ~2.8e38), which a finiteness
+    check passes; `x @ huge` then overflows bf16 to inf and `sin(inf)` = NaN, corrupting the
+    conditioning forward data-dependently. Since the basis is a constant, recompute it
+    UNCONDITIONALLY (targets BUFFERS, which _fix_uninit_params does not). Only the
+    from-scratch path hits this; a warm checkpoint carries a valid saved basis but
+    recomputing it is identical and harmless."""
+    n = 0
+    for module in model.modules():
+        if hasattr(module, "reset_basis") and hasattr(module, "basis"):
+            module.reset_basis()
+            n += 1
+    if n:
+        logger.info(f"_fix_pointembed_basis: recomputed {n} PointEmbed basis buffer(s)")
+
+
+def get_da3_encoder(model_cfg: ModelConfig) -> "FrozenGeoEncoder":
+    """Build the DA3 frozen geometry encoder from ModelConfig."""
+    from . import da3_cond as _da3_cond  # noqa: F401
+
+    if not getattr(model_cfg, "geo_encoder_type", ""):
+        model_cfg.geo_encoder_type = "da3"
+    encoder = build_geo_encoder(model_cfg)
+    if encoder is None:
+        raise ValueError("get_da3_encoder requires geo_encoder_type='da3'")
+    return encoder
+
+
 def get_model(
     local_model_path,
     model_cfg: ModelConfig,
     cond_encoder=None,
     cond_encoder_img=None,
+    geo_encoder=None,
 ):
     extra_args = {}
     if model_cfg is not None:
@@ -72,6 +107,26 @@ def get_model(
         extra_args["loss_layout_scale"] = model_cfg.loss_layout_scale
         if model_cfg.sep_token_id is not None:
             extra_args["sep_token_id"] = model_cfg.sep_token_id
+        # MV voxel encoder fields — override stale values in single-view checkpoints
+        # so that from_pretrained() creates mv_voxel_encoder when mv_voxel_encoder=True.
+        _mv_fields = [
+            "mv_voxel_encoder", "mv_num_obj_voxels", "mv_num_ctx_voxels",
+            "mv_voxel_dim", "mv_num_obj_queries", "mv_num_scene_queries",
+            "mv_num_heads", "mv_mask_seeded_pool", "mv_boundary_bias_alpha",
+            "mv_obj_pc_cond", "mv_use_voxel_encoder", "mv_obj_pc_appearance",
+            "mv_obj_pc_oracle", "mv_discovery_method",
+            # Discovery / voxelization params — must be here so yaml overrides reach
+            # ShapeOPTConfig; without this, getattr fallbacks in edgerunner.py fire
+            # instead of the configured values (e.g. mv_min_views: 2 → was using 3).
+            "mv_min_views", "mv_conf_threshold", "mv_depth_rtol", "mv_pool_size",
+            "mv_intra_obj_register", "mv_register_iters",
+            "mv_geom_norm_quantile", "mv_use_geometry", "mv_voxel_sampling",
+            "mv_covis_min_support_pix", "mv_view_conf_gate",
+            "mv_view_gate_min_views", "mv_obj_aabb_token",
+        ]
+        for _f in _mv_fields:
+            if hasattr(model_cfg, _f):
+                extra_args[_f] = getattr(model_cfg, _f)
         model_type = model_cfg.ar_model_type
     else:
         model_type = "meshxl"
@@ -92,10 +147,17 @@ def get_model(
             raise ValueError(f"Unknown model type: {model_type}")
 
     config = config_class.from_pretrained(local_model_path, **extra_args)
-    # Snapshot cond_encoder weights via named_parameters (NOT state_dict): ConditionEncoder
-    # overrides state_dict() to return {} for frozen encoders, so state_dict is useless here.
-    # transformers 5.x re-initializes ALL cond_encoder.* params after loading the BPT base
-    # checkpoint (which has no cond_encoder.* keys), discarding the MICHE pretrained weights.
+    # PretrainedConfig.from_pretrained discards kwargs that are not declared config
+    # attributes (e.g. the mv_* fields on ShapeOPTConfig), so force them onto the
+    # config here. Without this, config.mv_voxel_encoder is absent and ShapeOPT
+    # never builds the multi-view encoder.
+    if model_cfg is not None:
+        for _f in _mv_fields:
+            if _f in extra_args:
+                setattr(config, _f, extra_args[_f])
+    # Snapshot the pre-loaded cond_encoder state before from_pretrained, because
+    # from_pretrained detects cond_encoder.* as "MISSING" from the main checkpoint
+    # and re-initializes them with random weights, discarding the pretrained values.
     cond_enc_state = (
         {n: p.data.clone() for n, p in cond_encoder.named_parameters()}
         if cond_encoder is not None
@@ -108,13 +170,11 @@ def get_model(
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
         ignore_mismatched_sizes=True,
-        torch_dtype=torch.float32,
     )
-    # Restore MICHE pretrained weights into cond_encoder after from_pretrained corruption.
-    # Strategy:
-    #   Frozen encoder params (never saved to checkpoint): always restore from MICHE snapshot.
-    #   Trainable params like extra_feat_proj (saved to checkpoint): only restore if garbage,
-    #   so that a correctly-loaded stage-1-trained extra_feat_proj is preserved for stage-2.
+    # Restore frozen pretrained cond_encoder keys after from_pretrained corruption.
+    # ConditionEncoder.state_dict() intentionally filters frozen weights, so use
+    # named_parameters() snapshots. Trainable extra_feat_proj keys are preserved when
+    # a stage checkpoint loaded them, and restored only if they are unusable garbage.
     if cond_enc_state is not None:
         with torch.no_grad():
             model_enc_params = dict(model.cond_encoder.named_parameters())
@@ -126,27 +186,43 @@ def get_model(
                 is_garbage = (
                     current.isnan().any()
                     or current.isinf().any()
-                    or current.abs().max() > 1e6
+                    or current.abs().max() > 1e4
                 )
                 if name in trainable_keys:
-                    # Only fix garbage; keep stage-1 trained values when loading for stage-2
                     if is_garbage:
                         model_enc_params[name].data.copy_(pretrained_val)
                 else:
-                    # Frozen params are never in checkpoint → always restore from MICHE
                     model_enc_params[name].data.copy_(pretrained_val)
+    # If extra_feat_proj is still all-zeros or has garbage values after loading
+    # (shape mismatch caused ignore_mismatched_sizes to skip it, leaving uninitialized
+    # GPU memory that can overflow float32 norm to inf), re-init with Normal(0, 0.02).
+    if cond_encoder_img is not None and cond_encoder is not None:
+        enc = model.cond_encoder.encoder
+        if hasattr(enc, "extra_feat_proj"):
+            w = enc.extra_feat_proj.weight
+            w_f32 = w.detach().float()
+            w_norm = w_f32.norm().item()
+            needs_reinit = not math.isfinite(w_norm) or not w_f32.any()
+            if needs_reinit:
+                logger.info(
+                    f"extra_feat_proj has unusable values (norm={w_norm:.4g}); "
+                    "re-initializing with Normal(0, 0.02)"
+                )
+                w_init = torch.empty(w.shape, dtype=torch.float32).normal_(std=0.02)
+                enc.extra_feat_proj.weight.data.copy_(w_init.to(w.dtype))
+                enc.extra_feat_proj.bias.data.zero_()
+    model = model.to(torch.bfloat16)
+    # Attach the frozen geometry encoder after bf16 casting so the backbone keeps
+    # control over its own precision/autocast policy. Its state_dict() returns {},
+    # so from_pretrained never sees it as a checkpoint key.
+    if geo_encoder is not None and hasattr(model, "geo_encoder"):
+        model.geo_encoder = geo_encoder
     # Catch NaN/Inf params left by no_init_weights (absent checkpoint keys → garbage memory
     # → bfloat16 NaN).  This covers ctx_aggregator when loading from the original edgerunner
     # checkpoint (no ctx_aggregator keys) AND avoids overwriting trained ctx_aggregator values
     # when loading from a stage-2 checkpoint that already contains them.
     _fix_uninit_params(model)
-    # Train in bfloat16 to match the paper's "bf16 precision" training setup.
-    # With a float32 model + bf16 AMP, gradient norms are ~0.5 (below the 1.0 clip),
-    # leading to tiny updates and loss stuck at ~1.93. With a bf16 model, gradient
-    # norms are 10–18 (clipped to 1.0 every step) and the model converges properly.
-    # This cast is safe here: cond_encoder restore and _fix_uninit_params have
-    # already run on float32 values, so no garbage values are introduced.
-    model = model.to(torch.bfloat16)
+    _fix_pointembed_basis(model)
     if config.vocab_size != model_cfg.vocab_size:
         model.resize_token_embeddings(model_cfg.vocab_size, pad_to_multiple_of=64)
     return model
@@ -168,7 +244,17 @@ def get_condition_encoder(
         extra_args["with_extra_feat"] = True
         extra_args["extra_feat_dim"] = cond_encoder_img.output_dim
     model = model_class.from_pretrained(local_model_path, **extra_args)
+    model = model.to(torch.bfloat16)
     _fix_uninit_params(model)
+    _fix_pointembed_basis(model)
+    # extra_feat_proj is zero-initialized in encoder.__init__ (to survive no_init_weights).
+    # Re-initialize with Normal(0, 0.02) here — outside no_init_weights — so image features
+    # contribute from training step 1 instead of gradually turning on from zero.
+    if hasattr(model, "extra_feat_proj"):
+        w = model.extra_feat_proj.weight
+        w_init = torch.empty(w.shape, dtype=torch.float32).normal_(std=0.02)
+        w.data.copy_(w_init.to(w.dtype))
+        nn.init.zeros_(model.extra_feat_proj.bias.data)
     return ConditionEncoder(model, freeze=model_cfg.freeze_cond_encoder)
 
 
@@ -182,4 +268,4 @@ def get_image_condition_encoder(model_cfg: ModelConfig):
         )
     else:
         model = ImageConditionEncoder(model_name=model_cfg.image_encoder)
-    return model
+    return model.to(torch.bfloat16)

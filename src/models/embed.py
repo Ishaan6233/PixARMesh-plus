@@ -8,6 +8,12 @@ class CoordEmbed(nn.Module):
         super().__init__()
         assert freq_embed_dim % 6 == 0
         self.freq_embed_dim = freq_embed_dim
+        self.num_points = num_points
+        self.reset_basis()
+        self.mlp = nn.Linear(num_points * (self.freq_embed_dim + 3), dim)
+        self.ln = nn.LayerNorm(dim)
+
+    def reset_basis(self):
         e = torch.pow(2, torch.arange(self.freq_embed_dim // 6)).float() * np.pi
         e = torch.stack(
             [
@@ -34,10 +40,10 @@ class CoordEmbed(nn.Module):
                 ),
             ]
         )
-        self.num_points = num_points
-        self.register_buffer("basis", e)  # [3, 48]
-        self.mlp = nn.Linear(num_points * (self.freq_embed_dim + 3), dim)
-        self.ln = nn.LayerNorm(dim)
+        if "basis" in self._buffers:
+            self.basis.data.copy_(e.to(device=self.basis.device, dtype=self.basis.dtype))
+        else:
+            self.register_buffer("basis", e)  # [3, 48]
 
     @staticmethod
     def embed(input, basis):

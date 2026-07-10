@@ -34,19 +34,26 @@ class SrcModelAdapter(BaseModelAdapter):
     def _build_model(self) -> None:
         from src.models.utils import (
             get_condition_encoder,
+            get_da3_encoder,
             get_image_condition_encoder,
             get_model,
         )
-        from src.utils.config import ModelConfig
+        from src.utils.config import ModelConfig, mv_prefix_len
 
         allowed = {field.name for field in fields(ModelConfig)}
+        model_values = OmegaConf.to_container(self.cfg.model, resolve=True)
+        ds_model = OmegaConf.select(self.cfg, "dataset.model")
+        if ds_model is not None:
+            model_values.update(OmegaConf.to_container(ds_model, resolve=True))
         model_cfg_data = {
             key: value
-            for key, value in OmegaConf.to_container(self.cfg.model, resolve=True).items()
+            for key, value in model_values.items()
             if key in allowed
         }
         model_cfg_data["ar_model_type"] = self.ar_model_type
         model_cfg = ModelConfig(**model_cfg_data)
+        if getattr(model_cfg, "mv_voxel_encoder", False) or model_cfg.mv_obj_pc_cond:
+            model_cfg.prefix_len = mv_prefix_len(model_cfg)
 
         # Image encoder (DiNOv2 by default).
         cond_encoder_img = (
@@ -61,11 +68,15 @@ class SrcModelAdapter(BaseModelAdapter):
             if model_cfg.cond
             else None
         )
+        geo_encoder = None
+        if getattr(model_cfg, "use_da3", False) or getattr(model_cfg, "geo_encoder_type", "") == "da3":
+            geo_encoder = get_da3_encoder(model_cfg)
         self.model = get_model(
             model_cfg.local_path,
             model_cfg,
             cond_encoder=cond_encoder,
             cond_encoder_img=cond_encoder_img,
+            geo_encoder=geo_encoder,
         )
 
     def forward(self, batch: dict[str, Any]) -> Any:

@@ -29,14 +29,16 @@ from src.models.utils import (
     get_model,
     get_condition_encoder,
     get_image_condition_encoder,
+    get_da3_encoder,
 )
 from src.data.collator import get_mesh_data_collator
 from src.data.mesh import get_mesh_dataset, MeshProcessor
 from src.utils.logging import JsonlLoggerCallback
 from src.utils.trainer import CustomSFTTrainer, CustomSFTConfig
-from src.utils.config import DataConfig, ModelConfig
+from src.utils.config import DataConfig, ModelConfig, mv_prefix_len
 from src.utils.ckpt import get_last_checkpoint
 from src.utils.sig import SaveAndStopOnSignalCallback, install_sigusr1_handler
+from torch.utils.data import Subset
 
 logger = get_logger(__name__)
 
@@ -67,7 +69,13 @@ def _build_data_config(cfg):
 
 def _build_model_config(cfg):
     model_values = _to_container(cfg.model)
-    return ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+    ds_model = OmegaConf.select(cfg, "dataset.model")
+    if ds_model is not None:
+        model_values.update(_to_container(ds_model))
+    model_cfg = ModelConfig(**_filter_dataclass_kwargs(ModelConfig, model_values))
+    if getattr(model_cfg, "mv_voxel_encoder", False) or model_cfg.mv_obj_pc_cond:
+        model_cfg.prefix_len = mv_prefix_len(model_cfg)
+    return model_cfg
 
 
 def _build_train_args(cfg, model_cfg):
@@ -123,13 +131,37 @@ def main(cfg):
             )
         else:
             cond_encoder = None
+        geo_encoder = None
+        use_mv_feature_cache = bool(getattr(data_cfg, "mv_feature_cache", ""))
+        if use_mv_feature_cache:
+            logger.info(
+                f"mv_feature_cache={data_cfg.mv_feature_cache}: skipping DA3 geo_encoder construction."
+            )
+        elif getattr(model_cfg, "use_da3", False) or getattr(model_cfg, "geo_encoder_type", "") == "da3":
+            geo_encoder = get_da3_encoder(model_cfg)
         model = get_model(
             local_model_path,
             model_cfg,
             cond_encoder=cond_encoder,
             cond_encoder_img=cond_encoder_img,
+            geo_encoder=geo_encoder,
         )
+        if getattr(model_cfg, "freeze_decoder", False):
+            n_train = 0
+            for name, param in model.named_parameters():
+                trainable = "mv_voxel_encoder" in name
+                param.requires_grad_(trainable)
+                n_train += int(trainable)
+            logger.info(
+                f"freeze_decoder=True: {n_train} mv_voxel_encoder tensors trainable, rest frozen."
+            )
         train_set, val_set, _ = get_mesh_dataset(data_cfg)
+        if getattr(data_cfg, "overfit_n", 0):
+            n = int(data_cfg.overfit_n)
+            idx = list(range(min(n, len(train_set))))
+            train_set = train_set.select(idx) if hasattr(train_set, "select") else Subset(train_set, idx)
+            val_set = train_set
+            logger.info(f"overfit_n={n}: training/eval on {len(train_set)} objects")
 
     sig_cb = SaveAndStopOnSignalCallback()
     trainer = CustomSFTTrainer(

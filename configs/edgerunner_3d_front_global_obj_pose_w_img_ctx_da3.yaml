@@ -1,0 +1,12 @@
+defaults:
+  - edgerunner_3d_front_global_obj_pose_w_img_ctx
+  - _self_
+
+all:
+  name: edgerunner-3d-front-global-obj-pose-w-img-ctx-da3
+  output_dir: outputs/da3/train/${all.name}
+
+model:
+  use_da3: true
+  geo_encoder_type: da3
+  da3_ckpt_path: checkpoints/da3/DA3-GIANT
