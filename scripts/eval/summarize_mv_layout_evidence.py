@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -27,6 +28,19 @@ HIGHER_IS_BETTER = {
     "avg_f_score",
 }
 
+CATEGORY_KEYS = (
+    "category",
+    "object_category",
+    "model_category",
+    "semantic_category",
+    "class",
+    "label",
+    "synset",
+    "category_id",
+)
+
+UID_KEYS = ("uid", "image_id", "scene_id", "sha256", "model_id")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -42,6 +56,14 @@ def parse_args() -> argparse.Namespace:
         help="Downstream eval_obj_results.jsonl or JSON summary for a run. Repeatable.",
     )
     parser.add_argument("--sv-downstream", default="", help="SV baseline eval_obj_results.jsonl/JSON.")
+    parser.add_argument(
+        "--uid-metadata",
+        default="",
+        help=(
+            "Optional JSON/JSONL/CSV mapping from uid/image_id to category metadata. "
+            "When provided, summaries include category-paired CE deltas."
+        ),
+    )
     parser.add_argument("--out", default="outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary")
     return parser.parse_args()
 
@@ -62,6 +84,61 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 records.append(json.loads(line))
     return records
+
+
+def read_csv(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _stringify_metadata(record: dict[str, Any]) -> dict[str, str]:
+    return {str(key): str(value) for key, value in record.items() if value is not None}
+
+
+def _metadata_uid(record: dict[str, Any]) -> str | None:
+    for key in UID_KEYS:
+        value = record.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    return None
+
+
+def load_uid_metadata(path: str | Path) -> dict[str, dict[str, str]]:
+    """Load optional UID metadata for category-stratified evidence summaries."""
+    path = Path(path)
+    if not path:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix == ".jsonl":
+        rows = read_jsonl(path)
+    elif path.suffix == ".csv":
+        rows = read_csv(path)
+    else:
+        payload = json.loads(path.read_text())
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            if "records" in payload and isinstance(payload["records"], list):
+                rows = payload["records"]
+            elif all(isinstance(value, dict) for value in payload.values()):
+                rows = [{"uid": key, **value} for key, value in payload.items()]
+            else:
+                rows = [payload]
+        else:
+            rows = []
+
+    out: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        meta = _stringify_metadata(row)
+        uid = _metadata_uid(meta)
+        if uid is not None:
+            out[uid] = meta
+    return out
 
 
 def mean(values: list[float]) -> float | None:
@@ -95,12 +172,55 @@ def per_uid(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(record["uid"]): record for record in records if "uid" in record}
 
 
+def _category_from_mapping(uid: str, uid_metadata: dict[str, dict[str, str]]) -> str | None:
+    candidates = [uid]
+    if "::" in uid:
+        candidates.append(uid.split("::", 1)[0])
+    if "/" in uid:
+        candidates.append(uid.rsplit("/", 1)[-1])
+    for candidate in candidates:
+        meta = uid_metadata.get(candidate)
+        if not meta:
+            continue
+        for key in CATEGORY_KEYS:
+            value = meta.get(key)
+            if value is not None and str(value) != "":
+                return str(value)
+    return None
+
+
+def record_category(record: dict[str, Any], uid_metadata: dict[str, dict[str, str]]) -> str | None:
+    for key in CATEGORY_KEYS:
+        value = record.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    uid = record.get("uid")
+    if uid is None:
+        return None
+    return _category_from_mapping(str(uid), uid_metadata)
+
+
 def short_list(values: set[str], limit: int = 20) -> list[str]:
     return sorted(values)[:limit]
 
 
-def layout_summary(layout_root: Path, runs: list[str], seeds: list[int], ce_run: str) -> dict[str, Any]:
-    out: dict[str, Any] = {"runs": {}, "missing": []}
+def _category_bucket() -> dict[str, list[Any]]:
+    return {metric: [] for metric in LAYOUT_METRICS}
+
+
+def layout_summary(
+    layout_root: Path,
+    runs: list[str],
+    seeds: list[int],
+    ce_run: str,
+    uid_metadata: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    uid_metadata = uid_metadata or {}
+    out: dict[str, Any] = {
+        "runs": {},
+        "missing": [],
+        "uid_metadata_count": len(uid_metadata),
+    }
     ce_records_by_seed = {
         seed: per_uid(read_jsonl(layout_seed_dir(layout_root, ce_run, seed) / "per_sample.jsonl"))
         for seed in seeds
@@ -111,6 +231,10 @@ def layout_summary(layout_root: Path, runs: list[str], seeds: list[int], ce_run:
         per_seed_metric_values: dict[str, list[float]] = {metric: [] for metric in LAYOUT_METRICS}
         per_seed_paired_delta: dict[str, list[float]] = {metric: [] for metric in LAYOUT_METRICS}
         per_seed_improved: dict[str, list[bool]] = {metric: [] for metric in LAYOUT_METRICS}
+        per_category_delta: dict[str, dict[str, list[float]]] = {}
+        per_category_improved: dict[str, dict[str, list[bool]]] = {}
+        per_category_record_count: dict[str, int] = {}
+        missing_category_count = 0
 
         for seed in seeds:
             seed_dir = layout_seed_dir(layout_root, run, seed)
@@ -152,6 +276,7 @@ def layout_summary(layout_root: Path, runs: list[str], seeds: list[int], ce_run:
                     per_seed_metric_values[metric].append(seed_mean)
 
             if shared:
+                category_seed_values: dict[str, dict[str, list[float]]] = {}
                 for metric in LAYOUT_METRICS:
                     deltas = [
                         float(run_records[uid][metric]) - float(ce_records[uid][metric])
@@ -164,6 +289,31 @@ def layout_summary(layout_root: Path, runs: list[str], seeds: list[int], ce_run:
                     per_seed_paired_delta[metric].append(delta_mean)
                     improved = delta_mean > 0 if metric in HIGHER_IS_BETTER else delta_mean < 0
                     per_seed_improved[metric].append(improved)
+                if uid_metadata:
+                    for uid in shared:
+                        category = record_category(run_records[uid], uid_metadata) or record_category(
+                            ce_records[uid], uid_metadata
+                        )
+                        if category is None:
+                            missing_category_count += 1
+                            continue
+                        per_category_record_count[category] = per_category_record_count.get(category, 0) + 1
+                        category_seed_values.setdefault(category, _category_bucket())
+                        for metric in LAYOUT_METRICS:
+                            if metric in run_records[uid] and metric in ce_records[uid]:
+                                category_seed_values[category][metric].append(
+                                    float(run_records[uid][metric]) - float(ce_records[uid][metric])
+                                )
+                    for category, metric_values in category_seed_values.items():
+                        per_category_delta.setdefault(category, _category_bucket())
+                        per_category_improved.setdefault(category, {metric: [] for metric in LAYOUT_METRICS})
+                        for metric, values in metric_values.items():
+                            delta_mean = mean(values)
+                            if delta_mean is None:
+                                continue
+                            per_category_delta[category][metric].append(delta_mean)
+                            improved = delta_mean > 0 if metric in HIGHER_IS_BETTER else delta_mean < 0
+                            per_category_improved[category][metric].append(improved)
 
         for metric, values in per_seed_metric_values.items():
             run_summary["metrics"][metric] = summarize_values(values)
@@ -172,6 +322,17 @@ def layout_summary(layout_root: Path, runs: list[str], seeds: list[int], ce_run:
                 **summarize_values(values),
                 "improved_seed_count": int(sum(per_seed_improved[metric])),
             }
+        if uid_metadata:
+            run_summary["category_record_count"] = per_category_record_count
+            run_summary["missing_category_count"] = missing_category_count
+            run_summary["category_paired_delta_vs_ce"] = {}
+            for category, metric_values in sorted(per_category_delta.items()):
+                run_summary["category_paired_delta_vs_ce"][category] = {}
+                for metric, values in metric_values.items():
+                    run_summary["category_paired_delta_vs_ce"][category][metric] = {
+                        **summarize_values(values),
+                        "improved_seed_count": int(sum(per_category_improved[category][metric])),
+                    }
         out["runs"][run] = run_summary
     return out
 
@@ -317,6 +478,37 @@ def markdown_report(summary: dict[str, Any]) -> str:
                 f"| {run} | {metric} | {fmt(vals['mean'])} | {fmt(vals['ci95'])} "
                 f"| {fmt(delta['mean'])} | {fmt(delta['improved_seed_count'])}/{fmt(delta['n'])} |"
             )
+    category_rows = []
+    for run, run_summary in summary["layout"]["runs"].items():
+        for category, metrics in run_summary.get("category_paired_delta_vs_ce", {}).items():
+            for metric in ("bin_mae", "corner_l1", "corner_l2", "center_error", "size_rel_error", "aabb_iou"):
+                delta = metrics.get(metric, {})
+                if delta.get("n"):
+                    category_rows.append(
+                        (
+                            run,
+                            category,
+                            metric,
+                            delta.get("mean"),
+                            delta.get("ci95"),
+                            delta.get("improved_seed_count"),
+                            delta.get("n"),
+                        )
+                    )
+    if category_rows:
+        lines.append("")
+        lines.append("## Category Stability")
+        lines.append("")
+        lines.extend(
+            [
+                "| Run | Category | Metric | Paired Δ vs CE | 95% CI | Improved Seed-Category Cells |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for run, category, metric, delta, ci, improved, n in category_rows:
+            lines.append(
+                f"| {run} | {category} | {metric} | {fmt(delta)} | {fmt(ci)} | {fmt(improved)}/{fmt(n)} |"
+            )
     lines.append("")
     lines.append("## Downstream CD/F")
     lines.append("")
@@ -343,11 +535,13 @@ def markdown_report(summary: dict[str, Any]) -> str:
 def main() -> None:
     args = parse_args()
     runs = args.run or ["A_ce", "B_ordinal", "C_coord", "D_geometry"]
+    uid_metadata = load_uid_metadata(args.uid_metadata) if args.uid_metadata else {}
     summary = {
-        "layout": layout_summary(Path(args.layout_root), runs, args.seeds, args.ce_run),
+        "layout": layout_summary(Path(args.layout_root), runs, args.seeds, args.ce_run, uid_metadata),
         "downstream": downstream_summary(args.downstream, args.sv_downstream),
         "seeds": args.seeds,
         "ce_run": args.ce_run,
+        "uid_metadata": args.uid_metadata,
     }
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)

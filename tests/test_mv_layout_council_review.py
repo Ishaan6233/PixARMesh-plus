@@ -35,6 +35,24 @@ def _summary(*, downstream_beats_sv: bool = True) -> dict:
     }
 
 
+def _category_metrics(*, stable: bool = True) -> dict:
+    metrics = {}
+    for metric in ("bin_mae", "corner_l1", "corner_l2", "center_error", "size_rel_error"):
+        metrics[metric] = {"mean": -0.1 if stable else 0.1, "n": 2, "improved_seed_count": 2 if stable else 0}
+    metrics["aabb_iou"] = {"mean": 0.1 if stable else -0.1, "n": 2, "improved_seed_count": 2 if stable else 0}
+    return metrics
+
+
+def _summary_with_categories(*, stable: bool = True) -> dict:
+    summary = _summary()
+    summary["layout"]["runs"]["D_geometry"]["category_paired_delta_vs_ce"] = {
+        "chair": _category_metrics(stable=True),
+        "table": _category_metrics(stable=stable),
+    }
+    summary["layout"]["runs"]["D_geometry"]["missing_category_count"] = 0
+    return summary
+
+
 def _report(*, bin_mae: float, aabb_iou: float) -> dict:
     return {
         "summary": {
@@ -67,6 +85,36 @@ def test_council_review_passes_when_all_gates_are_satisfied(tmp_path):
     assert "recommendation: merge" in text
     assert "Checked commands/artifacts" in text
     assert json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def test_council_review_passes_with_required_category_stability():
+    result = evaluate_council(
+        summary=_summary_with_categories(),
+        best_layout_run="D_geometry",
+        downstream_run="E_stage2_best",
+        best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
+        negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
+        required_controls=["one_view_eval"],
+        require_category_stability=True,
+    )
+
+    assert result["status"] == "pass"
+    assert result["checks"]["layout_vs_ce"]["category_stability"]["passes"]
+
+
+def test_council_review_fails_when_required_category_regresses():
+    result = evaluate_council(
+        summary=_summary_with_categories(stable=False),
+        best_layout_run="D_geometry",
+        downstream_run="E_stage2_best",
+        best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
+        negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
+        required_controls=["one_view_eval"],
+        require_category_stability=True,
+    )
+
+    assert result["status"] == "fail"
+    assert any("category 'table'" in issue for issue in result["issues"])
 
 
 def test_council_review_fails_without_downstream_sv_win():

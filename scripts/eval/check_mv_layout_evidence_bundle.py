@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from scripts.eval.write_mv_layout_council_review import category_stability_issues
+
 REQUIRED_LAYOUT_METRICS = [
     "token_accuracy",
     "valid_token_frac",
@@ -72,6 +74,13 @@ def parse_args() -> argparse.Namespace:
         default="outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures",
         help="Directory containing per-seed plots and fixed/improved/regressed galleries.",
     )
+    parser.add_argument(
+        "--summary-json",
+        default="outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json",
+        help="Evidence summary JSON used for category-stability gates.",
+    )
+    parser.add_argument("--best-layout-run", default="", help="Best layout run name for category-stability gates.")
+    parser.add_argument("--require-category-stability", action="store_true")
     parser.add_argument("--require-visuals", action="store_true")
     parser.add_argument("--require-figures", action="store_true")
     parser.add_argument("--out", default="")
@@ -328,6 +337,33 @@ def check_figure_artifacts(report: dict[str, Any], figure_dir: Path, require_fig
             record_issue(report, f"gallery {name!r} has no created comparison images")
 
 
+def check_category_stability(
+    report: dict[str, Any],
+    *,
+    summary_json: Path,
+    best_layout_run: str,
+    require_category_stability: bool,
+) -> None:
+    report["category_stability"] = {
+        "required": require_category_stability,
+        "summary_json": str(summary_json),
+        "best_layout_run": best_layout_run,
+    }
+    if not require_category_stability:
+        return
+    if not best_layout_run:
+        record_issue(report, "--require-category-stability needs --best-layout-run")
+        return
+    summary = read_json(summary_json)
+    if summary is None:
+        record_issue(report, f"missing category-stability summary JSON: {summary_json}")
+        return
+    issues = category_stability_issues(summary, best_layout_run)
+    report["category_stability"]["issues"] = issues
+    for issue in issues:
+        record_issue(report, f"category stability: {issue}")
+
+
 def build_evidence_report(
     *,
     layout_root: Path,
@@ -338,8 +374,11 @@ def build_evidence_report(
     downstream: list[str],
     verifier_dir: Path,
     figure_dir: Path = Path("outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures"),
-    require_visuals: bool,
+    summary_json: Path = Path("outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json"),
+    best_layout_run: str = "",
+    require_visuals: bool = False,
     require_figures: bool = False,
+    require_category_stability: bool = False,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "ok": False,
@@ -348,6 +387,7 @@ def build_evidence_report(
         "downstream": {},
         "verifiers": {},
         "figures": {},
+        "category_stability": {},
     }
     for run in runs:
         for seed in seeds:
@@ -374,6 +414,12 @@ def build_evidence_report(
             )
     check_verifier_findings(report, verifier_dir)
     check_figure_artifacts(report, figure_dir, require_figures)
+    check_category_stability(
+        report,
+        summary_json=summary_json,
+        best_layout_run=best_layout_run,
+        require_category_stability=require_category_stability,
+    )
     report["ok"] = not report["issues"]
     return report
 
@@ -390,8 +436,11 @@ def main() -> int:
         downstream=args.downstream,
         verifier_dir=Path(args.verifier_dir),
         figure_dir=Path(args.figure_dir),
+        summary_json=Path(args.summary_json),
+        best_layout_run=args.best_layout_run,
         require_visuals=args.require_visuals,
         require_figures=args.require_figures,
+        require_category_stability=args.require_category_stability,
     )
     text = json.dumps(report, indent=2) + "\n"
     if args.out:

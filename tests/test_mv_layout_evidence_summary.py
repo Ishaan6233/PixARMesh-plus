@@ -2,7 +2,7 @@ import json
 import pytest
 from pathlib import Path
 
-from scripts.eval.summarize_mv_layout_evidence import downstream_summary, layout_summary
+from scripts.eval.summarize_mv_layout_evidence import downstream_summary, layout_summary, load_uid_metadata
 
 
 def _write_seed(root: Path, run: str, seed: int, records: list[dict]) -> None:
@@ -70,6 +70,39 @@ def test_layout_summary_reports_partial_uid_overlap_as_missing_evidence(tmp_path
 
     assert not summary["runs"]["B_ordinal"]["seeds"]["11"]["exact_uid_match"]
     assert any("UID mismatch" in item for item in summary["missing"])
+
+
+def test_layout_summary_reports_category_paired_deltas(tmp_path):
+    _write_seed(
+        tmp_path,
+        "A_ce",
+        11,
+        [_record("a", bin_mae=10.0, aabb_iou=0.2), _record("b", bin_mae=6.0, aabb_iou=0.5)],
+    )
+    _write_seed(
+        tmp_path,
+        "B_ordinal",
+        11,
+        [_record("a", bin_mae=8.0, aabb_iou=0.4), _record("b", bin_mae=7.0, aabb_iou=0.45)],
+    )
+    metadata = tmp_path / "metadata.jsonl"
+    metadata.write_text(
+        "\n".join(
+            [
+                json.dumps({"uid": "a", "category": "chair"}),
+                json.dumps({"uid": "b", "category": "table"}),
+            ]
+        )
+        + "\n"
+    )
+
+    summary = layout_summary(tmp_path, ["A_ce", "B_ordinal"], [11], "A_ce", load_uid_metadata(metadata))
+    category_delta = summary["runs"]["B_ordinal"]["category_paired_delta_vs_ce"]
+
+    assert category_delta["chair"]["bin_mae"]["mean"] == pytest.approx(-2.0)
+    assert category_delta["chair"]["bin_mae"]["improved_seed_count"] == 1
+    assert category_delta["table"]["bin_mae"]["mean"] == pytest.approx(1.0)
+    assert category_delta["table"]["bin_mae"]["improved_seed_count"] == 0
 
 
 def _write_downstream(path: Path, records: list[dict]) -> None:

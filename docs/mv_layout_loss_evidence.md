@@ -30,7 +30,8 @@ manifest with:
 
 ```bash
 /home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python \
-  scripts/experiments/mv_layout_loss_ablation.py
+  scripts/experiments/mv_layout_loss_ablation.py \
+  --uid-metadata metadata/layout_uid_categories.jsonl
 ```
 
 The generator writes `outputs/da3/experiments/mv_layout_loss_ablation/commands.sh`
@@ -60,6 +61,14 @@ include object-level rows followed by the aggregate row; aggregate-only JSON is
 not accepted by the evidence gates. Do not claim "beats SV PixARMesh" from bbox
 metrics alone.
 
+Object-category stability requires an explicit UID metadata file supplied with
+`--uid-metadata`. The file may be JSON, JSONL, or CSV and should contain a
+`uid` or `image_id` column plus one of `category`, `object_category`,
+`model_category`, `semantic_category`, `class`, `label`, `synset`, or
+`category_id`. Without this metadata, the scripts can still report paired layout
+and downstream metrics, but the category-stability part of the council claim is
+not established.
+
 After layout eval and downstream `eval_obj.py` runs exist, summarize the evidence
 with:
 
@@ -70,13 +79,16 @@ with:
   --run A_ce --run B_ordinal --run C_coord --run D_geometry \
   --seeds 11 23 37 \
   --ce-run A_ce \
+  --uid-metadata metadata/layout_uid_categories.jsonl \
   --sv-downstream outputs/sv/eval/baseline/eval_obj_results.jsonl \
   --downstream E_stage2_best=outputs/da3/eval/stage2_best/eval_obj_results.jsonl
 ```
 
 This writes `summary.json` and `summary.md` with per-seed confidence intervals,
 UID-paired deltas against CE, downstream CD/F deltas against SV, and explicit
-missing-evidence entries.
+missing-evidence entries. When `--uid-metadata` is provided, it also writes
+category-paired deltas against CE so category stability is checked on the same
+UID pairs as the global metrics.
 
 After choosing the best stage-1 run, build the evidence plots and fixed
 comparison galleries:
@@ -112,6 +124,7 @@ Before accepting the evidence bundle, run the hard gate:
   --best-layout-report outputs/da3/eval/layout_mv/D_geometry/seed23/report.json \
   --best-layout-report outputs/da3/eval/layout_mv/D_geometry/seed37/report.json \
   --downstream-run E_stage2_best \
+  --require-category-stability \
   --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/one_view_eval/report.json \
   --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/one_view_eval/report.json \
   --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/one_view_eval/report.json \
@@ -154,6 +167,9 @@ Before accepting the evidence bundle, run the hard gate:
   --downstream E_stage2_best=outputs/da3/eval/stage2_best/eval_obj_results.jsonl \
   --verifier-dir outputs/da3/experiments/mv_layout_loss_ablation/verifiers \
   --figure-dir outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures \
+  --summary-json outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json \
+  --best-layout-run D_geometry \
+  --require-category-stability \
   --require-visuals \
   --require-figures
 ```
@@ -161,12 +177,14 @@ Before accepting the evidence bundle, run the hard gate:
 The council writer exits nonzero unless the selected layout run improves all
 required bbox metrics over CE across exactly paired seeds, the selected stage-2
 run beats SV on object-paired downstream CD/F, and every required negative
-control report degrades relative to the matching best-run report. It also writes
-an explicit `recommendation: merge|keep-experimental|reject` line. The bundle
-checker then exits nonzero if required layout reports, exact paired UID records,
-visual projection/conditioning artifacts, downstream object-level CD/F rows,
-verifier findings, the council review recommendation, per-seed plots, UID lists,
-or comparison galleries are missing.
+control report degrades relative to the matching best-run report. With
+`--require-category-stability`, it also fails unless every metadata category
+improves the required bbox metrics over CE. It writes an explicit
+`recommendation: merge|keep-experimental|reject` line. The bundle checker then
+exits nonzero if required layout reports, exact paired UID records, category
+stability evidence, visual projection/conditioning artifacts, downstream
+object-level CD/F rows, verifier findings, the council review recommendation,
+per-seed plots, UID lists, or comparison galleries are missing.
 
 ## Negative Controls
 

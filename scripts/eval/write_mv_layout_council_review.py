@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         help="Required control name. Defaults to the planned core controls.",
     )
     parser.add_argument(
+        "--require-category-stability",
+        action="store_true",
+        help="Fail unless the best layout run improves CE within every metadata category.",
+    )
+    parser.add_argument(
         "--out",
         default="outputs/da3/experiments/mv_layout_loss_ablation/verifiers/council_review.md",
     )
@@ -113,6 +118,36 @@ def _as_report_list(value: Any) -> list[dict[str, Any] | None]:
     return [value]
 
 
+def category_stability_issues(summary: dict[str, Any], best_layout_run: str) -> list[str]:
+    """Return blocking issues for category-stratified CE deltas."""
+    issues: list[str] = []
+    layout_runs = summary.get("layout", {}).get("runs", {})
+    best_layout = layout_runs.get(best_layout_run) or {}
+    categories = best_layout.get("category_paired_delta_vs_ce") or {}
+    if not categories:
+        return [f"{best_layout_run} has no category-paired layout evidence"]
+    if len(categories) < 2:
+        issues.append(f"{best_layout_run} has category evidence for fewer than two categories")
+    missing_category_count = int(best_layout.get("missing_category_count") or 0)
+    if missing_category_count:
+        issues.append(f"{best_layout_run} has {missing_category_count} paired records without category metadata")
+    for category, metrics in sorted(categories.items()):
+        for metric in LAYOUT_IMPROVEMENT_METRICS:
+            delta = metrics.get(metric, {})
+            n = int(delta.get("n") or 0)
+            improved_seed_count = int(delta.get("improved_seed_count") or 0)
+            mean = delta.get("mean")
+            direction_ok = mean is not None and (
+                mean < 0 if metric in LOWER_IS_BETTER else mean > 0
+            )
+            all_cells_ok = n > 0 and improved_seed_count == n
+            if not (direction_ok and all_cells_ok):
+                issues.append(
+                    f"{best_layout_run} is not stable for category {category!r} metric {metric}"
+                )
+    return issues
+
+
 def evaluate_council(
     *,
     summary: dict[str, Any] | None,
@@ -121,6 +156,7 @@ def evaluate_council(
     best_layout_report: dict[str, Any] | list[dict[str, Any] | None] | None,
     negative_controls: dict[str, dict[str, Any] | list[dict[str, Any] | None] | None],
     required_controls: list[str],
+    require_category_stability: bool = False,
 ) -> dict[str, Any]:
     issues: list[str] = []
     checks: dict[str, Any] = {}
@@ -162,6 +198,16 @@ def evaluate_council(
         }
         if not layout_checks["visual_artifacts"]["passes"]:
             issues.append(f"{best_layout_run} lacks visual artifacts for one or more seeds")
+        if require_category_stability:
+            cat_issues = category_stability_issues(summary, best_layout_run)
+            category_checks = {
+                "required": True,
+                "category_count": len(best_layout.get("category_paired_delta_vs_ce") or {}),
+                "missing_category_count": int(best_layout.get("missing_category_count") or 0),
+                "passes": not cat_issues,
+            }
+            layout_checks["category_stability"] = category_checks
+            issues.extend(cat_issues)
         checks["layout_vs_ce"] = layout_checks
 
     downstream_cmp = summary.get("downstream", {}).get("comparison_to_sv", {}).get(downstream_run, {})
@@ -255,6 +301,7 @@ def write_markdown(result: dict[str, Any], out_path: Path) -> None:
         "- best stage-1 layout report",
         "- downstream SV comparison in summary JSON",
         "- required negative-control layout reports",
+        "- optional category-stability evidence when required",
         "",
         "## Verdict",
     ]
@@ -285,6 +332,7 @@ def main() -> int:
         best_layout_report=[read_json(Path(path)) for path in args.best_layout_report],
         negative_controls=controls,
         required_controls=required_controls,
+        require_category_stability=args.require_category_stability,
     )
     write_markdown(result, Path(args.out))
     print(json.dumps(result, indent=2))

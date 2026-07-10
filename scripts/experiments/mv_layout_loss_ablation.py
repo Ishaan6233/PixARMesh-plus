@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-obj-gt-dir", default="datasets/3D-FUTURE-model-ply")
     parser.add_argument("--eval-obj-points", type=int, default=10000)
     parser.add_argument("--eval-obj-mask-area-thresh", type=int, default=1600)
+    parser.add_argument(
+        "--uid-metadata",
+        default="",
+        help="Optional JSON/JSONL/CSV uid metadata used to gate object-category stability.",
+    )
     return parser.parse_args()
 
 
@@ -183,6 +188,7 @@ def main() -> None:
         "stage1_config": args.stage1_config,
         "stage2_config": args.stage2_config,
         "sv_downstream": args.sv_downstream,
+        "uid_metadata": args.uid_metadata,
         "ablations": [],
         "negative_controls": NEGATIVE_CONTROLS,
     }
@@ -248,12 +254,16 @@ def main() -> None:
     commands.append(f": \"${{BEST_STAGE2_DOWNSTREAM:=outputs/da3/eval/stage2_best/seed${{BEST_SEED}}/eval_obj_results.jsonl}}\"")
     seed_args = " ".join(str(seed) for seed in args.seeds)
     run_args = " ".join(f"--run {name}" for name in ABLATIONS)
+    uid_metadata_arg = f"--uid-metadata {args.uid_metadata} " if args.uid_metadata else ""
+    category_stability_arg = "--require-category-stability " if args.uid_metadata else ""
+    best_layout_arg = "--best-layout-run ${BEST_STAGE1_RUN} " if args.uid_metadata else ""
     commands.append(
         f"{args.python} scripts/eval/summarize_mv_layout_evidence.py "
         f"--layout-root outputs/da3/eval/layout_mv "
         f"{run_args} "
         f"--seeds {seed_args} "
         f"--ce-run A_ce "
+        f"{uid_metadata_arg}"
         f"--sv-downstream ${{SV_DOWNSTREAM}} "
         f"--downstream E_stage2_best=${{BEST_STAGE2_DOWNSTREAM}} "
         f"--out {args.out}/evidence_summary"
@@ -289,6 +299,7 @@ def main() -> None:
         f"--best-layout-run ${{BEST_STAGE1_RUN}} "
         f"{best_reports} "
         f"--downstream-run E_stage2_best "
+        f"{category_stability_arg}"
         f"{' '.join(council_controls)} "
         f"--out {args.out}/verifiers/council_review.md"
     )
@@ -302,6 +313,9 @@ def main() -> None:
         f"--downstream E_stage2_best=${{BEST_STAGE2_DOWNSTREAM}} "
         f"--verifier-dir {args.out}/verifiers "
         f"--figure-dir {args.out}/evidence_figures "
+        f"--summary-json {args.out}/evidence_summary/summary.json "
+        f"{best_layout_arg}"
+        f"{category_stability_arg}"
         f"--require-visuals "
         f"--require-figures "
         f"--out {args.out}/evidence_bundle_check.json"

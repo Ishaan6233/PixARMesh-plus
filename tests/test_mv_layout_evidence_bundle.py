@@ -79,6 +79,34 @@ def _write_figures(root):
     )
 
 
+def _write_category_summary(path, *, stable=True):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    good = {}
+    bad = {}
+    for metric in ("bin_mae", "corner_l1", "corner_l2", "center_error", "size_rel_error"):
+        good[metric] = {"mean": -0.1, "n": 1, "improved_seed_count": 1}
+        bad[metric] = {"mean": 0.1 if not stable else -0.1, "n": 1, "improved_seed_count": 0 if not stable else 1}
+    good["aabb_iou"] = {"mean": 0.1, "n": 1, "improved_seed_count": 1}
+    bad["aabb_iou"] = {"mean": -0.1 if not stable else 0.1, "n": 1, "improved_seed_count": 0 if not stable else 1}
+    path.write_text(
+        json.dumps(
+            {
+                "layout": {
+                    "runs": {
+                        "B_ordinal": {
+                            "category_paired_delta_vs_ce": {
+                                "chair": good,
+                                "table": bad,
+                            },
+                            "missing_category_count": 0,
+                        }
+                    }
+                }
+            }
+        )
+    )
+
+
 def test_evidence_bundle_checker_accepts_complete_bundle(tmp_path):
     layout_root = tmp_path / "layout"
     for run in ("A_ce", "B_ordinal"):
@@ -307,3 +335,49 @@ def test_evidence_bundle_checker_requires_figure_artifacts_when_enabled(tmp_path
         require_figures=True,
     )
     assert present["ok"]
+
+
+def test_evidence_bundle_checker_requires_category_stability(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        _write_layout(layout_root, run, 11)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv = tmp_path / "mv" / "eval_obj_results.jsonl"
+    _write_downstream(sv)
+    _write_downstream(mv)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+    summary_json = tmp_path / "summary" / "summary.json"
+
+    _write_category_summary(summary_json, stable=False)
+    failing = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        summary_json=summary_json,
+        best_layout_run="B_ordinal",
+        require_visuals=True,
+        require_category_stability=True,
+    )
+    assert not failing["ok"]
+    assert any("category stability" in issue for issue in failing["issues"])
+
+    _write_category_summary(summary_json, stable=True)
+    passing = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        summary_json=summary_json,
+        best_layout_run="B_ordinal",
+        require_visuals=True,
+        require_category_stability=True,
+    )
+    assert passing["ok"]
