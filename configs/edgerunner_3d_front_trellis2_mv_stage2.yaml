@@ -1,0 +1,11 @@
+defaults:
+  - edgerunner_3d_front_trellis2_mv
+  - _self_
+
+all:
+  name: edgerunner-3d-front-trellis2-mv-da3-stage2
+  output_dir: outputs/da3/train/stage2
+
+dataset:
+  model:
+    mv_obj_pc_cond: true

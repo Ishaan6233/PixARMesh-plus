@@ -1,0 +1,30 @@
+defaults:
+  - edgerunner_3d_front_global_obj_pose_w_img_ctx_da3
+  - dataset/canonical_3d_front_trellis2_mv
+  - _self_
+
+all:
+  name: edgerunner-3d-front-trellis2-mv-da3
+  output_dir: outputs/da3/train/${all.name}
+
+model:
+  local_path: outputs/archive/checkpoints/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260602-135736/checkpoints/final
+  mv_mask_seeded_pool: true
+
+train:
+  train_args:
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 2
+    max_steps: 30000
+    save_steps: 3000
+    eval_strategy: "no"
+    eval_steps: 999999
+    learning_rate: 1e-4
+    warmup_steps: 100
+    lr_scheduler_type: warmup_stable_decay
+    logging_steps: 10
+    bf16: true
+    dataloader_num_workers: 4
+    dataloader_prefetch_factor: 2
+    ddp_find_unused_parameters: true
