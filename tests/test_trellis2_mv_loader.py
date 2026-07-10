@@ -118,6 +118,24 @@ def test_feature_cache_rejects_wrong_cache_version(tmp_path):
         ds._load_feature_cache("uid-a", n_avail=4)
 
 
+def test_feature_cache_rejects_ref_view_outside_valid_mask(tmp_path):
+    ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
+    ds.feature_cache = tmp_path
+    np.savez_compressed(
+        tmp_path / "uid-a.npz",
+        cache_version=np.array(2, dtype=np.int64),
+        local_points=np.zeros((2, 4, 5, 3), dtype=np.float16),
+        conf=np.ones((2, 4, 5, 1), dtype=np.float16),
+        dino_feats=np.zeros((2, 8, 2, 3), dtype=np.float16),
+        view_indices=np.array([3, 1], dtype=np.int64),
+        view_mask=np.array([False, True]),
+        ref_view=np.array(0, dtype=np.int64),
+    )
+
+    with pytest.raises(ValueError, match="view_mask\\[ref_view\\] is false"):
+        ds._load_feature_cache("uid-a", n_avail=4)
+
+
 def test_mv_collator_keeps_only_plural_scene_transforms():
     data_cfg = DataConfig(
         type="3d-front-trellis2-mv",

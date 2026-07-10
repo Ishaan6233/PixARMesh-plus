@@ -483,6 +483,8 @@ class Trellis2MVDataset(Dataset):
             ref_view = int(np.asarray(z["ref_view"]).item())
             if ref_view < 0 or ref_view >= len(view_indices):
                 raise ValueError(f"{path} has invalid ref_view={ref_view}.")
+            if not bool(view_mask[ref_view]):
+                raise ValueError(f"{path} has ref_view={ref_view} but view_mask[ref_view] is false.")
             return {
                 "cached_local_points": np.array(local_points, copy=True),
                 "cached_conf": np.array(conf, copy=True),
