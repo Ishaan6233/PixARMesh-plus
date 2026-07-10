@@ -11,7 +11,7 @@ from transformers import (
 _STOP_REQUESTED = threading.Event()
 
 
-def _sigusr1_handler(signum, frame):
+def _sigusr1_handler(_signum, _frame):
     _STOP_REQUESTED.set()
 
 

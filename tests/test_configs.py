@@ -21,7 +21,7 @@ class ConfigTest(unittest.TestCase):
         ):
             cfg = compose(config_name="config")
         OmegaConf.resolve(cfg)
-        self.assertEqual(cfg.model.name, "pixarmesh")
+        self.assertEqual(cfg.model.name, "edgerunner")
         self.assertEqual(cfg.environment.cuda, "12.4")
         self.assertTrue(cfg.eval.chamfer.squared)
 
