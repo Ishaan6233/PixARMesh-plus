@@ -168,12 +168,15 @@ class Front3DCollator(BaseCollator):
         self.is_bpt = self.tokenization_method == "bpt"
         self.ignore_obj_seq = data_cfg.ignore_obj_seq
         self.ignore_layout_seq = data_cfg.ignore_layout_seq
+        # DEBUG-ONLY oracle ceiling: emit GT-canonical surface points as obj conditioning.
+        self.mv_obj_pc_oracle = getattr(model_cfg, "mv_obj_pc_oracle", False)
+        self.mv_num_obj_voxels = getattr(model_cfg, "mv_num_obj_voxels", 512)
 
     def _tokenize_bbox(self, rect_bboxes):
-        quantized_bboxes, sort_inds = quantize_gravity_aligned_bboxes(
+        quantized_bboxes = quantize_gravity_aligned_bboxes(
             rect_bboxes,
             num_pos_tokens=self.num_pos_tokens,
-            return_sort_inds=True,
+            return_sort_inds=False,
         )
         if self.layout_tokenization_method == "full":
             tris = quantized_bboxes
@@ -189,6 +192,31 @@ class Front3DCollator(BaseCollator):
             seq = tris.reshape(-1) + self.pos_token_offset
         return seq.tolist()
 
+    def _sample_canonical_surface(self, vertices, faces, n):
+        """DEBUG oracle: area-weighted uniform surface sampling of the GT canonical mesh
+        (already in normalize_vertices(0.95) frame). Returns (n, 3) float32. Falls back to
+        vertex resampling for missing / non-triangular faces."""
+        v = np.asarray(vertices, dtype=np.float64)
+        f = np.asarray(faces)
+        if v.ndim != 2 or len(v) == 0:
+            return np.zeros((n, 3), dtype=np.float32)
+        if f.ndim == 2 and f.shape[1] == 3 and len(f) > 0:
+            tris = v[f.astype(np.int64)]                       # (F, 3, 3)
+            cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+            areas = 0.5 * np.linalg.norm(cross, axis=1)
+            total = areas.sum()
+            if total > 0:
+                probs = areas / total
+                ti = np.random.choice(len(f), size=n, p=probs)
+                uu = np.random.rand(n, 1)
+                ww = np.random.rand(n, 1)
+                over = (uu + ww) > 1
+                uu[over], ww[over] = 1 - uu[over], 1 - ww[over]
+                a, b, c = tris[ti, 0], tris[ti, 1], tris[ti, 2]
+                return (a + uu * (b - a) + ww * (c - a)).astype(np.float32)
+        idx = np.random.randint(0, len(v), size=n)
+        return v[idx].astype(np.float32)
+
     def __call__(self, examples):
         all_input_ids = []
         all_token_type_ids = []
@@ -203,8 +231,8 @@ class Front3DCollator(BaseCollator):
         has_pixel_values = "pixel_values" in examples[0]
         has_ctx_pc = "ctx_point_clouds" in examples[0]
         # scene_transforms is present whenever has_pc=True (computed in transform_3d_front).
-        # Gated on has_pc, not has_ctx_pc, so object-level point-cloud consumers still
-        # receive scene transforms when context PCs are disabled.
+        # Gated on has_pc, not has_ctx_pc, so frozen geometry encoders can replace
+        # per-object point clouds independently of whether context PCs are used.
         has_scene_transform = has_pc and "scene_transforms" in examples[0]
         all_obj_indices = []
         all_obj_bboxes = []
@@ -240,8 +268,8 @@ class Front3DCollator(BaseCollator):
                 ctx_pc_2d = example["ctx_point_clouds_2d"]
                 all_ctx_pcs.append(ctx_pc)
                 all_ctx_pcs_2d.append(ctx_pc_2d)
-                if has_scene_transform:
-                    all_scene_transforms.append(example["scene_transforms"])
+            if has_scene_transform:
+                all_scene_transforms.append(example["scene_transforms"])
 
             obj_seq = []
             obj_type_ids = []
@@ -317,10 +345,11 @@ class Front3DCollator(BaseCollator):
             ret["ctx_pcs"] = torch.as_tensor(all_ctx_pcs, dtype=torch.float32)
             all_ctx_pcs_2d = np.array(all_ctx_pcs_2d)
             ret["ctx_pcs_2d"] = torch.as_tensor(all_ctx_pcs_2d, dtype=torch.float32)
-            if has_scene_transform:
-                ret["scene_transform"] = torch.as_tensor(
-                    np.array(all_scene_transforms), dtype=torch.float32
-                )
+        has_mv_fields = "K_per_view" in examples[0]
+        if has_scene_transform and not has_mv_fields:
+            ret["scene_transform"] = torch.as_tensor(
+                np.array(all_scene_transforms), dtype=torch.float32
+            )
         if has_obj:
             all_obj_indices = np.array(all_obj_indices)
             ret["obj_indices"] = torch.as_tensor(all_obj_indices, dtype=torch.long)
@@ -356,8 +385,60 @@ class Front3DCollator(BaseCollator):
             labels[~pc_valid_mask] = -100
         ret["labels"] = labels
         if has_pixel_values:
-            all_pixel_values = torch.concat(all_pixel_values, dim=0)
-            ret["pixel_values"] = all_pixel_values
+            # Multi-view: pixel_values per example is (N, C, H, W) with N > 1 → (B, N, C, H, W)
+            # Single-view: pixel_values per example is (1, C, H, W) → concat → (B, C, H, W)
+            if all_pixel_values[0].shape[0] > 1:
+                ret["pixel_values"] = torch.stack(all_pixel_values, dim=0)  # (B, N, C, H, W)
+            else:
+                ret["pixel_values"] = torch.concat(all_pixel_values, dim=0) # (B, C, H, W)
+
+        # Multi-view extra fields: scene_transforms (B,N,4,4), K_per_view (B,N,3,3),
+        # view_mask (B,N) — present when the dataset returns per-view transforms.
+        if has_mv_fields:
+            ret["scene_transforms"] = torch.as_tensor(
+                np.array([ex["scene_transforms"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, 4, 4)
+            ret["K_per_view"] = torch.as_tensor(
+                np.array([ex["K_per_view"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, 3, 3)
+            ret["view_mask"] = torch.as_tensor(
+                np.array([ex["view_mask"] for ex in examples]), dtype=torch.bool
+            )  # (B, N)
+            if "ref_view" in examples[0]:
+                ret["ref_view"] = torch.as_tensor(
+                    np.array([ex["ref_view"] for ex in examples]), dtype=torch.long
+                )  # (B,) reference view (seed source); model uses it instead of re-deriving
+            if "obj_canon_transform" in examples[0]:
+                ret["obj_canon_transform"] = torch.as_tensor(
+                    np.array([ex["obj_canon_transform"] for ex in examples]),
+                    dtype=torch.float32,
+                )  # (B, 4, 4) scene -> per-object canonical frame
+            if "panoptic_masks" in examples[0]:
+                ret["panoptic_masks"] = torch.as_tensor(
+                    np.array([ex["panoptic_masks"] for ex in examples]), dtype=torch.long
+                )  # (B, N, H, W)
+            if self.mv_obj_pc_oracle:
+                # DEBUG ceiling: GT-canonical surface points as obj conditioning (leak-by-design).
+                gt_pts = [
+                    self._sample_canonical_surface(
+                        ex.get("vertices"), ex.get("faces"), self.mv_num_obj_voxels
+                    )
+                    for ex in examples
+                ]
+                ret["gt_obj_vertices"] = torch.as_tensor(
+                    np.stack(gt_pts, axis=0), dtype=torch.float32
+                )  # (B, mv_num_obj_voxels, 3) canonical frame
+        # Precomputed frozen geometry + DINOv2 features (skip the ViT forwards at train time)
+        if all("cached_local_points" in ex for ex in examples):
+            ret["cached_local_points"] = torch.as_tensor(
+                np.array([ex["cached_local_points"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, H, W, 3)
+            ret["cached_conf"] = torch.as_tensor(
+                np.array([ex["cached_conf"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, H, W, 1)
+            ret["cached_dino_feats"] = torch.as_tensor(
+                np.array([ex["cached_dino_feats"] for ex in examples]), dtype=torch.float32
+            )  # (B, N, C_d, H', W')
         return ret
 
 
@@ -366,7 +447,7 @@ def get_mesh_data_collator(data_cfg: DataConfig, model_cfg: ModelConfig):
     match data_type:
         case "shapenet":
             collator = MeshDataCollator(data_cfg, model_cfg)
-        case "3d-front" | "3d-front-layout":
+        case "3d-front" | "3d-front-layout" | "3d-front-trellis2-mv":
             collator = Front3DCollator(data_cfg, model_cfg)
         case _:
             raise ValueError(f"Unknown dataset type: {data_type}")

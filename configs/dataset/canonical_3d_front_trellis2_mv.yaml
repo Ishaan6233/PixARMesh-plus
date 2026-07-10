@@ -1,0 +1,103 @@
+# Trellis2-MV 3D-FRONT training config.
+# Dataset: datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-...
+# Per-object file format (mesh_dumps + mv_cond). Images/cameras cross-referenced
+# from local 3d-front-multiview-full HF dataset by scene_id.
+# Scene normalization: T_norm_from_output (gravity-aligned world→norm) replaces the
+# current bbox-centering pipeline. Reference view chosen by covisibility.
+#
+# Model prefix: mv_obj_pc_cond=false here → z_i (257) + z_scene (64) + aabb (1) + num_face (1) = 323.
+# Stage configs override mv_obj_pc_cond: true → prefix = 2048+257+64+1(aabb)+1 = 2371.
+
+spec:
+  resolution: 518
+  num_points: 4096
+  axis_convention: y_up_z_forward
+  unit_scale: 1.0
+  augmentation_policy: canonical_train_only
+  coordinate_frame:
+    handedness: right
+    up_axis: y
+    forward_axis: z
+    units: meters
+  normalization:
+    mode: gravity_aligned   # uses T_norm_from_output from mv_cond.pt
+    bound: 0.95
+    center: true
+    preserve_aspect_ratio: true
+
+src_data:
+  type: 3d-front-trellis2-mv
+  path: datasets/mesh_datasets/datasets/3d-front-trellis2-slat-mv-da3-aug-srcperturb-r5-qfcat-obj015-light-bgtex-20260629
+  trellis2_hf_path: datasets/3d-front-multiview-full
+  num_views: 8        # pad-to slots; actual views chosen by covisibility (mv_covis_k_max)
+  mv_covis_k_max: 8   # max diverse views to select per object
+  mv_covis_min_support_pts: 50  # min projected obj points for a view to be eligible
+  # Runtime reference view policy: choose the highest object-support view from
+  # the covisible selected set. Masks are only a cheap sanity gate when the
+  # target instance id is identifiable; GT silhouette agreement is diagnostic,
+  # not the training-time selection criterion.
+  mv_mask_min_area_px: 256
+  mv_mask_min_hit_pts: 8
+  mv_mask_min_hit_frac: 0.05
+  # Drop degenerate instances (<2-view HF rows + truly object-blind objects); sidecar
+  # from scripts/data/build_conditioning_filter.py, built in the SAME frame mode
+  # (~9% dropped frame-corrected; the earlier "12.3%" was measured in the broken frame).
+  mv_filter_degenerate: true
+  # Exact norm→HF-world frame correction. Without it frozen geometry registers into a
+  # frame rotated ~90° from the seeds/bboxes/GT layout, and covisibility marks 47.7%
+  # of objects blind — 99.2% of those are visible once corrected (measured 2026-07-03).
+  # Separate loader code adapts HF y-up/z-forward camera coordinates to the OpenCV
+  # camera frame expected by K, frozen geometry local_points, and grid_sample projection.
+  mv_frame_correction: true
+  num_points: ${dataset.spec.num_points}
+  norm_bound: ${dataset.spec.normalization.bound}
+  with_normals: false
+  num_pos_tokens: ${model.num_pos_tokens}
+  # Random augmentation: scale and jitter still on; rotation is OFF because
+  # T_norm_from_output already provides a gravity-aligned frame (random Y-rotation
+  # would fight the consistent up-direction the pre-computed frame provides).
+  random_scale: true
+  random_scale_min: 0.75
+  random_rotate: false
+  random_jitter_point_clouds: true
+  random_jitter_probability: 0.5
+  random_jitter_offset: 0.01
+  random_jitter_depth: false   # no per-view depth maps in this loader
+  random_shift: true
+  random_shift_max: 0.2
+  visualize: false
+  use_masked_obj_pc: true
+  load_images: true
+  image_preprocessor: facebook/dpt-dinov2-small-nyu
+  image_size_divisor: 28
+  ignore_obj_seq: false
+  ignore_layout_seq: false
+
+model:
+  # OPT prefix (base, without mv_obj_pc_cond): z_i (257) + z_scene (64) + aabb (1) + num_face (1) = 323
+  prefix_len: 323
+  mv_voxel_encoder: true
+  mv_num_obj_queries: 257
+  mv_num_scene_queries: 64
+  mv_num_obj_voxels: 2048
+  mv_pool_size: 8192
+  mv_num_ctx_voxels: 1024
+  mv_voxel_dim: 512
+  mv_num_heads: 8
+  mv_min_views: 3
+  mv_depth_rtol: 100.0
+  mv_intra_obj_register: false
+  # Per-view confidence gates are backbone-specific. Leave disabled until DA3's
+  # depth_conf distribution has been calibrated by the registration-scatter gate.
+  mv_view_conf_gate: 0.0
+  # Scene-frame obj-AABB prefix token (+1 to derived prefix_len): restores the layout
+  # head's pose/size evidence that canonicalization strips (2026-07-03 council).
+  mv_obj_aabb_token: true
+  mv_register_iters: 4
+  mv_geom_norm_quantile: 0.05
+  mv_conf_threshold: 0.0
+  mv_use_geometry: true
+  img_cond: true
+  mv_obj_pc_cond: false
+  mv_use_voxel_encoder: true
+  mv_obj_pc_appearance: true
