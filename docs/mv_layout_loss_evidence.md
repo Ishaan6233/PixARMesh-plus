@@ -78,6 +78,27 @@ This writes `summary.json` and `summary.md` with per-seed confidence intervals,
 UID-paired deltas against CE, downstream CD/F deltas against SV, and explicit
 missing-evidence entries.
 
+After choosing the best stage-1 run, build the evidence plots and fixed
+comparison galleries:
+
+```bash
+/home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python \
+  scripts/eval/build_mv_layout_evidence_figures.py \
+  --summary-json outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json \
+  --layout-root outputs/da3/eval/layout_mv \
+  --run A_ce --run B_ordinal --run C_coord --run D_geometry \
+  --seeds 11 23 37 \
+  --ce-run A_ce \
+  --baseline-run A_ce \
+  --candidate-run D_geometry \
+  --out outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures
+```
+
+This writes per-seed metric plots, paired-delta plots, ranked UID lists, and
+fixed/improved/regressed side-by-side galleries from saved visual cases. Use
+`--baseline-run` to compare against CE, SV-layout artifacts, or another run with
+the same `eval_layout_mv.py` output format.
+
 Before accepting the evidence bundle, run the hard gate:
 
 ```bash
@@ -130,7 +151,9 @@ Before accepting the evidence bundle, run the hard gate:
   --sv-downstream outputs/sv/eval/baseline/eval_obj_results.jsonl \
   --downstream E_stage2_best=outputs/da3/eval/stage2_best/eval_obj_results.jsonl \
   --verifier-dir outputs/da3/experiments/mv_layout_loss_ablation/verifiers \
-  --require-visuals
+  --figure-dir outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures \
+  --require-visuals \
+  --require-figures
 ```
 
 The council writer exits nonzero unless the selected layout run improves all
@@ -139,7 +162,8 @@ run beats SV on object-paired downstream CD/F, and every required negative
 control report degrades relative to the matching best-run report. The bundle
 checker then exits nonzero if required layout reports, exact paired UID records,
 visual projection/conditioning artifacts, downstream object-level CD/F rows,
-verifier findings, or the council review are missing.
+verifier findings, the council review, per-seed plots, UID lists, or comparison
+galleries are missing.
 
 ## Negative Controls
 

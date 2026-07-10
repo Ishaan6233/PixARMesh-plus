@@ -258,6 +258,17 @@ def main() -> None:
         f"--downstream E_stage2_best=${{BEST_STAGE2_DOWNSTREAM}} "
         f"--out {args.out}/evidence_summary"
     )
+    commands.append(
+        f"{args.python} scripts/eval/build_mv_layout_evidence_figures.py "
+        f"--summary-json {args.out}/evidence_summary/summary.json "
+        f"--layout-root outputs/da3/eval/layout_mv "
+        f"{run_args} "
+        f"--seeds {seed_args} "
+        f"--ce-run A_ce "
+        f"--baseline-run A_ce "
+        f"--candidate-run ${{BEST_STAGE1_RUN}} "
+        f"--out {args.out}/evidence_figures"
+    )
     commands.append("")
     commands.append("# Write the deterministic council review after negative controls exist.")
     best_reports = " ".join(
@@ -290,7 +301,9 @@ def main() -> None:
         f"--sv-downstream ${{SV_DOWNSTREAM}} "
         f"--downstream E_stage2_best=${{BEST_STAGE2_DOWNSTREAM}} "
         f"--verifier-dir {args.out}/verifiers "
+        f"--figure-dir {args.out}/evidence_figures "
         f"--require-visuals "
+        f"--require-figures "
         f"--out {args.out}/evidence_bundle_check.json"
     )
 

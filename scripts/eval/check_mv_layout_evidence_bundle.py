@@ -62,7 +62,13 @@ def parse_args() -> argparse.Namespace:
         default="outputs/da3/experiments/mv_layout_loss_ablation/verifiers",
         help="Directory containing verifier/council markdown findings.",
     )
+    parser.add_argument(
+        "--figure-dir",
+        default="outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures",
+        help="Directory containing per-seed plots and fixed/improved/regressed galleries.",
+    )
     parser.add_argument("--require-visuals", action="store_true")
+    parser.add_argument("--require-figures", action="store_true")
     parser.add_argument("--out", default="")
     return parser.parse_args()
 
@@ -139,7 +145,7 @@ def check_layout_seed(
     layout_root: Path,
     run: str,
     seed: int,
-    require_visuals: bool,
+    require_visuals: bool = False,
 ) -> dict[str, Any]:
     seed_dir = layout_root / run / f"seed{seed}"
     report_path = seed_dir / "report.json"
@@ -279,6 +285,40 @@ def check_verifier_findings(report: dict[str, Any], verifier_dir: Path) -> None:
             record_issue(report, f"verifier finding contains unresolved failure markers {fail_markers}: {path}")
 
 
+def check_figure_artifacts(report: dict[str, Any], figure_dir: Path, require_figures: bool) -> None:
+    report["figures"] = {"path": str(figure_dir), "required": require_figures}
+    if not require_figures:
+        return
+    required_files = [
+        "per_seed_metrics.png",
+        "paired_delta_vs_ce.png",
+        "fixed_uids.txt",
+        "improved_uids.txt",
+        "regressed_uids.txt",
+        "ranked_uids.json",
+        "gallery_manifest.json",
+    ]
+    for name in required_files:
+        path = figure_dir / name
+        report["figures"][name] = {"path": str(path), "exists": path.exists()}
+        if not path.exists():
+            record_issue(report, f"missing figure artifact: {path}")
+    manifest = read_json(figure_dir / "gallery_manifest.json")
+    if manifest is None:
+        return
+    created = int(manifest.get("created_composites") or 0)
+    report["figures"]["created_composites"] = created
+    if created <= 0:
+        record_issue(report, f"{figure_dir / 'gallery_manifest.json'} has no created comparison composites")
+    for name in ("fixed", "improved", "regressed"):
+        gallery = next((item for item in manifest.get("galleries", []) if item.get("name") == name), None)
+        if gallery is None:
+            record_issue(report, f"gallery manifest missing {name!r} gallery")
+            continue
+        if name in {"fixed", "improved"} and not gallery.get("created"):
+            record_issue(report, f"gallery {name!r} has no created comparison images")
+
+
 def build_evidence_report(
     *,
     layout_root: Path,
@@ -288,7 +328,9 @@ def build_evidence_report(
     sv_downstream: Path,
     downstream: list[str],
     verifier_dir: Path,
+    figure_dir: Path = Path("outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures"),
     require_visuals: bool,
+    require_figures: bool = False,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "ok": False,
@@ -296,6 +338,7 @@ def build_evidence_report(
         "layout": [],
         "downstream": {},
         "verifiers": {},
+        "figures": {},
     }
     for run in runs:
         for seed in seeds:
@@ -321,6 +364,7 @@ def build_evidence_report(
                 f"extra={len(set(mv_records) - set(sv_records))}",
             )
     check_verifier_findings(report, verifier_dir)
+    check_figure_artifacts(report, figure_dir, require_figures)
     report["ok"] = not report["issues"]
     return report
 
@@ -336,7 +380,9 @@ def main() -> int:
         sv_downstream=Path(args.sv_downstream),
         downstream=args.downstream,
         verifier_dir=Path(args.verifier_dir),
+        figure_dir=Path(args.figure_dir),
         require_visuals=args.require_visuals,
+        require_figures=args.require_figures,
     )
     text = json.dumps(report, indent=2) + "\n"
     if args.out:

@@ -54,6 +54,27 @@ def _write_verifiers(root):
         (root / name).write_text("status: pass\n\nFindings\n\nChecked commands and artifacts.\n")
 
 
+def _write_figures(root):
+    root.mkdir(parents=True)
+    for name in ("per_seed_metrics.png", "paired_delta_vs_ce.png"):
+        (root / name).write_bytes(b"png")
+    for name in ("fixed_uids.txt", "improved_uids.txt", "regressed_uids.txt"):
+        (root / name).write_text("uid-a\n")
+    (root / "ranked_uids.json").write_text(json.dumps([{"uid": "uid-a"}]))
+    (root / "gallery_manifest.json").write_text(
+        json.dumps(
+            {
+                "created_composites": 2,
+                "galleries": [
+                    {"name": "fixed", "created": [{"path": "fixed.png"}], "missing": []},
+                    {"name": "improved", "created": [{"path": "improved.png"}], "missing": []},
+                    {"name": "regressed", "created": [], "missing": []},
+                ],
+            }
+        )
+    )
+
+
 def test_evidence_bundle_checker_accepts_complete_bundle(tmp_path):
     layout_root = tmp_path / "layout"
     for run in ("A_ce", "B_ordinal"):
@@ -210,3 +231,46 @@ def test_evidence_bundle_checker_rejects_unresolved_verifier_markers(tmp_path):
 
     assert not report["ok"]
     assert any("unresolved failure markers" in issue for issue in report["issues"])
+
+
+def test_evidence_bundle_checker_requires_figure_artifacts_when_enabled(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        _write_layout(layout_root, run, 11)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv = tmp_path / "mv" / "eval_obj_results.jsonl"
+    _write_downstream(sv)
+    _write_downstream(mv)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+    figure_dir = tmp_path / "figures"
+
+    missing = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        figure_dir=figure_dir,
+        require_visuals=True,
+        require_figures=True,
+    )
+    assert not missing["ok"]
+    assert any("missing figure artifact" in issue for issue in missing["issues"])
+
+    _write_figures(figure_dir)
+    present = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        figure_dir=figure_dir,
+        require_visuals=True,
+        require_figures=True,
+    )
+    assert present["ok"]
