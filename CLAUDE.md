@@ -31,7 +31,8 @@ python -m pytest tests/test_x.py::ClassName::test_method         # single test
 Training (2-stage; see "Architecture"):
 ```bash
 bash scripts/train_full.sh              # SV: stage1 layout-only -> stage2 full, auto-resumes
-bash scripts/train_mv.sh                # MV: same, GPUS=/NP= overridable; uses -full data + cache
+bash scripts/train_mv.sh                # MV: stage1 layout-only -> stage2 full, auto-skips existing stage1
+bash scripts/train_mv.sh --precompute-cache  # MV: precompute DA3+DINO cache for train+val, then train
 python launch.py [--num_processes N] train.py --config-name <cfg> [hydra.overrides=...]
 ```
 
@@ -39,9 +40,9 @@ Inference + eval (distributed via Accelerate):
 ```bash
 accelerate launch --module scripts.infer --model-type edgerunner --run-type obj \
   --checkpoint <hf-or-local-ckpt> --output-dir outputs/sv/infer        # SV
-# MV: add  --mv --obj-pc-cond  (stage-2 ckpts are trained WITH the obj-PC channel,
-#   prefix_len=2370; omitting --obj-pc-cond silently evals at prefix_len=322 without it
-#   → meaningless CD/F. Equivalently use --mv-config edgerunner_3d_front_multiview_stage2.)
+# MV model construction must use the same MV config family as training; current
+# stage1/stage2 configs derive prefix_len=2371 via mv_prefix_len because
+# mv_obj_pc_cond=true and mv_obj_aabb_token=true.
 # EdgeRunner decode flags: --num-beams --min-faces --max-faces --gt-layout --gt-mask
 accelerate launch --module scripts.eval_obj --pred-dir <preds> --save-dir <out>   # or: make eval-obj ARGS=...
 ```
@@ -71,14 +72,33 @@ stay stateless** (beam search calls it per-beam; mutable per-batch state corrupt
 - **SV:** Depth Pro (metric, RANSAC-aligned to GT via `align_depth` in
   [src/data/utils.py](src/data/utils.py)) + Grounded-SAM masks + DINOv2 image features → the
   EdgeRunner `cond_encoder` turns the object point cloud into 2048 latents.
-- **MV:** `discover_instance_points_mv` does **cross-view Grounded-SAM mask-consensus
-  voting** + confidence-filtered FPS to produce `obj_voxels` + `ctx_voxels`. The
+- **MV:** `Trellis2MVDataset` ([src/data/trellis2_mv.py](src/data/trellis2_mv.py))
+  selects covisible object-support views, emits per-view cameras, masks, `view_mask`, and `ref_view`,
+  and can load precomputed frozen features from `dataset.src_data.mv_feature_cache`.
+  `discover_instance_points_mv` then uses the selected views for object/context geometry, while
   `MultiViewVoxelAlignedEncoder` ([src/models/mv_voxel_encoder.py](src/models/mv_voxel_encoder.py))
-  projects voxels into every view, samples DINOv2, and does IBRNet **confidence-weighted** fusion →
-  `z_i` (object) + `z_scene`. The decoder prefix is `[obj-PC latents] + [z_i, z_scene] + num_face`
-  scattered into `pc_token` slots. Entry point: `EdgeRunner.get_mv_inputs_with_cond`. `prefix_len` is
-  **derived** from the active conditioning channels (`mv_prefix_len`); the collator must emit exactly
-  that many `pc_token` slots — keep them in sync.
+  projects voxels into every valid view, samples DINOv2, and does IBRNet **confidence-weighted** fusion →
+  `z_i` (object) + `z_scene`. The decoder prefix is `[obj-PC latents] + [z_i, z_scene] + [obj-AABB] + num_face`
+  scattered into `pc_token` slots when those channels are enabled. Entry point:
+  `EdgeRunner.get_mv_inputs_with_cond`. `prefix_len` is **derived** from the active conditioning
+  channels (`mv_prefix_len`); the collator must emit exactly that many `pc_token` slots.
+
+**MV training setup.** Use [scripts/train_mv.sh](scripts/train_mv.sh) as the canonical wrapper.
+It defaults to `edgerunner_3d_front_trellis2_mv_stage1` then
+`edgerunner_3d_front_trellis2_mv_stage2`, writes under `outputs/da3/train/stage1` and
+`outputs/da3/train/stage2`, skips Stage 1 when a final checkpoint already exists, and supports
+`--force-stage1`, `--stage1-only`, and `--stage2-only`. Set `MV_FEATURE_CACHE=<dir>` to pass
+`dataset.src_data.mv_feature_cache=<dir>` into both stages. Add `--precompute-cache` to first run
+[scripts/data/precompute_mv_features.py](scripts/data/precompute_mv_features.py) for train and val;
+each cache file stores `cache_version`, `local_points`, `conf`, `dino_feats`,
+`view_indices`, `view_mask`, and `ref_view`, letting `train.py` skip constructing
+the live DA3 geo encoder.
+
+**Reference-view policy.** The runtime policy is intentionally simple: score HF views by target-object
+projected support, select up to `mv_covis_k_max` diverse covisible views, and use local slot `0`
+(the highest-support selected view) as `ref_view`. If panoptic masks exist and the target id can be
+resolved, the chosen support views must also pass cheap sanity checks: visible target area and a few
+projected seed hits. GT silhouette agreement is diagnostic, not the training selection objective.
 
 **Frame handling (a recurring source of bugs).** The decoder emits per-object **canonical** vertices
 (`normalize_vertices(bound=0.95)`); `obj_voxels` live in the scene-normalized frame.
@@ -93,10 +113,11 @@ erased — **only intrinsic shape is scored.** Coverage (fraction of objects tha
 reported alongside CD/F and must be ≥~95% for a CD number to be trustworthy.
 
 **Data.** Hydra configs in `configs/` (`configs/dataset/canonical_3d_front*.yaml`,
-`configs/model/`). The MV dataset is a HF `DatasetDict` with a single `validation` split
-(`datasets/3d-front-multiview`); training uses `datasets/3d-front-multiview-full` plus an optional
-precomputed MV feature cache (`+dataset.src_data.mv_feature_cache=datasets/mv-feature-cache`, ~6×
-speedup). `launch.py` also injects `RUN_TS` and forwards SIGUSR1 to workers.
+`configs/model/`). The active MV training config uses Trellis2 per-object mesh dumps plus
+`datasets/3d-front-multiview-full` for images/cameras/masks. The optional MV feature cache is
+configured via `dataset.src_data.mv_feature_cache`; rebuild it whenever the selected views,
+image preprocessing, DA3 checkpoint, DINO encoder, or reference-view policy changes.
+`launch.py` also injects `RUN_TS` and forwards SIGUSR1 to workers.
 
 **Debug/oracle flags** (MV): `mv_obj_pc_oracle` feeds GT-canonical points as conditioning — a
 **leak, ceiling-probe only**, never report as a real number. `mv_obj_pc_cond`,

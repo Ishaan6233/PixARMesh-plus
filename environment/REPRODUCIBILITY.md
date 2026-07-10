@@ -28,3 +28,14 @@ Adapters may reshape, tokenize, or convert formats, but may not change splits,
 normalization, coordinate systems, point counts, metrics, evaluation sampling,
 precision policy, or runtime timing protocol.
 
+## Trellis2-MV Cache Rule
+
+The optional `dataset.src_data.mv_feature_cache` is a pure frozen-feature cache,
+not a new data source. It may cache `cache_version`, DA3 local geometry, DA3
+confidence, DINOv2 features, selected view indices, `view_mask`, and `ref_view`
+for the exact training config that produced it.
+
+Rebuild the cache if any of these change: Trellis2-MV split/filtering,
+reference-view selection, `num_views`/covisibility thresholds, image processor
+or size divisor, DA3 checkpoint, DINO encoder, frame-correction mode, or source
+HF/mesh datasets.

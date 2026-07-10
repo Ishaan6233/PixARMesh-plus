@@ -138,6 +138,49 @@ Replace `model.local_path` with the checkpoint path from Stage 1.
 python launch.py train.py --config-name=edgerunner_3d_front_global_obj_pose_w_img_ctx model.local_path=outputs/sv/train/edgerunner-3d-front-global-obj-pose-w-img-ctx-layout-only/1/checkpoints/final
 ```
 
+### PixARMesh+ Multi-View Training
+
+The active PixARMesh+ branch trains the DA3 Trellis2-MV setup with the wrapper in
+`scripts/train_mv.sh`:
+
+```bash
+bash scripts/train_mv.sh
+```
+
+This runs `edgerunner_3d_front_trellis2_mv_stage1` first, then runs
+`edgerunner_3d_front_trellis2_mv_stage2` with `model.local_path` set to the
+latest Stage 1 `checkpoints/final`. Stage 1 is layout-only
+(`dataset.src_data.ignore_obj_seq=true`); Stage 2 restores mesh/object tokens.
+Both stages use the Trellis2-MV dataset config
+`configs/dataset/canonical_3d_front_trellis2_mv.yaml`.
+
+Useful controls:
+
+```bash
+bash scripts/train_mv.sh --stage1-only
+bash scripts/train_mv.sh --stage2-only
+bash scripts/train_mv.sh --force-stage1
+PYTHON="/path/to/python" GPUS=0,1,2,3 NP=4 bash scripts/train_mv.sh
+```
+
+To avoid recomputing frozen DA3 geometry and DINOv2 image features every epoch,
+precompute the MV feature cache once and train against it:
+
+```bash
+MV_FEATURE_CACHE=datasets/mv-feature-cache/da3/trellis2-mv \
+  bash scripts/train_mv.sh --precompute-cache
+```
+
+The cache writes one `<uid>.npz` per Trellis2 object with `cache_version`,
+`local_points`, `conf`, `dino_feats`, `view_indices`, `view_mask`, and `ref_view`.
+Training uses it when `dataset.src_data.mv_feature_cache=<cache-dir>` is set;
+unset that override to fall back to live DA3/DINO forwards.
+
+The current reference-view policy is intentionally simple: select covisible views
+by object pixel support, then use the highest-support selected view as
+`ref_view`. Panoptic masks, when available and target ids are identifiable, are
+only a sanity gate that the object is visible and has seed hits.
+
 ## 📊 Evaluation
 
 Distributed inference is supported via **Accelerate**.

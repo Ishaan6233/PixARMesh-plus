@@ -5,6 +5,8 @@ eval dumps, diagnostics, and visualizations are ignored by git.
 
 - `da3/` contains active da3 work: training runs under `train/`, diagnostics
   under `diagnostics/`, and current visual evidence under `vis/`.
+  Trellis2-MV training uses `train/stage1/` for layout-only checkpoints and
+  `train/stage2/` for full mesh checkpoints.
 - `sv/` contains retained single-view baselines: training runs under `train/`,
   inference under `infer/`, and evaluation outputs under `eval/`.
 - `archive/` contains moved legacy material. Checkpoint-heavy runs live under

@@ -41,7 +41,11 @@ semantic purpose and runtime ownership.
 ## Scripts
 
 - `scripts/`: maintained command-line workflows.
+- `scripts/train_mv.sh`: canonical operator wrapper for active DA3 Trellis2-MV two-stage training
+  and optional frozen-feature cache precompute.
 - `scripts/data/`: dataset preparation, conversion, filtering, or inspection.
+- `scripts/data/precompute_mv_features.py`: precomputes per-object DA3 geometry and DINOv2
+  features for Trellis2-MV training caches.
 - `scripts/eval/`: evaluation probes and metric-specific entry points.
 - `scripts/experiments/`: bounded experiment runners that are useful to repeat.
 - `scripts/figures/`: figure generation from existing results.
@@ -62,7 +66,8 @@ If a script becomes imported by runtime code, move the reusable logic into
 ## Local Data And Generated Outputs
 
 - `metadata/`, `splits/`: small repo-level metadata and split definitions.
-- `datasets/`: local datasets; ignored by git.
+- `datasets/`: local datasets and ignored feature caches such as
+  `datasets/mv-feature-cache/da3/trellis2-mv`.
 - `checkpoints/`: local checkpoint roots. Track only policy docs and directory
   markers; do not track checkpoint payloads.
 - `outputs/`: local experiment outputs. Active work is grouped under `da3/` and
