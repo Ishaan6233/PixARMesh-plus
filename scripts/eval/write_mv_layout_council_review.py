@@ -212,13 +212,41 @@ def evaluate_council(
             issues.append(f"negative control {name!r} does not degrade relative to the best layout report")
     checks["negative_controls"] = control_checks
 
-    return {"status": "pass" if not issues else "fail", "issues": issues, "checks": checks}
+    status = "pass" if not issues else "fail"
+    return {
+        "status": status,
+        "recommendation": recommendation_for(status, issues),
+        "issues": issues,
+        "checks": checks,
+    }
+
+
+def recommendation_for(status: str, issues: list[str]) -> str:
+    """Return the deterministic merge/hold/reject recommendation for the bundle."""
+    if status == "pass":
+        return "merge"
+    missing_or_incomplete_markers = (
+        "missing",
+        "unreadable",
+        "absent",
+        "lacks",
+        "not uid/object-paired",
+        "has no",
+        "required negative control",
+        "reports but",
+    )
+    issue_text = "\n".join(issues).lower()
+    if any(marker in issue_text for marker in missing_or_incomplete_markers):
+        return "keep-experimental"
+    return "reject"
 
 
 def write_markdown(result: dict[str, Any], out_path: Path) -> None:
     status = result["status"]
+    recommendation = result.get("recommendation", recommendation_for(status, result.get("issues", [])))
     lines = [
         f"status: {status}",
+        f"recommendation: {recommendation}",
         "",
         "# MV Layout Council Review",
         "",
@@ -231,9 +259,9 @@ def write_markdown(result: dict[str, Any], out_path: Path) -> None:
         "## Verdict",
     ]
     if status == "pass":
-        lines.append("The evidence satisfies the deterministic council gate.")
+        lines.append("The evidence satisfies the deterministic council gate; merge is supportable after independent verifier files also pass.")
     else:
-        lines.append("The evidence does not satisfy the deterministic council gate.")
+        lines.append(f"The evidence does not satisfy the deterministic council gate; recommendation is {recommendation}.")
     lines.extend(["", "## Issues"])
     if result["issues"]:
         lines.extend(f"- {issue}" for issue in result["issues"])

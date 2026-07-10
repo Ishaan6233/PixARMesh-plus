@@ -159,11 +159,12 @@ Before accepting the evidence bundle, run the hard gate:
 The council writer exits nonzero unless the selected layout run improves all
 required bbox metrics over CE across exactly paired seeds, the selected stage-2
 run beats SV on object-paired downstream CD/F, and every required negative
-control report degrades relative to the matching best-run report. The bundle
+control report degrades relative to the matching best-run report. It also writes
+an explicit `recommendation: merge|keep-experimental|reject` line. The bundle
 checker then exits nonzero if required layout reports, exact paired UID records,
 visual projection/conditioning artifacts, downstream object-level CD/F rows,
-verifier findings, the council review, per-seed plots, UID lists, or comparison
-galleries are missing.
+verifier findings, the council review recommendation, per-seed plots, UID lists,
+or comparison galleries are missing.
 
 ## Negative Controls
 

@@ -30,6 +30,11 @@ REQUIRED_VERIFIER_FILES = [
 
 REQUIRED_DOWNSTREAM_KEYS = ["avg_cd", "avg_f_score", "num_evaluated"]
 PASS_MARKERS = ("status: pass", "verdict: pass")
+RECOMMENDATION_MARKERS = (
+    "recommendation: merge",
+    "recommendation: keep-experimental",
+    "recommendation: reject",
+)
 FAIL_MARKERS = (
     "status: fail",
     "verdict: fail",
@@ -280,6 +285,8 @@ def check_verifier_findings(report: dict[str, Any], verifier_dir: Path) -> None:
             record_issue(report, f"verifier finding lacks checked commands/artifacts section: {path}")
         if not any(marker in lowered for marker in PASS_MARKERS):
             record_issue(report, f"verifier finding lacks explicit status: pass marker: {path}")
+        if name == "council_review.md" and not any(marker in lowered for marker in RECOMMENDATION_MARKERS):
+            record_issue(report, f"council review lacks explicit merge/keep-experimental/reject recommendation: {path}")
         fail_markers = [marker for marker in FAIL_MARKERS if marker in lowered]
         if fail_markers:
             record_issue(report, f"verifier finding contains unresolved failure markers {fail_markers}: {path}")

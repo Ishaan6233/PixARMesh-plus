@@ -49,9 +49,11 @@ def _write_verifiers(root):
         "data_verifier.md",
         "experiment_verifier.md",
         "visual_verifier.md",
-        "council_review.md",
     ):
         (root / name).write_text("status: pass\n\nFindings\n\nChecked commands and artifacts.\n")
+    (root / "council_review.md").write_text(
+        "status: pass\nrecommendation: merge\n\nFindings\n\nChecked commands and artifacts.\n"
+    )
 
 
 def _write_figures(root):
@@ -231,6 +233,35 @@ def test_evidence_bundle_checker_rejects_unresolved_verifier_markers(tmp_path):
 
     assert not report["ok"]
     assert any("unresolved failure markers" in issue for issue in report["issues"])
+
+
+def test_evidence_bundle_checker_rejects_council_without_recommendation(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        _write_layout(layout_root, run, 11)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv = tmp_path / "mv" / "eval_obj_results.jsonl"
+    _write_downstream(sv)
+    _write_downstream(mv)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+    (verifier_dir / "council_review.md").write_text(
+        "status: pass\n\nFindings\n\nChecked commands and artifacts.\n"
+    )
+
+    report = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        require_visuals=True,
+    )
+
+    assert not report["ok"]
+    assert any("lacks explicit merge/keep-experimental/reject recommendation" in issue for issue in report["issues"])
 
 
 def test_evidence_bundle_checker_requires_figure_artifacts_when_enabled(tmp_path):

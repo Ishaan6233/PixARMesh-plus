@@ -1,6 +1,6 @@
 import json
 
-from scripts.eval.write_mv_layout_council_review import evaluate_council, write_markdown
+from scripts.eval.write_mv_layout_council_review import evaluate_council, recommendation_for, write_markdown
 
 
 def _summary(*, downstream_beats_sv: bool = True) -> dict:
@@ -57,12 +57,14 @@ def test_council_review_passes_when_all_gates_are_satisfied(tmp_path):
         required_controls=["one_view_eval", "no_aabb"],
     )
     assert result["status"] == "pass"
+    assert result["recommendation"] == "merge"
     assert result["issues"] == []
 
     out = tmp_path / "council_review.md"
     write_markdown(result, out)
     text = out.read_text()
     assert text.startswith("status: pass")
+    assert "recommendation: merge" in text
     assert "Checked commands/artifacts" in text
     assert json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
 
@@ -128,3 +130,9 @@ def test_council_review_requires_control_report_for_each_best_report():
 
     assert result["status"] == "fail"
     assert any("has 1 reports but 2 best-layout reports" in issue for issue in result["issues"])
+
+
+def test_council_recommendation_distinguishes_missing_from_reject():
+    assert recommendation_for("pass", []) == "merge"
+    assert recommendation_for("fail", ["summary.json is missing or unreadable"]) == "keep-experimental"
+    assert recommendation_for("fail", ["D_geometry does not improve bin_mae against CE across all paired seeds"]) == "reject"
