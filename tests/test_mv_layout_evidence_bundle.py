@@ -60,17 +60,19 @@ def _write_figures(root):
     root.mkdir(parents=True)
     for name in ("per_seed_metrics.png", "paired_delta_vs_ce.png"):
         (root / name).write_bytes(b"png")
-    for name in ("fixed_uids.txt", "improved_uids.txt", "regressed_uids.txt"):
+    for name in ("fixed_uids.txt", "improved_uids.txt", "regressed_uids.txt", "failure_uids.txt"):
         (root / name).write_text("uid-a\n")
     (root / "ranked_uids.json").write_text(json.dumps([{"uid": "uid-a"}]))
+    (root / "ranked_failures.json").write_text(json.dumps([{"uid": "uid-a"}]))
     (root / "gallery_manifest.json").write_text(
         json.dumps(
             {
-                "created_composites": 2,
+                "created_composites": 3,
                 "galleries": [
                     {"name": "fixed", "created": [{"path": "fixed.png"}], "missing": []},
                     {"name": "improved", "created": [{"path": "improved.png"}], "missing": []},
                     {"name": "regressed", "created": [], "missing": []},
+                    {"name": "failures", "created": [{"path": "failures.png"}], "missing": []},
                 ],
             }
         )

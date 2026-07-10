@@ -106,6 +106,44 @@ def ranked_uid_scores(
     return sorted(ranked, key=lambda item: item["mean_improvement"], reverse=True)
 
 
+def failure_uid_scores(
+    *,
+    layout_root: Path,
+    candidate_run: str,
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    by_uid: dict[str, list[dict[str, Any]]] = {}
+    for seed in seeds:
+        candidate = seed_records(layout_root, candidate_run, seed)
+        for uid, record in sorted(candidate.items()):
+            if not all(metric in record for metric in ("valid_token_frac", "aabb_iou", "bin_mae")):
+                continue
+            failure_score = (
+                (1.0 - float(record["valid_token_frac"]))
+                + (1.0 - float(record["aabb_iou"]))
+                + float(record["bin_mae"]) / 100.0
+            )
+            by_uid.setdefault(uid, []).append(
+                {
+                    "seed": seed,
+                    "valid_token_frac": float(record["valid_token_frac"]),
+                    "aabb_iou": float(record["aabb_iou"]),
+                    "bin_mae": float(record["bin_mae"]),
+                    "failure_score": failure_score,
+                }
+            )
+    ranked = []
+    for uid, values in by_uid.items():
+        ranked.append(
+            {
+                "uid": uid,
+                "mean_failure_score": sum(item["failure_score"] for item in values) / len(values),
+                "seeds": values,
+            }
+        )
+    return sorted(ranked, key=lambda item: item["mean_failure_score"], reverse=True)
+
+
 def write_uid_list(path: Path, items: list[dict[str, Any]]) -> None:
     path.write_text("\n".join(str(item["uid"]) for item in items) + ("\n" if items else ""))
 
@@ -235,6 +273,65 @@ def write_gallery(
     return {"name": gallery_name, "created": created, "missing": missing}
 
 
+def combine_single_run_case_image(
+    *,
+    layout_root: Path,
+    run: str,
+    seed: int,
+    uid: str,
+    image_name: str,
+    out_path: Path,
+) -> bool:
+    image_path = visual_case_dir(layout_root, run, seed, uid) / image_name
+    if not image_path.exists():
+        return False
+    image = mpimg.imread(image_path)
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    ax.imshow(image)
+    ax.set_title(f"{run} seed{seed} - {uid} - {image_name}")
+    ax.set_axis_off()
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return True
+
+
+def write_failure_gallery(
+    *,
+    layout_root: Path,
+    candidate_run: str,
+    selected: list[dict[str, Any]],
+    image_names: list[str],
+    out_dir: Path,
+) -> dict[str, Any]:
+    gallery_dir = out_dir / "failures"
+    created = []
+    missing = []
+    for item in selected:
+        uid = str(item["uid"])
+        seeds = [int(seed_info["seed"]) for seed_info in item.get("seeds", [])]
+        if not seeds:
+            missing.append({"uid": uid, "reason": "no candidate seed records"})
+            continue
+        seed = seeds[0]
+        for image_name in image_names:
+            out_name = f"seed{seed}_{uid.replace('/', '_')}_{image_name}"
+            ok = combine_single_run_case_image(
+                layout_root=layout_root,
+                run=candidate_run,
+                seed=seed,
+                uid=uid,
+                image_name=image_name,
+                out_path=gallery_dir / out_name,
+            )
+            if ok:
+                created.append({"uid": uid, "seed": seed, "image_name": image_name, "path": str(gallery_dir / out_name)})
+            else:
+                missing.append({"uid": uid, "seed": seed, "image_name": image_name})
+    return {"name": "failures", "created": created, "missing": missing}
+
+
 def build_figures(
     *,
     summary_json: Path,
@@ -273,10 +370,17 @@ def build_figures(
     fixed = ranked[:max_gallery_cases]
     improved = [item for item in ranked if item["mean_improvement"] > 0][:max_gallery_cases]
     regressed = list(reversed([item for item in ranked if item["mean_improvement"] < 0]))[:max_gallery_cases]
+    failures = failure_uid_scores(
+        layout_root=layout_root,
+        candidate_run=candidate_run,
+        seeds=seeds,
+    )[:max_gallery_cases]
     write_uid_list(out_dir / "fixed_uids.txt", fixed)
     write_uid_list(out_dir / "improved_uids.txt", improved)
     write_uid_list(out_dir / "regressed_uids.txt", regressed)
+    write_uid_list(out_dir / "failure_uids.txt", failures)
     (out_dir / "ranked_uids.json").write_text(json.dumps(ranked, indent=2) + "\n")
+    (out_dir / "ranked_failures.json").write_text(json.dumps(failures, indent=2) + "\n")
 
     galleries = [
         write_gallery(
@@ -294,6 +398,15 @@ def build_figures(
             ("regressed", regressed),
         )
     ]
+    galleries.append(
+        write_failure_gallery(
+            layout_root=layout_root,
+            candidate_run=candidate_run,
+            selected=failures,
+            image_names=image_names,
+            out_dir=out_dir,
+        )
+    )
     manifest = {
         "summary_json": str(summary_json),
         "layout_root": str(layout_root),
@@ -311,6 +424,7 @@ def build_figures(
             "fixed": str(out_dir / "fixed_uids.txt"),
             "improved": str(out_dir / "improved_uids.txt"),
             "regressed": str(out_dir / "regressed_uids.txt"),
+            "failures": str(out_dir / "failure_uids.txt"),
         },
         "galleries": galleries,
         "created_composites": sum(len(gallery["created"]) for gallery in galleries),

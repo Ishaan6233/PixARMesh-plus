@@ -302,7 +302,9 @@ def check_figure_artifacts(report: dict[str, Any], figure_dir: Path, require_fig
         "fixed_uids.txt",
         "improved_uids.txt",
         "regressed_uids.txt",
+        "failure_uids.txt",
         "ranked_uids.json",
+        "ranked_failures.json",
         "gallery_manifest.json",
     ]
     for name in required_files:
@@ -317,12 +319,12 @@ def check_figure_artifacts(report: dict[str, Any], figure_dir: Path, require_fig
     report["figures"]["created_composites"] = created
     if created <= 0:
         record_issue(report, f"{figure_dir / 'gallery_manifest.json'} has no created comparison composites")
-    for name in ("fixed", "improved", "regressed"):
+    for name in ("fixed", "improved", "regressed", "failures"):
         gallery = next((item for item in manifest.get("galleries", []) if item.get("name") == name), None)
         if gallery is None:
             record_issue(report, f"gallery manifest missing {name!r} gallery")
             continue
-        if name in {"fixed", "improved"} and not gallery.get("created"):
+        if name in {"fixed", "improved", "failures"} and not gallery.get("created"):
             record_issue(report, f"gallery {name!r} has no created comparison images")
 
 

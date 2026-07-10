@@ -6,7 +6,7 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from scripts.eval.build_mv_layout_evidence_figures import build_figures, ranked_uid_scores
+from scripts.eval.build_mv_layout_evidence_figures import build_figures, failure_uid_scores, ranked_uid_scores
 from scripts.eval.summarize_mv_layout_evidence import layout_summary
 
 
@@ -65,6 +65,23 @@ def test_ranked_uid_scores_orders_improved_before_regressed(tmp_path):
     assert ranked[1]["mean_improvement"] < 0
 
 
+def test_failure_uid_scores_orders_worst_candidate_cases(tmp_path):
+    _write_seed(
+        tmp_path,
+        "D_geometry",
+        11,
+        [
+            _record("ok", bin_mae=1.0, aabb_iou=0.9),
+            {**_record("bad", bin_mae=20.0, aabb_iou=0.1), "valid_token_frac": 0.5},
+        ],
+    )
+
+    failures = failure_uid_scores(layout_root=tmp_path, candidate_run="D_geometry", seeds=[11])
+
+    assert [item["uid"] for item in failures] == ["bad", "ok"]
+    assert failures[0]["mean_failure_score"] > failures[1]["mean_failure_score"]
+
+
 def test_build_figures_writes_plots_uid_lists_and_composites(tmp_path):
     layout_root = tmp_path / "layout"
     _write_seed(
@@ -107,5 +124,7 @@ def test_build_figures_writes_plots_uid_lists_and_composites(tmp_path):
     assert (tmp_path / "figures" / "fixed_uids.txt").read_text().splitlines() == ["better", "worse"]
     assert (tmp_path / "figures" / "improved_uids.txt").read_text().splitlines() == ["better"]
     assert (tmp_path / "figures" / "regressed_uids.txt").read_text().splitlines() == ["worse"]
-    assert manifest["created_composites"] >= 3
+    assert (tmp_path / "figures" / "failure_uids.txt").read_text().splitlines() == ["worse", "better"]
+    assert {gallery["name"] for gallery in manifest["galleries"]} == {"fixed", "improved", "regressed", "failures"}
+    assert manifest["created_composites"] >= 5
     assert (tmp_path / "figures" / "gallery_manifest.json").exists()

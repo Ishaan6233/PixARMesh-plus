@@ -95,9 +95,11 @@ comparison galleries:
 ```
 
 This writes per-seed metric plots, paired-delta plots, ranked UID lists, and
-fixed/improved/regressed side-by-side galleries from saved visual cases. Use
-`--baseline-run` to compare against CE, SV-layout artifacts, or another run with
-the same `eval_layout_mv.py` output format.
+fixed/improved/regressed side-by-side galleries from saved visual cases. It also
+writes a worst-case `failure_uids.txt` plus a `failures/` gallery ranked by low
+valid-token fraction, low IoU, and high bin error. Use `--baseline-run` to
+compare against CE, SV-layout artifacts, or another run with the same
+`eval_layout_mv.py` output format.
 
 Before accepting the evidence bundle, run the hard gate:
 
