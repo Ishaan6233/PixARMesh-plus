@@ -566,6 +566,119 @@ def _batched_obj_fps(pts_list, scores_list, geom_list, n_sample, device, out_dty
     return obj_t, geom_t
 
 
+def _adaptive_filter_cap(
+    pts: torch.Tensor,
+    conf: torch.Tensor | None,
+    n_voxels: int,
+    conf_threshold: float = 0.3,
+    max_in: int = 65536,
+) -> torch.Tensor:
+    """Confidence-filter + cap step of ``adaptive_fps_voxelize``, split out so the
+    expensive FPS step can be batched across samples by the caller (Opt 3; see
+    ``discover_instance_points_mv``'s pool/ctx voxel FPS batching). Behavior is
+    byte-identical to the single-item path of ``adaptive_fps_voxelize`` — only the
+    final ``fps_centroid_seeded`` call is deferred, not replaced.
+    """
+    if conf is None:
+        return _cap_points(pts, max_in)
+    keep = conf >= conf_threshold
+    pts_keep = pts[keep]
+    if pts_keep.shape[0] < max(n_voxels, 4):
+        pts_keep = pts  # fall back to all points if too few pass threshold
+    return _cap_points(pts_keep, max_in)
+
+
+def _batched_fps_fixed_k(pts_list: list, K: int, device, out_dtype) -> torch.Tensor:
+    """Batched farthest-point sampling to a FIXED ``K`` per item (Opt 3).
+
+    Replaces B serial per-item ``fps_centroid_seeded`` calls with one padded
+    pytorch3d ``sample_farthest_points(..., lengths=...)`` call, run only over
+    items whose length exceeds K ("dense"); shorter ("sparse") items are kept
+    whole in their original order and padded by repeating the last point —
+    matching ``fps_centroid_seeded``'s per-item semantics exactly. Restricting
+    the kernel to dense items avoids pytorch3d's documented uncatchable async
+    illegal-memory-access fault on sparse/near-degenerate items (see the
+    identical pattern and rationale in ``_batched_obj_fps``).
+
+    Args:
+        pts_list: B tensors of shape (M_b, 3), M_b >= 0.
+        K:        target sample count, identical for every item.
+    Returns:
+        (B, K, 3) tensor.
+    """
+    B = len(pts_list)
+    lengths = torch.tensor([max(1, p.shape[0]) for p in pts_list], device=device, dtype=torch.long)
+    Mmax = int(lengths.max())
+    padded = torch.zeros(B, Mmax, 3, device=device, dtype=torch.float32)
+    for b, p in enumerate(pts_list):
+        m = p.shape[0]
+        if m > 0:
+            padded[b, :m] = p.float()
+
+    K_eff = min(K, Mmax)
+    idx_pad = torch.arange(K_eff, device=device).unsqueeze(0).repeat(B, 1)
+    dense = [b for b in range(B) if lengths[b].item() > K_eff]
+    if dense:
+        dsel = torch.tensor(dense, device=device)
+        _, didx = sample_farthest_points(padded[dsel], lengths[dsel], K=K_eff, random_start_point=False)
+        idx_pad[dsel] = didx
+
+    def _pad_to(x):
+        if x.shape[0] >= K:
+            return x[:K]
+        return torch.cat([x, x[-1:].expand(K - x.shape[0], 3)], dim=0)
+
+    out = []
+    for b, p in enumerate(pts_list):
+        m = p.shape[0]
+        if m == 0:
+            out.append(torch.zeros(K, 3, device=device, dtype=out_dtype))
+            continue
+        sel = _pad_to(p[idx_pad[b].clamp(0, m - 1)])
+        out.append(sel.to(out_dtype))
+    return torch.stack(out, dim=0)
+
+
+def _batched_pool_fps(pts_list: list, K: int, device) -> list:
+    """Batched farthest-point sampling for pool downsampling to AT MOST K points/item.
+
+    Unlike ``_batched_fps_fixed_k``, output length varies per item: items with
+    ``len(pts_list[b]) <= K`` are returned UNCHANGED (no FPS, no padding) —
+    matching the current per-item ``pool_size_b = min(pool_size, M_b)`` target,
+    which by construction never exceeds the (post filter+cap) candidate count,
+    so ``fps_centroid_seeded``'s pad-with-last-point branch is never reachable
+    for pool and must not be reproduced here (padding would corrupt the
+    mask-consensus hit-counting that runs over ``pool_pts`` downstream, since it
+    would duplicate hit/miss votes for the repeated padding points). Items with
+    length > K get farthest-point-sampled to exactly K, batched in one
+    pytorch3d call over every "dense" item at once — every dense item's length
+    exceeds K=the kernel's own target by construction, which avoids pytorch3d's
+    documented async illegal-memory-access fault on sparse inputs (see
+    ``_batched_obj_fps``) without needing the dense/sparse split machinery that
+    ``_batched_fps_fixed_k`` needs for its padding case.
+
+    Args:
+        pts_list: B tensors of shape (M_b, 3), M_b >= 1.
+        K:        pool target (the raw ``pool_size`` config value).
+    Returns:
+        list of B tensors, each of shape (min(K, M_b), 3).
+    """
+    B = len(pts_list)
+    lengths = [p.shape[0] for p in pts_list]
+    dense = [b for b in range(B) if lengths[b] > K]
+    out = list(pts_list)
+    if dense:
+        Mmax = max(lengths[b] for b in dense)
+        padded = torch.zeros(len(dense), Mmax, 3, device=device, dtype=torch.float32)
+        dlengths = torch.tensor([lengths[b] for b in dense], device=device, dtype=torch.long)
+        for i, b in enumerate(dense):
+            padded[i, : lengths[b]] = pts_list[b].float()
+        _, idx = sample_farthest_points(padded, dlengths, K=K, random_start_point=False)
+        for i, b in enumerate(dense):
+            out[b] = pts_list[b][idx[i]].to(pts_list[b].dtype)
+    return out
+
+
 def _apply_scene_transform(pts: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
     """Apply a (B, 4, 4) affine transform to (B, N, 3) points.
 
@@ -882,16 +995,43 @@ def discover_instance_points_mv(
 
     # Opt 2: collect the per-item raw object clouds and FPS them all in ONE batched
     # pytorch3d call after the loop (instead of 16 serial per-item FPS calls).
-    obj_raw_list: list[torch.Tensor] = []       # (M_b, 3) candidate object points
-    obj_scores_list: list[torch.Tensor | None] = []  # (M_b,) score for seeding, or None
-    reg_geom_list: list[torch.Tensor | None] = []    # (M_b, 3) registered twin, or None
-    ctx_list: list[torch.Tensor] = []
-    target_ids_list: list[torch.Tensor] = []
-    diag_pool_hit_rate: list[float] = []
-    diag_n_obj_raw: list[int] = []
-    diag_pool_pts: list[torch.Tensor] = []
-    diag_pool_hit_strict: list[torch.Tensor] = []
-    diag_pool_hit_2d: list[torch.Tensor] = []
+    # Opt 3 note: obj_raw_list/obj_scores_list/reg_geom_list and the diag_* lists
+    # below are written from BOTH the degenerate early-exit case (pass 1) and the
+    # mask-consensus tail (pass 2, run only for non-early-exit items) — since the
+    # two passes no longer visit indices in a single interleaved b=0..B-1 order,
+    # these must be index-assigned (pre-allocated) rather than order-dependent
+    # `.append()`, or a batch item's data would land at the wrong batch index.
+    obj_raw_list: list[torch.Tensor | None] = [None] * B     # (M_b, 3) candidate object points
+    obj_scores_list: list[torch.Tensor | None] = [None] * B  # (M_b,) score for seeding, or None
+    reg_geom_list: list[torch.Tensor | None] = [None] * B    # (M_b, 3) registered twin, or None
+    target_ids_list: list[torch.Tensor] = []  # single-pass (pass 1 only) — append order is correct
+    diag_pool_hit_rate: list[float | None] = [None] * B
+    diag_n_obj_raw: list[int | None] = [None] * B
+    diag_pool_pts: list[torch.Tensor | None] = [None] * B
+    diag_pool_hit_strict: list[torch.Tensor | None] = [None] * B
+    diag_pool_hit_2d: list[torch.Tensor | None] = [None] * B
+
+    # Opt 3: pool voxels (2a) and ctx voxels (2b) each ran their own per-item FPS
+    # call inside this loop — up to 2*B serial pytorch3d launches, ~83%/17% of the
+    # measured per-step FPS cost respectively (the dominant training-time cost;
+    # object voxels were already fixed by Opt 2 above). Pass 1 below computes
+    # everything through pool-candidate construction and defers only the FPS
+    # itself; two batched calls resolve pool_pts/ctx_voxels_b for every item at
+    # once; Pass 2 runs the (unchanged) mask-consensus + fallback logic that
+    # consumes them. ctx_voxels_b has no other use in the loop (was only ever
+    # appended to ctx_list) so it defers cleanly; pool_pts is read-only after
+    # construction (indexed/sliced, never mutated) so deferring its FPS step
+    # doesn't change any of the mask-consensus logic that reads it in Pass 2.
+    skip_pass2: list[bool] = [False] * B    # True for the degenerate (no-scene-points) early exit
+    reg_active_list: list[bool] = [False] * B
+    reg_obj_geom_list: list[torch.Tensor | None] = [None] * B
+    reg_obj_scene_list: list[torch.Tensor | None] = [None] * B
+    reg_obj_conf_list: list[torch.Tensor | None] = [None] * B
+    pool_pts_resolved: list[torch.Tensor | None] = [None] * B
+    pool_pending_idx: list[int] = []
+    pool_pending_filtered: list[torch.Tensor] = []
+    ctx_resolved: list[torch.Tensor | None] = [None] * B
+    ctx_filtered_list: list[torch.Tensor] = [torch.zeros(0, 3, device=device)] * B
 
     for b in range(B):
         st_b = scene_transforms[b]           # (N, 4, 4)
@@ -918,17 +1058,20 @@ def discover_instance_points_mv(
                 conf_list.append(conf_n[valid].float())
 
         if len(pts_scene_list) == 0:
-            obj_raw_list.append(seed_pcs[b].float())   # FPS deferred to batched post-loop
-            obj_scores_list.append(None)
-            reg_geom_list.append(None)
-            ctx_list.append(fps_centroid_seeded(seed_pcs[b:b+1].float(), num_ctx_voxels).squeeze(0))
+            obj_raw_list[b] = seed_pcs[b].float()   # FPS deferred to batched post-loop
+            obj_scores_list[b] = None
+            reg_geom_list[b] = None
+            ctx_resolved[b] = (
+                fps_centroid_seeded(seed_pcs[b:b+1].float(), num_ctx_voxels).squeeze(0).to(out_dtype)
+            )
             target_ids_list.append(torch.full((N,), -1, dtype=torch.long, device=device))
-            diag_pool_hit_rate.append(0.0)
-            diag_n_obj_raw.append(0)
+            diag_pool_hit_rate[b] = 0.0
+            diag_n_obj_raw[b] = 0
             if return_pool_diagnostics:
-                diag_pool_pts.append(torch.empty(0, 3))
-                diag_pool_hit_strict.append(torch.empty(0, dtype=torch.bool))
-                diag_pool_hit_2d.append(torch.empty(0, dtype=torch.bool))
+                diag_pool_pts[b] = torch.empty(0, 3)
+                diag_pool_hit_strict[b] = torch.empty(0, dtype=torch.bool)
+                diag_pool_hit_2d[b] = torch.empty(0, dtype=torch.bool)
+            skip_pass2[b] = True
             continue
 
         all_pts  = torch.cat(pts_scene_list, dim=0)
@@ -1021,9 +1164,13 @@ def discover_instance_points_mv(
             # Diagnostics force the full path so eval_voxels/diagnose_pool_misses still work.
             reg_active = (reg_obj_scene is not None and reg_obj_scene.shape[0] > 0
                           and not return_diagnostics)
+            reg_active_list[b] = reg_active
+            reg_obj_geom_list[b] = reg_obj_geom
+            reg_obj_scene_list[b] = reg_obj_scene
+            reg_obj_conf_list[b] = reg_obj_conf
 
             if reg_active:
-                pool_pts = reg_obj_scene[:1]   # placeholder for the degenerate fallback only
+                pool_pts_resolved[b] = reg_obj_scene[:1]   # placeholder for the degenerate fallback only
             elif mask_pool_list:
                 raw_pts  = torch.cat(mask_pool_list, dim=0)
                 raw_conf = torch.cat(mask_conf_list, dim=0) if mask_conf_list else None
@@ -1033,29 +1180,58 @@ def discover_instance_points_mv(
                     raw_w    = torch.cat(mask_weight_list, dim=0)
                     raw_conf = (raw_conf * raw_w).clamp(max=1.0)
                 pool_size_b = min(pool_size, raw_pts.shape[0])
-                pool_pts = adaptive_fps_voxelize(
-                    raw_pts.unsqueeze(0),
-                    raw_conf.unsqueeze(0) if raw_conf is not None else None,
-                    pool_size_b, conf_threshold=conf_threshold,
-                ).squeeze(0)
+                # Opt 3: defer the FPS itself — collect the filtered/capped candidate
+                # cloud; one batched pytorch3d call resolves every pending item's
+                # pool_pts after the loop (see comment above the loop).
+                pool_pending_idx.append(b)
+                pool_pending_filtered.append(
+                    _adaptive_filter_cap(raw_pts, raw_conf, pool_size_b, conf_threshold)
+                )
             else:
                 # All target_ids_n == -1 (degenerate scene): fall back to seed-biased pool.
-                pool_pts = _seed_biased_pool(
+                pool_pts_resolved[b] = _seed_biased_pool(
                     all_pts, all_conf, seed_b, pool_size, conf_threshold, device
                 )
         else:
-            pool_pts = _seed_biased_pool(
+            pool_pts_resolved[b] = _seed_biased_pool(
                 all_pts, all_conf, seed_b, pool_size, conf_threshold, device
             )
 
         # --- 2b. Context voxels: directly from full cloud to num_ctx_voxels ---
         # Avoids the redundant pool→ctx re-downsampling; confidence property applies end-to-end.
-        ctx_voxels_b = adaptive_fps_voxelize(
-            all_pts.unsqueeze(0),
-            all_conf.unsqueeze(0) if all_conf is not None else None,
-            num_ctx_voxels,
-            conf_threshold=conf_threshold,
-        ).squeeze(0)   # (num_ctx_voxels, 3)
+        # Opt 3: defer the FPS itself — collect the filtered/capped candidate cloud;
+        # one batched pytorch3d call resolves every item's ctx_voxels after the loop.
+        ctx_filtered_list[b] = _adaptive_filter_cap(all_pts, all_conf, num_ctx_voxels, conf_threshold)
+
+    # Opt 3: resolve the deferred pool/ctx FPS in two batched calls (instead of up
+    # to 2*B serial per-item pytorch3d launches).
+    if pool_pending_idx:
+        pool_batched = _batched_pool_fps(pool_pending_filtered, pool_size, device)
+        for i, b in enumerate(pool_pending_idx):
+            pool_pts_resolved[b] = pool_batched[i]
+    ctx_pending_idx = [b for b in range(B) if not skip_pass2[b]]
+    if ctx_pending_idx:
+        ctx_batched = _batched_fps_fixed_k(
+            [ctx_filtered_list[b] for b in ctx_pending_idx], num_ctx_voxels, device, out_dtype
+        )
+        for i, b in enumerate(ctx_pending_idx):
+            ctx_resolved[b] = ctx_batched[i]
+
+    for b in range(B):
+        if skip_pass2[b]:
+            continue
+        pool_pts = pool_pts_resolved[b]
+        target_ids_n = target_ids_list[b]
+        reg_active = reg_active_list[b]
+        reg_obj_geom = reg_obj_geom_list[b]
+        reg_obj_scene = reg_obj_scene_list[b]
+        reg_obj_conf = reg_obj_conf_list[b]
+        st_b = scene_transforms[b]
+        K_b  = K_per_view[b]
+        vm_b = view_mask[b]
+        pm_b = panoptic_masks[b]
+        lp_z = local_points[b, :, :, :, 2]
+        seed_b = seed_pcs[b].float()
 
         # --- 4. Direct Grounded-SAM masking ---
         # A pool point is labelled as object if it matches the target mask in
@@ -1066,8 +1242,8 @@ def discover_instance_points_mv(
             # Opt 1: object cloud comes from registration (step 5); consensus is skipped.
             obj_pts    = torch.empty(0, 3, device=device)
             obj_scores = None
-            diag_pool_hit_rate.append(0.0)
-            diag_n_obj_raw.append(0)
+            diag_pool_hit_rate[b] = 0.0
+            diag_n_obj_raw[b] = 0
         elif n_valid_views > 0:
             pix_coords, pts_cam = _project_pts_to_views(pool_pts, st_b, K_b, H, W)
             P = pool_pts.shape[0]
@@ -1095,25 +1271,25 @@ def discover_instance_points_mv(
             is_obj = hit_count >= threshold
             obj_pts = pool_pts[is_obj]
             obj_scores = hit_count[is_obj].float() / n_valid_views  # (n_obj,) in [0,1]
-            diag_pool_hit_rate.append(is_obj.float().mean().item())
-            diag_n_obj_raw.append(int(is_obj.sum().item()))
+            diag_pool_hit_rate[b] = is_obj.float().mean().item()
+            diag_n_obj_raw[b] = int(is_obj.sum().item())
             if return_pool_diagnostics:
                 # Strict = at depth_rtol; 2D-only = at rtol=100 (no depth check)
                 hc_strict = _pool_mask(depth_rtol)
                 hc_2d     = _pool_mask(100.0)
-                diag_pool_pts.append(pool_pts.cpu())
-                diag_pool_hit_strict.append((hc_strict >= threshold).cpu())
-                diag_pool_hit_2d.append((hc_2d >= threshold).cpu())
+                diag_pool_pts[b] = pool_pts.cpu()
+                diag_pool_hit_strict[b] = (hc_strict >= threshold).cpu()
+                diag_pool_hit_2d[b] = (hc_2d >= threshold).cpu()
         else:
             obj_pts    = torch.empty(0, 3, device=device)
             obj_scores = torch.empty(0, device=device)
-            diag_pool_hit_rate.append(0.0)  # no valid target view
-            diag_n_obj_raw.append(0)
+            diag_pool_hit_rate[b] = 0.0  # no valid target view
+            diag_n_obj_raw[b] = 0
             if return_pool_diagnostics:
                 P_b = pool_pts.shape[0]
-                diag_pool_pts.append(pool_pts.cpu())
-                diag_pool_hit_strict.append(torch.zeros(P_b, dtype=torch.bool))
-                diag_pool_hit_2d.append(torch.zeros(P_b, dtype=torch.bool))
+                diag_pool_pts[b] = pool_pts.cpu()
+                diag_pool_hit_strict[b] = torch.zeros(P_b, dtype=torch.bool)
+                diag_pool_hit_2d[b] = torch.zeros(P_b, dtype=torch.bool)
 
         # --- 5. Fallback + FPS to fixed obj size ---
         # Fix A: when registration produced a merged object cloud, FPS on the SCENE-frame
@@ -1144,11 +1320,10 @@ def discover_instance_points_mv(
             reg_geom_for_gather = None
 
         # Opt 2: defer the FPS — collect the raw candidate cloud, its seeding score, and
-        # the registered geometry twin. The batched FPS runs once after the loop.
-        obj_raw_list.append(obj_pts)
-        obj_scores_list.append(obj_scores)
-        reg_geom_list.append(reg_geom_for_gather)
-        ctx_list.append(ctx_voxels_b)
+        # the registered geometry twin. The batched FPS runs once after both passes.
+        obj_raw_list[b] = obj_pts
+        obj_scores_list[b] = obj_scores
+        reg_geom_list[b] = reg_geom_for_gather
 
     # Opt 2: one batched score-seeded FPS over all items' object clouds (pytorch3d with
     # `lengths`) replaces the B serial per-item calls — the index-aligned registered twin
@@ -1157,7 +1332,7 @@ def discover_instance_points_mv(
         obj_raw_list, obj_scores_list, reg_geom_list, num_obj_voxels, device, out_dtype,
         sampling_mode=voxel_sampling,
     )
-    ctx_t = torch.stack(ctx_list, dim=0).to(out_dtype)
+    ctx_t = torch.stack(ctx_resolved, dim=0)
     target_ids_t = torch.stack(target_ids_list, dim=0) if return_target_ids else None  # (B, N) long
     if return_diagnostics:
         diag: dict = {"pool_hit_rate": diag_pool_hit_rate, "n_obj_pts_raw": diag_n_obj_raw}
