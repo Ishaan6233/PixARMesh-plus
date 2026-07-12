@@ -15,6 +15,41 @@ import torch.nn.functional as F
 from .pc_edgerunner.encoder import PointEmbed
 
 
+def _floating_module_dtype(module: nn.Module, fallback: torch.dtype = torch.float32) -> torch.dtype:
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    for buffer in module.buffers():
+        if buffer.is_floating_point():
+            return buffer.dtype
+    return fallback
+
+
+def _grid_sample_fp32(
+    input: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    mode: str,
+    padding_mode: str = "zeros",
+    align_corners: bool = False,
+) -> torch.Tensor:
+    """Run grid_sample in the fp32 geometry/sampling domain.
+
+    Cached/live DINO features may be fp16/bf16 while projection grids are fp32.
+    grid_sample requires matching dtypes and is autocast-sensitive, so normalize
+    both operands to fp32 at this boundary and let callers cast for learned layers.
+    """
+    device_type = input.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        return F.grid_sample(
+            input.to(dtype=torch.float32),
+            grid.to(device=input.device, dtype=torch.float32),
+            mode=mode,
+            padding_mode=padding_mode,
+            align_corners=align_corners,
+        )
+
+
 def _project_to_views(
     voxels_scene: torch.Tensor,
     scene_transforms: torch.Tensor,
@@ -35,25 +70,30 @@ def _project_to_views(
         voxels_cam: (B, V, N, 3) camera-frame voxels.
     """
     B, V, _ = voxels_scene.shape
-    st_inv = torch.linalg.inv(scene_transforms.float())
-    voxels_h = torch.cat(
-        [voxels_scene.float(), torch.ones(B, V, 1, device=voxels_scene.device)],
-        dim=-1,
-    )
-    voxels_cam_h = voxels_h.unsqueeze(1) @ st_inv.permute(0, 1, 3, 2)
-    voxels_cam = voxels_cam_h[..., :3].permute(0, 2, 1, 3)
+    with torch.autocast(device_type=voxels_scene.device.type, enabled=False):
+        st_inv = torch.linalg.inv(scene_transforms.to(dtype=torch.float32))
+        voxels_h = torch.cat(
+            [
+                voxels_scene.to(dtype=torch.float32),
+                torch.ones(B, V, 1, device=voxels_scene.device, dtype=torch.float32),
+            ],
+            dim=-1,
+        )
+        voxels_cam_h = voxels_h.unsqueeze(1) @ st_inv.permute(0, 1, 3, 2)
+        voxels_cam = voxels_cam_h[..., :3].permute(0, 2, 1, 3)
 
-    vc_nv = voxels_cam.permute(0, 2, 1, 3)
-    projected = (
-        vc_nv.unsqueeze(-2) @ K_per_view.float().unsqueeze(2).transpose(-1, -2)
-    ).squeeze(-2)
-    z = projected[..., 2].clamp(min=1e-6)
-    u = projected[..., 0] / z
-    v = projected[..., 1] / z
+        vc_nv = voxels_cam.permute(0, 2, 1, 3)
+        projected = (
+            vc_nv.unsqueeze(-2)
+            @ K_per_view.to(dtype=torch.float32).unsqueeze(2).transpose(-1, -2)
+        ).squeeze(-2)
+        z = projected[..., 2].clamp(min=1e-6)
+        u = projected[..., 0] / z
+        v = projected[..., 1] / z
 
-    u_norm = (u + 0.5) / W * 2.0 - 1.0
-    v_norm = (v + 0.5) / H * 2.0 - 1.0
-    pix_coords = torch.stack([u_norm, v_norm], dim=-1).permute(0, 2, 1, 3)
+        u_norm = (u + 0.5) / W * 2.0 - 1.0
+        v_norm = (v + 0.5) / H * 2.0 - 1.0
+        pix_coords = torch.stack([u_norm, v_norm], dim=-1).permute(0, 2, 1, 3)
     return pix_coords, voxels_cam
 
 
@@ -74,7 +114,7 @@ def _sample_features(
     V = pix_coords.shape[1]
     feats_flat = img_feats.reshape(B * N, C, Hf, Wf)
     coords_flat = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
-    sampled = F.grid_sample(
+    sampled = _grid_sample_fp32(
         feats_flat,
         coords_flat,
         mode="bilinear",
@@ -109,8 +149,8 @@ def _compute_visibility_mask(
 
     if panoptic_masks is not None and target_ids is not None:
         Hp, Wp = panoptic_masks.shape[-2:]
-        masks_flat = panoptic_masks.float().reshape(B * N, 1, Hp, Wp)
-        ids = F.grid_sample(
+        masks_flat = panoptic_masks.reshape(B * N, 1, Hp, Wp)
+        ids = _grid_sample_fp32(
             masks_flat,
             coords_flat,
             mode="nearest",
@@ -121,8 +161,8 @@ def _compute_visibility_mask(
         target = target_ids[:, None, :].expand(B, V, N)
         return z_ok & (ids == target) & (target > 0) & vm
 
-    depth_flat = geo_depth.float().reshape(B * N, 1, H, W)
-    sampled_depth = F.grid_sample(
+    depth_flat = geo_depth.reshape(B * N, 1, H, W)
+    sampled_depth = _grid_sample_fp32(
         depth_flat,
         coords_flat,
         mode="bilinear",
@@ -221,8 +261,8 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
         conf_vox = None
         if conf is not None:
             coords_flat = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
-            conf_map = conf.float().reshape(B * N, 1, H_full, W_full)
-            conf_vox = F.grid_sample(
+            conf_map = conf.reshape(B * N, 1, H_full, W_full)
+            conf_vox = _grid_sample_fp32(
                 conf_map,
                 coords_flat,
                 mode="bilinear",
@@ -231,14 +271,15 @@ class MultiViewVoxelAlignedEncoder(nn.Module):
             )
             conf_vox = conf_vox.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1)
 
-        per_view_feats = _sample_features(dino_feats, pix_coords).to(voxels.dtype)
+        per_view_feats = _sample_features(dino_feats, pix_coords)
 
         fused = _ibr_fusion(per_view_feats.float(), vis_mask, weights=conf_vox)
-        voxel_feats = self.fusion_proj(fused.to(next(self.fusion_proj.parameters()).dtype))
+        learned_dtype = _floating_module_dtype(self.fusion_proj)
+        voxel_feats = self.fusion_proj(fused.to(dtype=learned_dtype))
 
         if self.point_embed is not None:
             pe_in = geom_voxels if geom_voxels is not None else voxels
-            voxel_feats = voxel_feats + self.point_embed(pe_in.to(voxel_feats.dtype))
+            voxel_feats = voxel_feats + self.point_embed(pe_in.to(dtype=voxel_feats.dtype))
 
         return voxel_feats
 

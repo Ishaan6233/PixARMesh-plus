@@ -112,6 +112,14 @@ class ModelConfig:
     with_ctx_pc: bool = False
     img_cond_drop_prob: float = 0.0
     loss_layout_scale: Optional[float] = None
+    # Experimental MV stage-1 layout supervision. Defaults keep the current CE-only
+    # objective unchanged unless an experiment config opts in.
+    loss_layout_ordinal_sigma: Optional[float] = None
+    loss_layout_ordinal_weight: float = 0.0
+    loss_layout_coord_weight: float = 0.0
+    loss_layout_center_weight: float = 0.0
+    loss_layout_size_weight: float = 0.0
+    loss_layout_geometry_tokens: int = 24
     # DA3: frozen any-view image→3D backbone for MV geometry.
     use_da3: bool = False
     da3_ckpt_path: str = "checkpoints/da3/DA3-GIANT"

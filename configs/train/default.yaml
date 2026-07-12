@@ -19,7 +19,7 @@ train_args:
   lr_scheduler_type: warmup_stable_decay
   lr_scheduler_kwargs:
     num_stable_steps: 0
-    num_decay_steps: 9500
+    num_decay_steps: ${sub:${train.train_args.max_steps}, ${train.train_args.warmup_steps}}
     min_lr_ratio: 0.1
   warmup_steps: 500
   save_steps: 1000

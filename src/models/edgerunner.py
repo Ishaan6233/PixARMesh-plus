@@ -13,6 +13,8 @@ from .discovery import get_discovery_fn
 from .mv_voxel_encoder import (
     MultiViewVoxelAlignedEncoder,
     _compute_visibility_mask,
+    _floating_module_dtype,
+    _grid_sample_fp32,
     _project_to_views,
     _sample_features,
 )
@@ -45,7 +47,15 @@ class ShapeOPTConfig(OPTConfig):
         pc_token_id=-48,
         with_ctx_pc=False,
         img_cond_drop_prob=0.0,
+        num_pos_tokens: int = 0,
+        pos_token_offset: int = 0,
         loss_layout_scale: Optional[float] = None,
+        loss_layout_ordinal_sigma: Optional[float] = None,
+        loss_layout_ordinal_weight: float = 0.0,
+        loss_layout_coord_weight: float = 0.0,
+        loss_layout_center_weight: float = 0.0,
+        loss_layout_size_weight: float = 0.0,
+        loss_layout_geometry_tokens: int = 24,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -55,7 +65,15 @@ class ShapeOPTConfig(OPTConfig):
         self.with_ctx_pc = with_ctx_pc
         self.tie_word_embeddings = False
         self.img_cond_drop_prob = img_cond_drop_prob
+        self.num_pos_tokens = num_pos_tokens
+        self.pos_token_offset = pos_token_offset
         self.loss_layout_scale = loss_layout_scale
+        self.loss_layout_ordinal_sigma = loss_layout_ordinal_sigma
+        self.loss_layout_ordinal_weight = loss_layout_ordinal_weight
+        self.loss_layout_coord_weight = loss_layout_coord_weight
+        self.loss_layout_center_weight = loss_layout_center_weight
+        self.loss_layout_size_weight = loss_layout_size_weight
+        self.loss_layout_geometry_tokens = loss_layout_geometry_tokens
 
 
 class ShapeOPTDecoder(OPTDecoder):
@@ -284,8 +302,8 @@ class ShapeOPT(OPTForCausalLM):
         if conf is not None:
             N = pix_coords.shape[2]
             coords_flat = pix_coords.permute(0, 2, 1, 3).reshape(B * N, V, 1, 2)
-            conf_map = conf.float().reshape(B * N, 1, H_full, W_full)
-            conf_vox = F.grid_sample(
+            conf_map = conf.reshape(B * N, 1, H_full, W_full)
+            conf_vox = _grid_sample_fp32(
                 conf_map,
                 coords_flat,
                 mode="bilinear",
@@ -314,6 +332,7 @@ class ShapeOPT(OPTForCausalLM):
         obj_canon_transform=None,
         gt_obj_vertices=None,
         ref_view=None,
+        return_diagnostics: bool = False,
     ):
         """Build multi-view conditioning embeddings and scatter them into pc_token slots."""
         B, N, C, H, W = pixel_values.shape
@@ -322,18 +341,24 @@ class ShapeOPT(OPTForCausalLM):
             view_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
         if cached_local_points is not None:
-            local_points = cached_local_points.to(device)
-            geo_out = {"conf": cached_conf.to(device) if cached_conf is not None else None}
+            local_points = cached_local_points.to(device=device, dtype=torch.float32)
+            geo_out = {
+                "conf": (
+                    cached_conf.to(device=device, dtype=torch.float32)
+                    if cached_conf is not None
+                    else None
+                )
+            }
         else:
             if self.geo_encoder is None:
                 raise RuntimeError("Multi-view path requires a frozen geo_encoder or cached_local_points")
             geo_out = self.geo_encoder.forward_all_views_joint(pixel_values)
-            local_points = geo_out["local_points"]
+            local_points = geo_out["local_points"].to(device=device, dtype=torch.float32)
         geo_depth = local_points[..., 2]
         st = scene_transforms.to(device, dtype=torch.float32)
-        K_f = K_per_view.float().to(device)
+        K_f = K_per_view.to(device=device, dtype=torch.float32)
         if geo_out.get("conf") is not None:
-            geo_out["conf"] = geo_out["conf"].to(device)
+            geo_out["conf"] = geo_out["conf"].to(device=device, dtype=torch.float32)
 
         view_gate = float(getattr(self.config, "mv_view_conf_gate", 0.0) or 0.0)
         if view_gate > 0.0 and geo_out.get("conf") is not None:
@@ -434,29 +459,32 @@ class ShapeOPT(OPTForCausalLM):
                 )
             ctx_voxels = torch.stack(ctx_list, dim=0)
 
-        obj_voxels = obj_voxels.to(local_points.dtype)
-        ctx_voxels = ctx_voxels.to(local_points.dtype)
+        obj_voxels = obj_voxels.to(device=device, dtype=torch.float32)
+        ctx_voxels = ctx_voxels.to(device=device, dtype=torch.float32)
 
         obj_geom_voxels = None
         if obj_canon_transform is not None:
             src_voxels = obj_voxels_geom if obj_voxels_geom is not None else obj_voxels
-            R = obj_canon_transform[:, :3, :3].to(device=src_voxels.device, dtype=src_voxels.dtype)
-            v = torch.bmm(src_voxels, R.transpose(1, 2))
-            q = float(getattr(self.config, "mv_geom_norm_quantile", 0.0) or 0.0)
-            if q > 0.0:
-                qs = torch.tensor([q, 1.0 - q], device=v.device, dtype=torch.float32)
-                bounds = torch.quantile(v.float(), qs, dim=1)
-                vmin = bounds[0].unsqueeze(1).to(v.dtype)
-                vmax = bounds[1].unsqueeze(1).to(v.dtype)
-            else:
-                vmin = v.amin(dim=1, keepdim=True)
-                vmax = v.amax(dim=1, keepdim=True)
-            center = 0.5 * (vmin + vmax)
-            scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
-            obj_geom_voxels = (v - center) * scale
+            with torch.autocast(device_type=src_voxels.device.type, enabled=False):
+                R = obj_canon_transform[:, :3, :3].to(
+                    device=src_voxels.device, dtype=torch.float32
+                )
+                v = torch.bmm(src_voxels.to(dtype=torch.float32), R.transpose(1, 2))
+                q = float(getattr(self.config, "mv_geom_norm_quantile", 0.0) or 0.0)
+                if q > 0.0:
+                    qs = torch.tensor([q, 1.0 - q], device=v.device, dtype=torch.float32)
+                    bounds = torch.quantile(v, qs, dim=1)
+                    vmin = bounds[0].unsqueeze(1)
+                    vmax = bounds[1].unsqueeze(1)
+                else:
+                    vmin = v.amin(dim=1, keepdim=True)
+                    vmax = v.amax(dim=1, keepdim=True)
+                center = 0.5 * (vmin + vmax)
+                scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
+                obj_geom_voxels = (v - center) * scale
 
         if getattr(self.config, "mv_obj_pc_oracle", False) and gt_obj_vertices is not None:
-            obj_geom_voxels = gt_obj_vertices.to(device=obj_voxels.device, dtype=obj_voxels.dtype)
+            obj_geom_voxels = gt_obj_vertices.to(device=obj_voxels.device, dtype=torch.float32)
 
         mv_conf = geo_out["conf"][..., 0] if geo_out.get("conf") is not None else None
         need_dino = getattr(self.config, "mv_obj_pc_appearance", False) or (
@@ -491,8 +519,16 @@ class ShapeOPT(OPTForCausalLM):
                     mv_target_ids,
                     mv_conf,
                 )
-            obj_pc_conds = self.cond_encoder(obj_geom_voxels, extra_feat=obj_pc_extra_feat)
-            obj_pc_embeds = self.projector(obj_pc_conds)
+            cond_dtype = _floating_module_dtype(self.cond_encoder, obj_geom_voxels.dtype)
+            obj_pc_extra_feat = (
+                obj_pc_extra_feat.to(dtype=cond_dtype) if obj_pc_extra_feat is not None else None
+            )
+            obj_pc_conds = self.cond_encoder(
+                obj_geom_voxels.to(dtype=cond_dtype),
+                extra_feat=obj_pc_extra_feat,
+            )
+            projector_dtype = _floating_module_dtype(self.projector, obj_pc_conds.dtype)
+            obj_pc_embeds = self.projector(obj_pc_conds.to(dtype=projector_dtype))
 
         obj_view_mask = None
         if mv_target_ids is not None and panoptic_masks is not None:
@@ -539,16 +575,34 @@ class ShapeOPT(OPTForCausalLM):
         if z_i is not None:
             cond_parts.append(z_i.to(inputs_embeds.dtype))
             cond_parts.append(z_scene.to(inputs_embeds.dtype))
+        aabb = None
         if self.mv_aabb_embed is not None:
             aabb = torch.cat([obj_voxels.amin(dim=1), obj_voxels.amax(dim=1)], dim=-1)
-            cond_parts.append(self.mv_aabb_embed(aabb.to(inputs_embeds.dtype)).unsqueeze(1))
+            aabb_dtype = _floating_module_dtype(self.mv_aabb_embed, inputs_embeds.dtype)
+            cond_parts.append(self.mv_aabb_embed(aabb.to(dtype=aabb_dtype)).unsqueeze(1))
         cond_parts.append(num_face_embeds.to(inputs_embeds.dtype))
         all_cond = torch.cat(cond_parts, dim=1).flatten(0, 1)
         assert all_cond.shape[0] == int(cond_token_mask.sum()), (
             f"MV cond token count {all_cond.shape[0]} != pc_token slots "
             f"{int(cond_token_mask.sum())}; prefix_len must equal mv_prefix_len(config)."
         )
-        return inputs_embeds.masked_scatter(cond_token_mask.unsqueeze(-1), all_cond)
+        inputs_embeds = inputs_embeds.masked_scatter(cond_token_mask.unsqueeze(-1), all_cond)
+        if return_diagnostics:
+            diagnostics = {
+                "obj_voxels": obj_voxels.detach(),
+                "ctx_voxels": ctx_voxels.detach(),
+                "obj_geom_voxels": obj_geom_voxels.detach() if obj_geom_voxels is not None else None,
+                "seed_pcs": seed_pcs.detach() if "seed_pcs" in locals() else None,
+                "seed_pcs_2d": cond_pcs_2d.detach() if cond_pcs_2d is not None else None,
+                "view_mask": view_mask.detach(),
+                "obj_view_mask": obj_view_mask.detach() if obj_view_mask is not None else None,
+                "ref_view": ref_idx.detach() if "ref_idx" in locals() else None,
+                "obj_aabb": aabb.detach() if aabb is not None else None,
+                "mv_target_ids": mv_target_ids.detach() if mv_target_ids is not None else None,
+                "view_conf_mean": mv_conf.float().mean(dim=(-1, -2)).detach() if mv_conf is not None else None,
+            }
+            return inputs_embeds, diagnostics
+        return inputs_embeds
 
     def _forward_multiview(
         self,
@@ -621,15 +675,37 @@ class ShapeOPT(OPTForCausalLM):
         logits = self.lm_head(outputs[0]).contiguous()
 
         loss = loss_layout = loss_object = None
+        layout_components = {}
         if labels is not None:
             labels = labels.to(logits.device)
-            loss, loss_layout, loss_object = self.loss_function(
+            loss, loss_layout, loss_object, layout_components = self.loss_function(
                 logits,
                 labels,
                 vocab_size=self.config.vocab_size,
                 loss_layout_scale=self.config.loss_layout_scale,
                 token_type_ids=token_type_ids,
                 num_items_in_batch=num_items_in_batch,
+                pos_token_offset=getattr(self.config, "pos_token_offset", 0),
+                num_pos_tokens=getattr(self.config, "num_pos_tokens", 0),
+                loss_layout_ordinal_sigma=getattr(
+                    self.config, "loss_layout_ordinal_sigma", None
+                ),
+                loss_layout_ordinal_weight=getattr(
+                    self.config, "loss_layout_ordinal_weight", 0.0
+                ),
+                loss_layout_coord_weight=getattr(
+                    self.config, "loss_layout_coord_weight", 0.0
+                ),
+                loss_layout_center_weight=getattr(
+                    self.config, "loss_layout_center_weight", 0.0
+                ),
+                loss_layout_size_weight=getattr(
+                    self.config, "loss_layout_size_weight", 0.0
+                ),
+                loss_layout_geometry_tokens=getattr(
+                    self.config, "loss_layout_geometry_tokens", 24
+                ),
+                return_layout_components=True,
                 **decoder_kwargs,
             )
 
@@ -637,6 +713,11 @@ class ShapeOPT(OPTForCausalLM):
             loss=loss,
             loss_layout=loss_layout,
             loss_object=loss_object,
+            loss_layout_token=layout_components.get("loss_layout_token"),
+            loss_layout_ordinal=layout_components.get("loss_layout_ordinal"),
+            loss_layout_coord=layout_components.get("loss_layout_coord"),
+            loss_layout_center=layout_components.get("loss_layout_center"),
+            loss_layout_size=layout_components.get("loss_layout_size"),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -748,6 +829,8 @@ class ShapeOPT(OPTForCausalLM):
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
+        token_type_ids = kwargs.pop("token_type_ids", None)
+        num_items_in_batch = kwargs.pop("num_items_in_batch", None)
 
         if self.cond_encoder is not None and cond_pcs is not None:
             inputs_embeds = self.get_inputs_with_cond(
@@ -783,13 +866,37 @@ class ShapeOPT(OPTForCausalLM):
         logits = self.lm_head(outputs[0]).contiguous()
 
         loss = loss_layout = loss_object = None
+        layout_components = {}
         if labels is not None:
             labels = labels.to(logits.device)
-            loss, loss_layout, loss_object = self.loss_function(
+            loss, loss_layout, loss_object, layout_components = self.loss_function(
                 logits,
                 labels,
                 vocab_size=self.config.vocab_size,
                 loss_layout_scale=self.config.loss_layout_scale,
+                token_type_ids=token_type_ids,
+                num_items_in_batch=num_items_in_batch,
+                pos_token_offset=getattr(self.config, "pos_token_offset", 0),
+                num_pos_tokens=getattr(self.config, "num_pos_tokens", 0),
+                loss_layout_ordinal_sigma=getattr(
+                    self.config, "loss_layout_ordinal_sigma", None
+                ),
+                loss_layout_ordinal_weight=getattr(
+                    self.config, "loss_layout_ordinal_weight", 0.0
+                ),
+                loss_layout_coord_weight=getattr(
+                    self.config, "loss_layout_coord_weight", 0.0
+                ),
+                loss_layout_center_weight=getattr(
+                    self.config, "loss_layout_center_weight", 0.0
+                ),
+                loss_layout_size_weight=getattr(
+                    self.config, "loss_layout_size_weight", 0.0
+                ),
+                loss_layout_geometry_tokens=getattr(
+                    self.config, "loss_layout_geometry_tokens", 24
+                ),
+                return_layout_components=True,
                 **kwargs,
             )
 
@@ -797,6 +904,11 @@ class ShapeOPT(OPTForCausalLM):
             loss=loss,
             loss_layout=loss_layout,
             loss_object=loss_object,
+            loss_layout_token=layout_components.get("loss_layout_token"),
+            loss_layout_ordinal=layout_components.get("loss_layout_ordinal"),
+            loss_layout_coord=layout_components.get("loss_layout_coord"),
+            loss_layout_center=layout_components.get("loss_layout_center"),
+            loss_layout_size=layout_components.get("loss_layout_size"),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,

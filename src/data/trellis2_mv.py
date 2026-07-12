@@ -47,6 +47,7 @@ MV_FEATURE_CACHE_KEYS = (
     "view_mask",
     "ref_view",
 )
+MV_FEATURE_CACHE_EMPTY_MARKER_KEY = "empty_marker"
 _CAM_YUP_TO_OPENCV_4 = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
 _CAM_YUP_TO_OPENCV_3 = np.diag(np.array([-1, -1, 1], dtype=np.float32))
 
@@ -424,6 +425,7 @@ class Trellis2MVDataset(Dataset):
             self._pan_key = "panoptic_mask"
         self._hf_has_panoptic = self._pan_key is not None
         self._cached_img_chw: tuple[int, int, int] | None = None
+        self._empty_feat_shapes: dict[str, tuple[int, ...]] | None = None
 
     def __len__(self) -> int:
         return len(self.instances)
@@ -468,7 +470,15 @@ class Trellis2MVDataset(Dataset):
             if view_indices.ndim != 1 or view_mask.shape != view_indices.shape:
                 raise ValueError(f"{path} has invalid view_indices/view_mask shapes.")
             if len(view_indices) == 0 or not bool(view_mask.any()):
-                raise ValueError(f"{path} contains no valid cached views.")
+                reason = "runtime-rejected MV feature-cache marker"
+                if "empty_reason" in z.files:
+                    reason = str(np.asarray(z["empty_reason"]).item())
+                return {
+                    "empty_marker": True,
+                    "empty_reason": reason,
+                    "view_indices": np.array(view_indices, copy=True),
+                    "view_mask": np.array(view_mask, copy=True),
+                }
             if int(view_indices.max(initial=0)) >= int(n_avail) or int(view_indices.min(initial=0)) < 0:
                 raise ValueError(
                     f"{path} references HF view indices outside the available range [0, {n_avail})."
@@ -483,6 +493,8 @@ class Trellis2MVDataset(Dataset):
             ref_view = int(np.asarray(z["ref_view"]).item())
             if ref_view < 0 or ref_view >= len(view_indices):
                 raise ValueError(f"{path} has invalid ref_view={ref_view}.")
+            if not bool(view_mask[ref_view]):
+                raise ValueError(f"{path} has ref_view={ref_view} but view_mask[ref_view] is false.")
             return {
                 "cached_local_points": np.array(local_points, copy=True),
                 "cached_conf": np.array(conf, copy=True),
@@ -564,6 +576,13 @@ class Trellis2MVDataset(Dataset):
         if n_avail < 2:
             return self._make_empty(uid, vertices, faces, f"single-view HF row (n_views={n_avail})")
         cached_features = self._load_feature_cache(uid, n_avail)
+        if cached_features is not None and cached_features.get("empty_marker"):
+            return self._make_empty(
+                uid,
+                vertices,
+                faces,
+                str(cached_features.get("empty_reason") or "runtime-rejected MV feature-cache marker"),
+            )
 
         T_norm_to_world = None
         if getattr(data_cfg, "mv_frame_correction", False):
@@ -786,6 +805,46 @@ class Trellis2MVDataset(Dataset):
             ret["panoptic_masks"] = pan_stack
         return ret
 
+    def _empty_cached_features(self) -> dict[str, np.ndarray]:
+        """All-zero cached features shaped like the real cache, for runtime-empty examples.
+
+        In cache mode there is no live geo_encoder fallback and the collator only
+        forwards cached_* keys when every example in the batch carries them, so empty
+        examples must ship zero features (their all-false view_mask already excludes
+        every view from fusion). Shapes are read once from the first non-marker cache
+        file; markers store degenerate (n,1,1,*) placeholders and cannot be templates.
+        """
+        if getattr(self, "_empty_feat_shapes", None) is None:
+            for path in sorted(self.feature_cache.glob("*.npz")):
+                with np.load(path) as z:
+                    is_marker = MV_FEATURE_CACHE_EMPTY_MARKER_KEY in z.files and bool(
+                        np.asarray(z[MV_FEATURE_CACHE_EMPTY_MARKER_KEY])
+                    )
+                    if is_marker or not bool(np.asarray(z["view_mask"]).any()):
+                        continue
+                    self._empty_feat_shapes = {
+                        "cached_local_points": tuple(z["local_points"].shape),
+                        "cached_conf": tuple(z["conf"].shape),
+                        "cached_dino_feats": tuple(z["dino_feats"].shape),
+                    }
+                break
+            if getattr(self, "_empty_feat_shapes", None) is None:
+                raise RuntimeError(
+                    f"mv_feature_cache={self.feature_cache} has no non-marker entries; "
+                    "cannot derive cached feature shapes for empty examples."
+                )
+        n = int(getattr(self.data_cfg, "num_views", 8) or 8)
+        n_tpl = self._empty_feat_shapes["cached_local_points"][0]
+        if n_tpl != n:
+            raise RuntimeError(
+                f"mv_feature_cache view slots ({n_tpl}) disagree with num_views ({n}); "
+                "rebuild the cache for the current view selection."
+            )
+        return {
+            key: np.zeros(shape, dtype=np.float16)
+            for key, shape in self._empty_feat_shapes.items()
+        }
+
     def _make_empty(self, uid: str, vertices, faces, reason: str | None = None) -> dict:
         warnings.warn(
             f"[Trellis2MVDataset] {reason or 'unconditionable item'} for uid={uid!r}; "
@@ -809,7 +868,14 @@ class Trellis2MVDataset(Dataset):
             "obj_canon_transform": np.eye(4, dtype=np.float32),
             "view_indices": np.zeros(n, dtype=np.int64),
         }
-        if self.data_cfg.load_images and self.image_preprocessor is not None:
+        if self.feature_cache is not None:
+            feats = self._empty_cached_features()
+            h, w = feats["cached_local_points"].shape[1:3]
+            ret["pixel_values"] = torch.zeros((n, 3, h, w), dtype=torch.float32)
+            ret.update(feats)
+            if self._hf_has_panoptic:
+                ret["panoptic_masks"] = np.zeros((n, h, w), dtype=np.int32)
+        elif self.data_cfg.load_images and self.image_preprocessor is not None:
             if self._cached_img_chw is not None:
                 c, h, w = self._cached_img_chw
             else:

@@ -56,12 +56,19 @@ echo "[train_mv] Stage 2 config: ${STAGE2_CFG}"
 echo "[train_mv] GPUs: ${GPUS}  processes: ${NP}"
 echo "[train_mv] ══════════════════════════════════════════════"
 
+accelerate_launch() {
+    CUDA_VISIBLE_DEVICES="${GPUS}" $PYTHON -m accelerate.commands.launch \
+        --num_processes "${NP}" \
+        --gpu_ids "${GPUS}" \
+        "$@"
+}
+
 if $PRECOMPUTE_CACHE; then
     echo "[train_mv] ── Precomputing DA3+DINO MV feature cache ──"
     echo "[train_mv] Cache dir: ${MV_FEATURE_CACHE}"
     for SPLIT in train val; do
         export RUN_TS="precompute-${SPLIT}-$(date +%Y%m%d-%H%M%S)"
-        CUDA_VISIBLE_DEVICES="${GPUS}" $PYTHON launch.py --num_processes "${NP}" \
+        accelerate_launch \
             --module scripts.data.precompute_mv_features \
             --config-name="${STAGE1_CFG}" \
             --split="${SPLIT}" \
@@ -83,7 +90,7 @@ elif [[ -n "$S1_CKPT" ]] && [[ "$FORCE_STAGE1" == "false" ]]; then
 else
     echo "[train_mv] ── Stage 1: layout-only DA3 MV training ──"
     export RUN_TS=$(date +%Y%m%d-%H%M%S)
-    CUDA_VISIBLE_DEVICES="${GPUS}" $PYTHON launch.py --num_processes "${NP}" train.py \
+    accelerate_launch train.py \
         --config-name="${STAGE1_CFG}" \
         "${COMMON_OVERRIDES[@]}"
     S1_CKPT=$(ls -td "${S1_PREFIX}"/*/checkpoints/final 2>/dev/null | head -1 || true)
@@ -101,7 +108,7 @@ fi
 echo "[train_mv] ── Stage 2: full mesh DA3 MV training ──"
 echo "[train_mv] Stage 1 checkpoint: $S1_CKPT"
 export RUN_TS=$(date +%Y%m%d-%H%M%S)
-CUDA_VISIBLE_DEVICES="${GPUS}" $PYTHON launch.py --num_processes "${NP}" train.py \
+accelerate_launch train.py \
     --config-name="${STAGE2_CFG}" \
     "model.local_path=${S1_CKPT}" \
     "${COMMON_OVERRIDES[@]}"

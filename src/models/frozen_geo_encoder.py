@@ -52,8 +52,7 @@ def build_geo_encoder(model_cfg) -> "FrozenGeoEncoder | None":
         raise ValueError(
             f"Unknown geo_encoder_type {enc_type!r}. Available: {available}"
         )
-    enc = _GEO_ENCODER_REGISTRY[enc_type].from_model_cfg(model_cfg)
-    return enc.to(torch.bfloat16)
+    return _GEO_ENCODER_REGISTRY[enc_type].from_model_cfg(model_cfg)
 
 
 # ---------------------------------------------------------------------------

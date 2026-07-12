@@ -34,6 +34,7 @@ from transformers import AutoImageProcessor
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.trellis2_mv import (
+    MV_FEATURE_CACHE_EMPTY_MARKER_KEY,
     MV_FEATURE_CACHE_KEYS,
     MV_FEATURE_CACHE_VERSION,
     Trellis2MVDataset,
@@ -112,6 +113,33 @@ def _cache_is_current(path: Path) -> bool:
         return False
 
 
+def _write_empty_cache_marker(path: Path, ex: dict, data_cfg: DataConfig, reason: str) -> None:
+    """Write a cache marker for items the runtime loader already deems empty."""
+    view_mask_raw = np.asarray(ex.get("view_mask", []), dtype=bool).reshape(-1)
+    view_indices_raw = np.asarray(ex.get("view_indices", []), dtype=np.int64).reshape(-1)
+    n_slots = len(view_mask_raw) or len(view_indices_raw) or int(getattr(data_cfg, "num_views", 8) or 8)
+    if len(view_indices_raw) == n_slots:
+        view_indices = view_indices_raw
+    else:
+        view_indices = np.zeros(n_slots, dtype=np.int64)
+    view_mask = np.zeros(n_slots, dtype=bool)
+    ref_view = np.asarray(0, dtype=np.int64)
+    np.savez_compressed(
+        path,
+        cache_version=np.asarray(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
+        local_points=np.zeros((n_slots, 1, 1, 3), dtype=np.float16),
+        conf=np.zeros((n_slots, 1, 1, 1), dtype=np.float16),
+        dino_feats=np.zeros((n_slots, 1, 1, 1), dtype=np.float16),
+        view_indices=view_indices,
+        view_mask=view_mask,
+        ref_view=ref_view,
+        **{
+            MV_FEATURE_CACHE_EMPTY_MARKER_KEY: np.asarray(True),
+            "empty_reason": np.asarray(reason),
+        },
+    )
+
+
 def main():
     args = parse_args()
     state = PartialState()
@@ -147,7 +175,7 @@ def main():
     da3 = get_da3_encoder(model_cfg).to(device).eval()
     dino = get_image_condition_encoder(model_cfg).to(device).eval()
 
-    wrote = skipped = invalid = 0
+    wrote = markers = skipped = invalid = 0
     with torch.no_grad():
         for idx in tqdm(shard, position=state.process_index, dynamic_ncols=True):
             ex = dataset[idx]
@@ -157,6 +185,13 @@ def main():
                 skipped += 1
                 continue
             if "pixel_values" not in ex or not bool(np.asarray(ex.get("view_mask", [])).any()):
+                _write_empty_cache_marker(
+                    out_path,
+                    ex,
+                    data_cfg,
+                    "runtime loader returned an empty MV conditioning example during precompute",
+                )
+                markers += 1
                 invalid += 1
                 continue
 
@@ -193,7 +228,7 @@ def main():
             wrote += 1
 
     print(
-        f"[rank {state.process_index}] wrote={wrote} skipped={skipped} "
+        f"[rank {state.process_index}] wrote={wrote} markers={markers} skipped={skipped} "
         f"invalid={invalid} out={out_dir}"
     )
 

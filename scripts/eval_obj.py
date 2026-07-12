@@ -52,6 +52,14 @@ def get_mesh(mesh_path: Path):
     return None
 
 
+def alignment_protocol_name(args):
+    if args.no_align:
+        return "none"
+    if args.align_sample_points > 0 and args.align_sample_points != args.num_sample_points:
+        return "separate_alignment_sample"
+    return "same_sample_alignment"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="datasets/3d-front-ar-packed")
@@ -114,6 +122,12 @@ def main():
     pred_dir = Path(args.pred_dir)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    protocol = {
+        "num_sample_points": int(args.num_sample_points),
+        "align_sample_points": int(args.align_sample_points),
+        "alignment_protocol": alignment_protocol_name(args),
+        "no_align": bool(args.no_align),
+    }
 
     with accelerator.local_main_process_first():
         subset = subset.map(
@@ -156,6 +170,7 @@ def main():
             "has_pred": has_pred,
             "cd": None,
             "f_score": None,
+            **protocol,
         }
 
         if has_gt and has_pred:
@@ -229,6 +244,7 @@ def main():
                 "avg_cd": avg_cd,
                 "avg_f_score": avg_f_scores,
                 "num_evaluated": len(all_cds),
+                **protocol,
             }
         )
         results_path = save_dir / "eval_obj_results.jsonl"

@@ -51,6 +51,7 @@ class Da3FrozenEncoder(FrozenGeoEncoder):
             resolved,
             local_files_only=True,
         )
+        self.model.float()
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad_(False)
@@ -73,14 +74,16 @@ class Da3FrozenEncoder(FrozenGeoEncoder):
                 f"expected (B,N,3,H,W) pixel_values, got {tuple(pixel_values.shape)}"
             )
 
-        raw = self.model.forward(
-            pixel_values,
-            extrinsics=None,
-            intrinsics=None,
-            export_feat_layers=[],
-            infer_gs=False,
-            use_ray_pose=False,
-        )
+        da3_inputs = pixel_values.to(dtype=torch.float32)
+        with torch.autocast(device_type=da3_inputs.device.type, enabled=False):
+            raw = self.model.forward(
+                da3_inputs,
+                extrinsics=None,
+                intrinsics=None,
+                export_feat_layers=[],
+                infer_gs=False,
+                use_ray_pose=False,
+            )
 
         depth = self._get_raw_tensor(raw, ("depth",), required=False)
         intrinsics = self._get_raw_tensor(raw, ("intrinsics",), required=False)
