@@ -1,9 +1,8 @@
 # @package _global_
-# Explicit CE-only baseline; matches current defaults.
+# CE-only control; overrides Trellis2-MV geometry-loss defaults to zero.
 model:
   loss_layout_ordinal_sigma: null
   loss_layout_ordinal_weight: 0.0
   loss_layout_coord_weight: 0.0
   loss_layout_center_weight: 0.0
   loss_layout_size_weight: 0.0
-

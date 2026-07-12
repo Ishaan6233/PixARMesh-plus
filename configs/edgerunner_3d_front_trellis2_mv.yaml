@@ -10,6 +10,11 @@ all:
 model:
   local_path: outputs/archive/checkpoints/edgerunner-3d-front-global-obj-pose-w-img-ctx/20260602-135736/checkpoints/final
   mv_mask_seeded_pool: true
+  loss_layout_ordinal_sigma: 2.0
+  loss_layout_ordinal_weight: 1.0
+  loss_layout_coord_weight: 1.0
+  loss_layout_center_weight: 0.5
+  loss_layout_size_weight: 0.5
 
 train:
   train_args:
