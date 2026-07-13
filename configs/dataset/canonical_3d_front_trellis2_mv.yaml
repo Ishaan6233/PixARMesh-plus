@@ -98,7 +98,15 @@ model:
   mv_obj_aabb_token: true
   mv_register_iters: 4
   mv_geom_norm_quantile: 0.05
-  mv_conf_threshold: 0.0
+  # Point-level confidence filter for voxel-encoder discovery/fusion (distinct from the
+  # per-view mv_view_conf_gate above). Had silently drifted to 0.0 (no filtering at all)
+  # with no comment explaining why -- docs/HANDOFF.md's own policy-drift note records the
+  # last known-good checkpoint (20260707-trellis2-fixed-s1c) was trained with
+  # mv_conf_threshold=0.5, matching ModelConfig's dataclass default, before this branch
+  # silently composed 0.0. Flagged by the 2026-07-13 red-team (Finding 3); restored to 0.5
+  # rather than introduced fresh. NOT independently re-validated in this pass -- probe
+  # before trusting a training run that depends on it.
+  mv_conf_threshold: 0.5
   mv_use_geometry: true
   img_cond: true
   mv_obj_pc_cond: false
