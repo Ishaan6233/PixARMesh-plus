@@ -79,8 +79,9 @@ def _tiny_pretrained_shapeopt(tmp_path, model_cfg: ModelConfig) -> Path:
         pad_token_id=model_cfg.pad_token_id,
         num_pos_tokens=model_cfg.num_pos_tokens,
         pos_token_offset=model_cfg.pos_token_offset,
+        with_ctx_pc=model_cfg.with_ctx_pc,
     )
-    ShapeOPT(config).save_pretrained(checkpoint)
+    ShapeOPT(config, cond_encoder=_DummyCondEncoder()).save_pretrained(checkpoint)
     return checkpoint
 
 

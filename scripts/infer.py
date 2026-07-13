@@ -1,19 +1,19 @@
+import argparse
+import hashlib
+import json
 import os
 import sys
+import warnings
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 os.environ["OMP_NUM_THREADS"] = "1"
-import warnings
 
-warnings.filterwarnings("ignore")
-
-import argparse
-import torch
 import numpy as np
-from tqdm import tqdm
+import torch
 from accelerate import PartialState
-from pathlib import Path
+from tqdm import tqdm
 from transformers import set_seed, AutoImageProcessor
 from src.utils.inference import (
     prepare_model_for_inference,
@@ -25,6 +25,23 @@ from src.utils.inference import (
 )
 from src.data.collator import get_mesh_data_collator
 from src.data import utils as data_utils, tokenize_bpt
+
+warnings.filterwarnings("ignore")
+
+
+def _path_digest(path: Path) -> dict:
+    path = Path(path)
+    out = {"path": str(path), "exists": path.exists(), "sha256": None, "bytes": 0}
+    if not path.exists() or not path.is_file():
+        return out
+    h = hashlib.sha256()
+    n = 0
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+            n += len(chunk)
+    out.update(sha256=h.hexdigest(), bytes=n)
+    return out
 
 
 def main():
@@ -351,6 +368,31 @@ def main():
                         mesh.export(out_dir / f"{uid}.ply")
                     except Exception as e:
                         print(f"[WARN] decode failed for {uid} ({len(tokens)} tokens): {e}")
+
+    if state.is_main_process:
+        ply_files = sorted(out_dir.glob("*.ply"))
+        manifest = {
+            "schema": "pixarmesh_inference_manifest_v1",
+            "checkpoint": args.checkpoint,
+            "checkpoint_digest": _path_digest(Path(args.checkpoint))
+            if Path(args.checkpoint).is_file()
+            else {"path": args.checkpoint, "exists": Path(args.checkpoint).exists(), "sha256": None},
+            "output_dir": str(out_dir),
+            "run_type": args.run_type,
+            "model_type": args.model_type,
+            "seed": int(args.seed),
+            "batch_size": int(args.batch_size),
+            "generation_flags": {
+                "gt_layout": bool(use_gt_layout),
+                "gt_mask": bool(use_gt_mask),
+                "gt_depth": bool(use_gt_depth),
+                "do_sample": bool(args.do_sample),
+            },
+            "mesh_count": len(ply_files),
+        }
+        (out_dir / "inference_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, Subset
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.data.collator import get_mesh_data_collator
+from src.data.trellis2_mv import validate_mv_feature_cache_root
 from src.data.mesh import get_mesh_dataset
 from src.data.utils import dequantize_points
 from src.models.mv_voxel_encoder import _project_to_views
@@ -136,7 +137,9 @@ def build_model(model_cfg: ModelConfig, data_cfg: DataConfig, device: torch.devi
         else None
     )
     geo_encoder = None
-    if not getattr(data_cfg, "mv_feature_cache", "") and (
+    if getattr(data_cfg, "mv_feature_cache", ""):
+        validate_mv_feature_cache_root(data_cfg.mv_feature_cache, data_cfg, model_cfg)
+    elif (
         getattr(model_cfg, "use_da3", False) or getattr(model_cfg, "geo_encoder_type", "") == "da3"
     ):
         geo_encoder = get_da3_encoder(model_cfg)

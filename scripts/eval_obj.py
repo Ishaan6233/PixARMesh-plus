@@ -3,11 +3,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+import hashlib
 import jsonlines
 import datasets
 import open3d as o3d
 import numpy as np
 import json
+import torch
 from pytorch3d.loss import chamfer_distance
 from tqdm import tqdm
 from pathlib import Path
@@ -50,6 +52,23 @@ def get_mesh(mesh_path: Path):
     if mesh_path.exists():
         return o3d.io.read_triangle_mesh(str(mesh_path))
     return None
+
+
+def _stable_seed(base_seed: int, *parts) -> int:
+    h = hashlib.sha256(str(base_seed).encode("utf-8"))
+    for part in parts:
+        h.update(b"\0")
+        h.update(str(part).encode("utf-8"))
+    return int.from_bytes(h.digest()[:4], "little", signed=False)
+
+
+def _set_eval_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        o3d.utility.random.seed(seed)
+    except Exception:
+        pass
 
 
 def alignment_protocol_name(args):
@@ -99,6 +118,12 @@ def main():
         action="store_true",
         help="Whether to overwrite existing eval results",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=12345,
+        help="Base seed for deterministic per-object mesh sampling and ICP initialization.",
+    )
     parser.add_argument("--save-dir", type=str, default="outputs/sv/eval")
     args = parser.parse_args()
 
@@ -127,7 +152,13 @@ def main():
         "align_sample_points": int(args.align_sample_points),
         "alignment_protocol": alignment_protocol_name(args),
         "no_align": bool(args.no_align),
+        "mask_area_thresh": int(args.mask_area_thresh),
+        "evaluator_seed": int(args.seed),
+        "rng_policy": "per_object_stable_seed_v1",
     }
+    protocol["eval_protocol_fingerprint"] = hashlib.sha256(
+        json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
 
     with accelerator.local_main_process_first():
         subset = subset.map(
@@ -170,10 +201,12 @@ def main():
             "has_pred": has_pred,
             "cd": None,
             "f_score": None,
+            "object_eval_seed": _stable_seed(args.seed, uid, obj_id, model_id),
             **protocol,
         }
 
         if has_gt and has_pred:
+            _set_eval_seed(record["object_eval_seed"])
             gt_pcds = evaluation.sample_points_from_o3d_mesh(
                 gt_mesh, args.num_sample_points
             )
@@ -223,6 +256,7 @@ def main():
         results = []
         all_cds = []
         all_f_scores = []
+        mask_passing_count = 0
         for item in subset:
             uid = item["uid"]
             obj_id = item["obj_id"]
@@ -230,6 +264,7 @@ def main():
             mask_area = item["mask_area"]
             if mask_area < args.mask_area_thresh:
                 continue
+            mask_passing_count += 1
             with out_json_path.open("r") as f:
                 record = json.load(f)
             if record["cd"] is not None:
@@ -239,17 +274,35 @@ def main():
 
         avg_cd = float(np.mean(all_cds))
         avg_f_scores = float(np.mean(all_f_scores))
+        coverage = float(len(all_cds) / mask_passing_count) if mask_passing_count else 0.0
         results.append(
             {
                 "avg_cd": avg_cd,
                 "avg_f_score": avg_f_scores,
                 "num_evaluated": len(all_cds),
+                "num_mask_passing": mask_passing_count,
+                "coverage": coverage,
                 **protocol,
             }
         )
         results_path = save_dir / "eval_obj_results.jsonl"
         with jsonlines.open(results_path, "w") as writer:
             writer.write_all(results)
+        manifest = {
+            "schema": "pixarmesh_eval_obj_manifest_v1",
+            "results_path": str(results_path),
+            "pred_dir": str(pred_dir),
+            "dataset": args.dataset,
+            "metadata": args.metadata,
+            "gt_dir": args.gt_dir,
+            "protocol": protocol,
+            "num_mask_passing": mask_passing_count,
+            "num_evaluated": len(all_cds),
+            "coverage": coverage,
+        }
+        (save_dir / "eval_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
         print(
             f"""
 Evaluation results saved to {results_path}.

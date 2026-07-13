@@ -33,6 +33,7 @@ from src.models.utils import (
 )
 from src.data.collator import get_mesh_data_collator
 from src.data.mesh import get_mesh_dataset, MeshProcessor
+from src.data.trellis2_mv import validate_mv_feature_cache_root
 from src.utils.logging import JsonlLoggerCallback
 from src.utils.trainer import CustomSFTTrainer, CustomSFTConfig
 from src.utils.config import DataConfig, ModelConfig, mv_prefix_len
@@ -134,8 +135,15 @@ def main(cfg):
         geo_encoder = None
         use_mv_feature_cache = bool(getattr(data_cfg, "mv_feature_cache", ""))
         if use_mv_feature_cache:
+            cache_manifest = validate_mv_feature_cache_root(
+                data_cfg.mv_feature_cache,
+                data_cfg,
+                model_cfg,
+            )
             logger.info(
-                f"mv_feature_cache={data_cfg.mv_feature_cache}: skipping DA3 geo_encoder construction."
+                f"mv_feature_cache={data_cfg.mv_feature_cache} "
+                f"fingerprint={cache_manifest.get('fingerprint')}: "
+                "skipping DA3 geo_encoder construction."
             )
         elif getattr(model_cfg, "use_da3", False) or getattr(model_cfg, "geo_encoder_type", "") == "da3":
             geo_encoder = get_da3_encoder(model_cfg)
@@ -146,6 +154,15 @@ def main(cfg):
             cond_encoder_img=cond_encoder_img,
             geo_encoder=geo_encoder,
         )
+        if hasattr(model, "_pixarmesh_loading_report"):
+            report = model._pixarmesh_loading_report
+            logger.info(
+                "model loading report: mode=%s missing=%d unexpected=%d mismatched=%d",
+                report.get("mode"),
+                len(report.get("missing_keys", [])),
+                len(report.get("unexpected_keys", [])),
+                len(report.get("mismatched_keys", [])),
+            )
         if getattr(model_cfg, "freeze_decoder", False):
             n_train = 0
             for name, param in model.named_parameters():

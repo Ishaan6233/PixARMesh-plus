@@ -46,6 +46,9 @@ class DataConfig:
     # Multi-view frozen-feature cache dir (geometry local_points/conf + DINOv2 feats,
     # precomputed by scripts/data/precompute_mv_features.py). "" = compute live.
     mv_feature_cache: str = ""
+    # Debug-only escape hatch for inspecting legacy/stale caches. Certifiable
+    # training/evidence gates reject runs that need this mode.
+    mv_feature_cache_warning_only: bool = False
     # Ablations
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False
@@ -93,6 +96,10 @@ class ModelConfig:
     cond: bool = False
     obj_cond: bool = False
     local_path: str = ""
+    # Loading contract for model.local_path:
+    # - base_init: SV/base checkpoint may lack documented MV-only tensors.
+    # - strict_warm_start: stage-to-stage warm starts must load every trainable tensor.
+    local_path_load_mode: str = "base_init"
     local_cond_path: str = ""
     cond_enc_type: str = "miche"
     freeze_cond_encoder: bool = True

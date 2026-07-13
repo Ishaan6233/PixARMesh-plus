@@ -1,5 +1,7 @@
 import logging
 import math
+import hashlib
+import json
 import torch
 import torch.nn as nn
 from src.utils.config import ModelConfig
@@ -13,6 +15,155 @@ from .img_cond import ImageConditionEncoder, HighResImageConditionEncoder
 from .frozen_geo_encoder import FrozenGeoEncoder, build_geo_encoder  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+_MV_ARCHITECTURE_FIELDS = (
+    "prefix_len",
+    "pc_latent_len",
+    "mv_voxel_encoder",
+    "mv_num_obj_voxels",
+    "mv_num_ctx_voxels",
+    "mv_voxel_dim",
+    "mv_num_obj_queries",
+    "mv_num_scene_queries",
+    "mv_num_heads",
+    "mv_obj_pc_cond",
+    "mv_use_voxel_encoder",
+    "mv_obj_pc_appearance",
+    "mv_obj_pc_oracle",
+    "mv_discovery_method",
+    "mv_min_views",
+    "mv_conf_threshold",
+    "mv_depth_rtol",
+    "mv_pool_size",
+    "mv_intra_obj_register",
+    "mv_register_iters",
+    "mv_geom_norm_quantile",
+    "mv_geom_norm_trim_fallback_ratio",
+    "mv_use_geometry",
+    "mv_voxel_sampling",
+    "mv_covis_min_support_pix",
+    "mv_view_conf_gate",
+    "mv_view_gate_min_views",
+    "mv_obj_aabb_token",
+    "vocab_size",
+    "max_position_embeddings",
+    "num_pos_tokens",
+    "pos_token_offset",
+    "pc_token_id",
+    "obj_pc_token_id",
+    "indicator_token_id",
+)
+
+_BASE_INIT_ALLOWED_MISSING_PREFIXES = (
+    "mv_voxel_encoder.",
+    "mv_aabb_embed.",
+    "ctx_aggregator.",
+    "cond_encoder.encoder.extra_feat_proj.",
+)
+
+
+def _canonical_json(payload) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def build_mv_architecture_contract(model_cfg: ModelConfig, config=None) -> dict:
+    values = {field: getattr(model_cfg, field, None) for field in _MV_ARCHITECTURE_FIELDS}
+    hidden = {
+        "word_embed_proj_dim": getattr(config, "word_embed_proj_dim", None),
+        "hidden_size": getattr(config, "hidden_size", None),
+        "vocab_size": getattr(config, "vocab_size", getattr(model_cfg, "vocab_size", None)),
+    }
+    prefix = {
+        "obj_pc_tokens": getattr(model_cfg, "pc_latent_len", 0)
+        if getattr(model_cfg, "mv_obj_pc_cond", False)
+        else 0,
+        "obj_query_tokens": getattr(model_cfg, "mv_num_obj_queries", 0)
+        if getattr(model_cfg, "mv_use_voxel_encoder", True)
+        and getattr(model_cfg, "mv_voxel_encoder", False)
+        else 0,
+        "scene_query_tokens": getattr(model_cfg, "mv_num_scene_queries", 0)
+        if getattr(model_cfg, "mv_use_voxel_encoder", True)
+        and getattr(model_cfg, "mv_voxel_encoder", False)
+        else 0,
+        "obj_aabb_tokens": 1 if getattr(model_cfg, "mv_obj_aabb_token", False) else 0,
+        "num_face_tokens": 1,
+        "total": getattr(model_cfg, "prefix_len", None),
+    }
+    body = {
+        "schema": "pixarmesh_mv_architecture_contract",
+        "fields": values,
+        "dimensions": hidden,
+        "prefix_decomposition": prefix,
+    }
+    body["fingerprint"] = hashlib.sha256(_canonical_json(body).encode("utf-8")).hexdigest()[:16]
+    return body
+
+
+def _normalize_loading_info(loading_info: dict | None) -> dict:
+    loading_info = loading_info or {}
+    mismatched = []
+    for item in loading_info.get("mismatched_keys", []) or []:
+        if isinstance(item, (list, tuple)) and item:
+            mismatched.append(
+                {
+                    "key": item[0],
+                    "checkpoint_shape": str(item[1]) if len(item) > 1 else None,
+                    "model_shape": str(item[2]) if len(item) > 2 else None,
+                }
+            )
+        else:
+            mismatched.append({"key": str(item), "checkpoint_shape": None, "model_shape": None})
+    return {
+        "missing_keys": sorted(str(k) for k in loading_info.get("missing_keys", []) or []),
+        "unexpected_keys": sorted(str(k) for k in loading_info.get("unexpected_keys", []) or []),
+        "mismatched_keys": mismatched,
+        "error_msgs": [str(x) for x in loading_info.get("error_msgs", []) or []],
+    }
+
+
+def _allowed_base_missing(key: str) -> bool:
+    return key.endswith("basis") or any(
+        key.startswith(prefix) for prefix in _BASE_INIT_ALLOWED_MISSING_PREFIXES
+    )
+
+
+def _validate_loading_report(model, report: dict, mode: str) -> None:
+    trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+    missing_trainable = [key for key in report["missing_keys"] if key in trainable]
+    mismatched_trainable = [
+        item for item in report["mismatched_keys"] if item["key"] in trainable
+    ]
+    if mode == "strict_warm_start":
+        blockers = []
+        if missing_trainable:
+            blockers.append(f"missing trainable tensors: {missing_trainable[:20]}")
+        if report["unexpected_keys"]:
+            blockers.append(f"unexpected checkpoint tensors: {report['unexpected_keys'][:20]}")
+        if mismatched_trainable:
+            blockers.append(f"mismatched trainable tensors: {mismatched_trainable[:20]}")
+        if report["error_msgs"]:
+            blockers.append(f"loader errors: {report['error_msgs'][:5]}")
+        if blockers:
+            raise ValueError(
+                "strict_warm_start rejected model.local_path load; "
+                + "; ".join(blockers)
+            )
+    elif mode == "base_init":
+        disallowed_missing = [
+            key for key in missing_trainable if not _allowed_base_missing(key)
+        ]
+        disallowed_mismatched = [
+            item for item in mismatched_trainable if not _allowed_base_missing(item["key"])
+        ]
+        if disallowed_missing or disallowed_mismatched:
+            raise ValueError(
+                "base_init only allows documented new MV tensors to be absent/mismatched; "
+                f"missing={disallowed_missing[:20]} mismatched={disallowed_mismatched[:20]}"
+            )
+    else:
+        raise ValueError(
+            f"Unknown model.local_path_load_mode={mode!r}; expected 'base_init' or 'strict_warm_start'."
+        )
 
 
 def _fix_uninit_params(model):
@@ -174,6 +325,12 @@ def get_model(
         case _:
             raise ValueError(f"Unknown model type: {model_type}")
 
+    load_mode = getattr(model_cfg, "local_path_load_mode", "base_init") if model_cfg is not None else "base_init"
+    if load_mode not in {"base_init", "strict_warm_start"}:
+        raise ValueError(
+            f"Unknown model.local_path_load_mode={load_mode!r}; expected 'base_init' or 'strict_warm_start'."
+        )
+
     config = config_class.from_pretrained(local_model_path, **extra_args)
     # PretrainedConfig.from_pretrained discards kwargs that are not declared config
     # attributes (e.g. the mv_* fields on ShapeOPTConfig), so force them onto the
@@ -193,6 +350,9 @@ def get_model(
         for _f in _mv_fields:
             if _f in extra_args:
                 setattr(config, _f, extra_args[_f])
+        arch_contract = build_mv_architecture_contract(model_cfg, config)
+        config.mv_architecture_contract = arch_contract
+        config.mv_architecture_fingerprint = arch_contract["fingerprint"]
     # Snapshot the pre-loaded cond_encoder state before from_pretrained, because
     # from_pretrained detects cond_encoder.* as "MISSING" from the main checkpoint
     # and re-initializes them with random weights, discarding the pretrained values.
@@ -201,14 +361,28 @@ def get_model(
         if cond_encoder is not None
         else None
     )
-    model = model_class.from_pretrained(
+    model, loading_info = model_class.from_pretrained(
         local_model_path,
         config=config,
         cond_encoder=cond_encoder,
         cond_encoder_img=cond_encoder_img,
         is_scene=is_scene,
         ignore_mismatched_sizes=True,
+        output_loading_info=True,
     )
+    loading_report = _normalize_loading_info(loading_info)
+    model._pixarmesh_loading_report = {
+        "mode": load_mode,
+        **loading_report,
+    }
+    logger.info(
+        "model.local_path load report mode=%s missing=%d unexpected=%d mismatched=%d",
+        load_mode,
+        len(loading_report["missing_keys"]),
+        len(loading_report["unexpected_keys"]),
+        len(loading_report["mismatched_keys"]),
+    )
+    _validate_loading_report(model, loading_report, load_mode)
     # Restore frozen pretrained cond_encoder keys after from_pretrained corruption.
     # ConditionEncoder.state_dict() intentionally filters frozen weights, so use
     # named_parameters() snapshots. Trainable extra_feat_proj keys are preserved when

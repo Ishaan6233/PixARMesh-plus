@@ -111,6 +111,7 @@ export RUN_TS=$(date +%Y%m%d-%H%M%S)
 accelerate_launch train.py \
     --config-name="${STAGE2_CFG}" \
     "model.local_path=${S1_CKPT}" \
+    "model.local_path_load_mode=strict_warm_start" \
     "${COMMON_OVERRIDES[@]}"
 
 echo "[train_mv] ══════════════════════════════════════════════"

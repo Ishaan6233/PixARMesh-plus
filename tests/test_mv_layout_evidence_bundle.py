@@ -14,6 +14,17 @@ METRICS = {
     "aabb_iou": 1.0,
 }
 
+DOWNSTREAM_PROTOCOL = {
+    "num_sample_points": 10000,
+    "align_sample_points": 5000,
+    "alignment_protocol": "separate_alignment_sample",
+    "no_align": False,
+    "mask_area_thresh": 1600,
+    "evaluator_seed": 12345,
+    "rng_policy": "per_object_stable_seed_v1",
+    "eval_protocol_fingerprint": "protocol-fp",
+}
+
 
 def _write_layout(root, run, seed, uid="uid-a"):
     seed_dir = root / run / f"seed{seed}"
@@ -98,19 +109,48 @@ def _write_layout(root, run, seed, uid="uid-a"):
     (visual_dir / "conditioning_points.npz").write_bytes(b"npz")
 
 
-def _write_downstream(path, *, cd=None, f_score=None):
+def _write_downstream(
+    path,
+    *,
+    cd=None,
+    f_score=None,
+    coverage=1.0,
+    protocol=None,
+    records=None,
+):
     is_sv = "sv" in {part.lower() for part in path.parts}
-    if cd is None:
-        cd = 0.2 if is_sv else 0.1
-    if f_score is None:
-        f_score = 0.1 if is_sv else 0.2
+    protocol = protocol or DOWNSTREAM_PROTOCOL
+    if records is None:
+        if cd is None:
+            cd = 0.005 if is_sv else 0.003
+        if f_score is None:
+            f_score = 80.0 if is_sv else 85.0
+        records = [{"uid": "x", "obj_id": 0, "cd": cd, "f_score": f_score}]
+    avg_cd = sum(float(record["cd"]) for record in records) / len(records)
+    avg_f_score = sum(float(record["f_score"]) for record in records) / len(records)
     path.parent.mkdir(parents=True)
     with path.open("w") as f:
+        for idx, record in enumerate(records):
+            f.write(
+                json.dumps(
+                    {
+                        "object_eval_seed": 7 + idx,
+                        **record,
+                        **protocol,
+                    }
+                )
+                + "\n"
+            )
         f.write(
-            json.dumps({"uid": "x", "obj_id": 0, "cd": cd, "f_score": f_score}) + "\n"
-        )
-        f.write(
-            json.dumps({"avg_cd": cd, "avg_f_score": f_score, "num_evaluated": 1})
+            json.dumps(
+                {
+                    "avg_cd": avg_cd,
+                    "avg_f_score": avg_f_score,
+                    "num_evaluated": len(records),
+                    "coverage": coverage,
+                    **protocol,
+                }
+            )
             + "\n"
         )
 
@@ -299,6 +339,98 @@ def test_evidence_bundle_checker_requires_downstream_file_per_requested_seed(tmp
     assert complete["downstream_groups"]["MV"]["count"] == 2
 
 
+def test_evidence_bundle_checker_accepts_three_seed_scene_clustered_bootstrap(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        for seed in (11, 23, 37):
+            _write_layout(layout_root, run, seed)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv_paths = [
+        tmp_path / "mv" / f"seed{seed}" / "eval_obj_results.jsonl"
+        for seed in (11, 23, 37)
+    ]
+    sv_records = [
+        {"uid": "scene-a", "obj_id": 0, "cd": 0.005, "f_score": 80.0},
+        {"uid": "scene-b", "obj_id": 0, "cd": 0.006, "f_score": 81.0},
+    ]
+    mv_records = [
+        {"uid": "scene-a", "obj_id": 0, "cd": 0.003, "f_score": 85.0},
+        {"uid": "scene-b", "obj_id": 0, "cd": 0.003, "f_score": 86.0},
+    ]
+    _write_downstream(sv, records=sv_records)
+    for path in mv_paths:
+        _write_downstream(path, records=mv_records)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+
+    report = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11, 23, 37],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={path}" for path in mv_paths],
+        verifier_dir=verifier_dir,
+        require_visuals=True,
+        bootstrap_resamples=200,
+        bootstrap_seed=7,
+    )
+
+    assert report["ok"]
+    bootstrap = report["downstream_groups"]["MV"]["scene_clustered_paired_bootstrap"]
+    assert bootstrap["cluster_count"] == 2
+    assert bootstrap["paired_observation_count"] == 6
+    assert bootstrap["cd_upper_bound_below_zero"]
+    assert bootstrap["f_score_lower_bound_above_zero"]
+
+
+def test_evidence_bundle_checker_rejects_scene_clustered_bootstrap_ci_crossing_zero(
+    tmp_path,
+):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        for seed in (11, 23, 37):
+            _write_layout(layout_root, run, seed)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv_paths = [
+        tmp_path / "mv" / f"seed{seed}" / "eval_obj_results.jsonl"
+        for seed in (11, 23, 37)
+    ]
+    sv_records = [
+        {"uid": "scene-a", "obj_id": 0, "cd": 0.004, "f_score": 84.0},
+        {"uid": "scene-b", "obj_id": 0, "cd": 0.001, "f_score": 99.0},
+    ]
+    # Mean MV still beats SV directionally and beats the paper target, but the
+    # scene-clustered interval crosses zero because scene-b regresses.
+    mv_records = [
+        {"uid": "scene-a", "obj_id": 0, "cd": 0.001, "f_score": 90.0},
+        {"uid": "scene-b", "obj_id": 0, "cd": 0.002, "f_score": 98.0},
+    ]
+    _write_downstream(sv, records=sv_records)
+    for path in mv_paths:
+        _write_downstream(path, records=mv_records)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+
+    report = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11, 23, 37],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={path}" for path in mv_paths],
+        verifier_dir=verifier_dir,
+        require_visuals=True,
+        bootstrap_resamples=200,
+        bootstrap_seed=7,
+    )
+
+    assert not report["ok"]
+    bootstrap = report["downstream_groups"]["MV"]["scene_clustered_paired_bootstrap"]
+    assert bootstrap["cd_delta_ci_high"] > 0.0
+    assert any("CD bootstrap upper 95% bound" in issue for issue in report["issues"])
+
+
 def test_evidence_bundle_checker_rejects_duplicate_downstream_seed_labels(tmp_path):
     layout_root = tmp_path / "layout"
     for run in ("A_ce", "B_ordinal"):
@@ -359,6 +491,59 @@ def test_evidence_bundle_checker_rejects_downstream_seed_that_does_not_beat_sv(
     assert any(
         "does not beat SV on paired F-score" in issue for issue in report["issues"]
     )
+
+
+def test_evidence_bundle_checker_rejects_downstream_protocol_mismatch(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        _write_layout(layout_root, run, 11)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv = tmp_path / "mv" / "seed11" / "eval_obj_results.jsonl"
+    _write_downstream(sv)
+    mv_protocol = {**DOWNSTREAM_PROTOCOL, "align_sample_points": 0}
+    _write_downstream(mv, protocol=mv_protocol)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+
+    report = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        require_visuals=True,
+    )
+
+    assert not report["ok"]
+    assert any("downstream protocol mismatch" in issue for issue in report["issues"])
+
+
+def test_evidence_bundle_checker_rejects_sub_95_percent_downstream_coverage(tmp_path):
+    layout_root = tmp_path / "layout"
+    for run in ("A_ce", "B_ordinal"):
+        _write_layout(layout_root, run, 11)
+    sv = tmp_path / "sv" / "eval_obj_results.jsonl"
+    mv = tmp_path / "mv" / "seed11" / "eval_obj_results.jsonl"
+    _write_downstream(sv)
+    _write_downstream(mv, coverage=0.94)
+    verifier_dir = tmp_path / "verifiers"
+    _write_verifiers(verifier_dir)
+
+    report = build_evidence_report(
+        layout_root=layout_root,
+        runs=["A_ce", "B_ordinal"],
+        seeds=[11],
+        ce_run="A_ce",
+        sv_downstream=sv,
+        downstream=[f"MV={mv}"],
+        verifier_dir=verifier_dir,
+        require_visuals=True,
+    )
+
+    assert not report["ok"]
+    assert any("coverage=94.0% below" in issue for issue in report["issues"])
 
 
 def test_evidence_bundle_checker_reports_missing_artifacts(tmp_path):
@@ -592,9 +777,30 @@ def test_evidence_bundle_checker_rejects_unpaired_downstream_objects(tmp_path):
     _write_downstream(sv)
     mv.parent.mkdir(parents=True)
     with mv.open("w") as f:
-        f.write(json.dumps({"uid": "y", "obj_id": 0, "cd": 0.1, "f_score": 0.2}) + "\n")
         f.write(
-            json.dumps({"avg_cd": 0.1, "avg_f_score": 0.2, "num_evaluated": 1}) + "\n"
+            json.dumps(
+                {
+                    "uid": "y",
+                    "obj_id": 0,
+                    "cd": 0.003,
+                    "f_score": 85.0,
+                    "object_eval_seed": 7,
+                    **DOWNSTREAM_PROTOCOL,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "avg_cd": 0.003,
+                    "avg_f_score": 85.0,
+                    "num_evaluated": 1,
+                    "coverage": 1.0,
+                    **DOWNSTREAM_PROTOCOL,
+                }
+            )
+            + "\n"
         )
     verifier_dir = tmp_path / "verifiers"
     _write_verifiers(verifier_dir)

@@ -6,7 +6,36 @@ from pathlib import Path
 
 import numpy as np
 
-from src.data.trellis2_mv import MV_FEATURE_CACHE_VERSION
+from src.data.trellis2_mv import (
+    MV_FEATURE_CACHE_CONTRACT_KEY,
+    MV_FEATURE_CACHE_FINGERPRINT_KEY,
+    MV_FEATURE_CACHE_VERSION,
+)
+
+TEST_CACHE_FP = "ready-cache-fp"
+TEST_PROTOCOL = {
+    "num_sample_points": 10000,
+    "align_sample_points": 5000,
+    "alignment_protocol": "separate_alignment_sample",
+    "no_align": False,
+    "mask_area_thresh": 1600,
+    "evaluator_seed": 12345,
+    "rng_policy": "per_object_stable_seed_v1",
+    "eval_protocol_fingerprint": "protocol-fp",
+}
+
+
+def _cache_provenance():
+    contract = {
+        "cache_version": MV_FEATURE_CACHE_VERSION,
+        "fingerprint": TEST_CACHE_FP,
+        "certifiable": True,
+        "uncertified_reasons": [],
+    }
+    return {
+        MV_FEATURE_CACHE_FINGERPRINT_KEY: np.asarray(TEST_CACHE_FP),
+        MV_FEATURE_CACHE_CONTRACT_KEY: np.asarray(json.dumps(contract)),
+    }
 
 
 def _write_ready_fixture(root):
@@ -27,6 +56,16 @@ def _write_ready_fixture(root):
     (hf / "train" / "state.json").write_text("{}\n")
 
     cache.mkdir()
+    (cache / "manifest.json").write_text(
+        json.dumps(
+            {
+                "cache_version": MV_FEATURE_CACHE_VERSION,
+                "fingerprint": TEST_CACHE_FP,
+                "certifiable": True,
+                "uncertified_reasons": [],
+            }
+        )
+    )
     np.savez(
         cache / "uid-a.npz",
         cache_version=np.asarray(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
@@ -36,11 +75,35 @@ def _write_ready_fixture(root):
         view_indices=np.asarray([0], dtype=np.int64),
         view_mask=np.asarray([True]),
         ref_view=np.asarray(0, dtype=np.int64),
+        **_cache_provenance(),
     )
 
     with sv.open("w") as f:
-        f.write(json.dumps({"uid": "uid-a", "obj_id": 0, "cd": 0.1, "f_score": 0.2}) + "\n")
-        f.write(json.dumps({"avg_cd": 0.1, "avg_f_score": 0.2, "num_evaluated": 1}) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "uid": "uid-a",
+                    "obj_id": 0,
+                    "cd": 0.1,
+                    "f_score": 0.2,
+                    "object_eval_seed": 7,
+                    **TEST_PROTOCOL,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "avg_cd": 0.1,
+                    "avg_f_score": 0.2,
+                    "num_evaluated": 1,
+                    "coverage": 1.0,
+                    **TEST_PROTOCOL,
+                }
+            )
+            + "\n"
+        )
     uid_meta.write_text(
         json.dumps({"uid": "uid-a", "category": "chair"}) + "\n"
         + json.dumps({"uid": "uid-b", "category": "table"}) + "\n"
@@ -76,6 +139,8 @@ def _run_readiness_for_paths(tmp_path, mesh, hf, cache, sv, uid_meta, *extra):
         "--stage2-train-root",
         str(tmp_path / "stage2"),
         "--no-require-gpu",
+        "--sv-baseline-glob",
+        str(tmp_path / "candidate_sv" / "**" / "eval_obj_results.jsonl"),
         "--out",
         str(out),
         *extra,
@@ -109,6 +174,7 @@ def _write_empty_marker_npz(cache):
         view_mask=np.asarray([False]),
         ref_view=np.asarray(0, dtype=np.int64),
         empty_reason=np.asarray("runtime rejected"),
+        **_cache_provenance(),
     )
 
 
@@ -328,7 +394,7 @@ def test_mv_layout_loss_readiness_reports_existing_checkpoint_guards(tmp_path):
     assert any(item["check"] == "existing_checkpoints" for item in report["remediations"])
 
 
-def test_mv_layout_loss_readiness_warns_on_disagreeing_sv_baseline(tmp_path):
+def test_mv_layout_loss_readiness_blocks_on_disagreeing_sv_baseline(tmp_path):
     # 2026-07-13 red-team Finding 2: two on-disk "frozen SV baseline" files disagreed by
     # ~2x avg_cd on identical objects with no warning anywhere. This is the guard.
     mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
@@ -336,8 +402,31 @@ def test_mv_layout_loss_readiness_warns_on_disagreeing_sv_baseline(tmp_path):
     other_dir.mkdir()
     other_sv = other_dir / "eval_obj_results.jsonl"
     with other_sv.open("w") as f:
-        f.write(json.dumps({"uid": "uid-a", "obj_id": 0, "cd": 0.05, "f_score": 0.6}) + "\n")
-        f.write(json.dumps({"avg_cd": 0.05, "avg_f_score": 0.6, "num_evaluated": 1}) + "\n")
+        f.write(
+            json.dumps(
+                {
+                    "uid": "uid-a",
+                    "obj_id": 0,
+                    "cd": 0.05,
+                    "f_score": 0.6,
+                    "object_eval_seed": 7,
+                    **TEST_PROTOCOL,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "avg_cd": 0.05,
+                    "avg_f_score": 0.6,
+                    "num_evaluated": 1,
+                    "coverage": 1.0,
+                    **TEST_PROTOCOL,
+                }
+            )
+            + "\n"
+        )
 
     result, report = _run_readiness_for_paths(
         tmp_path,
@@ -350,13 +439,13 @@ def test_mv_layout_loss_readiness_warns_on_disagreeing_sv_baseline(tmp_path):
         str(tmp_path / "**" / "eval_obj_results.jsonl"),
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert report["ok"]
+    assert result.returncode == 1
+    assert not report["ok"]
     disagreements = report["checks"]["sv_downstream"]["baseline_disagreements"]
     assert len(disagreements) == 1
     assert disagreements[0]["path"] == str(other_sv)
     assert disagreements[0]["avg_cd"] == 0.05
-    assert any("disagree with" in warning for warning in report["warnings"])
+    assert any("disagree with" in issue for issue in report["issues"])
 
 
 def test_mv_layout_loss_readiness_silent_when_candidate_baselines_agree(tmp_path):

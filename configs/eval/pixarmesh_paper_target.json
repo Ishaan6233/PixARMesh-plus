@@ -1,0 +1,17 @@
+{
+  "schema": "pixarmesh_paper_target_v1",
+  "source": {
+    "paper": "PixARMesh: Autoregressive Mesh-Native Single-View Scene Reconstruction",
+    "arxiv": "2603.05888v1",
+    "table": "Table 1",
+    "row": "PixARMesh-EdgeRunner (Ours)",
+    "dataset": "3D-FRONT",
+    "metric_notes": "Object-level meshes are normalized to a unit cube; meshes are uniformly sampled into 10000 points; F-Score threshold is 0.002."
+  },
+  "object_level": {
+    "mean_cd": 0.00404,
+    "mean_cd_table_value_x1e3": 4.04,
+    "mean_f_score": 82.27
+  },
+  "coverage_min": 0.95
+}

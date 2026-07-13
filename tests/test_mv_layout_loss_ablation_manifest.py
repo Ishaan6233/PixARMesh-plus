@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 
+from scripts.eval.mv_layout_evidence_common import ABLATIONS
+
 
 def test_mv_layout_loss_ablation_manifest_emits_runnable_seed_group_commands(tmp_path):
     out = tmp_path / "mv_layout_loss_ablation"
@@ -76,7 +78,7 @@ def test_mv_layout_loss_ablation_manifest_emits_runnable_seed_group_commands(tmp
         "align_sample_points": 5000,
         "mask_area_thresh": 1600,
     }
-    assert len(manifest["ablations"]) == 8
+    assert len(manifest["ablations"]) == len(ABLATIONS) * 2
 
 
 def test_mv_layout_loss_ablation_manifest_can_enable_category_stability(tmp_path):

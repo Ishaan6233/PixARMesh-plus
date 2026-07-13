@@ -37,8 +37,11 @@ if np.__version__ < "2":
 
 
 _OBJ_PTS_SAMPLE = 512
-MV_FEATURE_CACHE_VERSION = 2
-MV_FEATURE_CACHE_KEYS = (
+MV_FEATURE_CACHE_VERSION = 3
+MV_FEATURE_CACHE_MANIFEST_NAME = "manifest.json"
+MV_FEATURE_CACHE_FINGERPRINT_KEY = "mv_feature_cache_fingerprint"
+MV_FEATURE_CACHE_CONTRACT_KEY = "mv_feature_cache_contract_json"
+MV_FEATURE_CACHE_BASE_KEYS = (
     "cache_version",
     "local_points",
     "conf",
@@ -47,13 +50,14 @@ MV_FEATURE_CACHE_KEYS = (
     "view_mask",
     "ref_view",
 )
+MV_FEATURE_CACHE_KEYS = (
+    *MV_FEATURE_CACHE_BASE_KEYS,
+    MV_FEATURE_CACHE_FINGERPRINT_KEY,
+    MV_FEATURE_CACHE_CONTRACT_KEY,
+)
 MV_FEATURE_CACHE_EMPTY_MARKER_KEY = "empty_marker"
-# Optional (not in MV_FEATURE_CACHE_KEYS, so cache files built before this field existed
-# still pass the required-keys check): a fingerprint of the DataConfig fields that decide
-# which HF views got selected/rejected for an item. Stamped at precompute time; the loader
-# compares it against the currently active config so a later view-selection/mask-sanity/
-# frame-correction policy change doesn't silently keep serving views chosen under the old
-# policy for every cache-hit row (2026-07-13 red-team Finding 4).
+# Legacy v2 row key. Kept only so audit tooling can report what old caches are
+# missing; v3 uses MV_FEATURE_CACHE_FINGERPRINT_KEY and a root manifest.
 MV_FEATURE_CACHE_POLICY_KEY = "view_selection_policy_fingerprint"
 _VIEW_SELECTION_POLICY_FIELDS = (
     "mv_covis_k_max",
@@ -63,10 +67,264 @@ _VIEW_SELECTION_POLICY_FIELDS = (
     "mv_mask_min_hit_frac",
     "mv_frame_correction",
 )
+_VIEW_SELECTION_PROVENANCE_FIELDS = (*_VIEW_SELECTION_POLICY_FIELDS, "num_views")
+_CACHE_TENSOR_SCHEMA = {
+    "local_points": {"dtype": "float16", "rank": 4, "slot_axis": 0, "last_dim": 3},
+    "conf": {"dtype": "float16", "rank": 4, "slot_axis": 0, "last_dim": 1},
+    "dino_feats": {"dtype": "float16", "rank": 4, "slot_axis": 0},
+    "view_indices": {"dtype": "int64", "rank": 1, "slot_axis": 0},
+    "view_mask": {"dtype": "bool", "rank": 1, "slot_axis": 0},
+    "ref_view": {"dtype": "int64", "rank": 0, "semantics": "local slot index"},
+}
+
+
+def _json_dumps_canonical(payload) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    h = hashlib.sha256()
+    n = 0
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+            n += len(chunk)
+    return h.hexdigest(), n
+
+
+def _path_content_identity(value: str) -> dict:
+    path = Path(str(value)).expanduser()
+    out = {
+        "identifier": str(value),
+        "kind": "path",
+        "exists": path.exists(),
+        "resolved_path": str(path.resolve()) if path.exists() else str(path),
+        "content_digest": None,
+        "file_count": 0,
+        "byte_count": 0,
+    }
+    if not path.exists():
+        return out
+    files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+    h = hashlib.sha256()
+    byte_count = 0
+    for file_path in files:
+        digest, n = _hash_file(file_path)
+        rel = file_path.name if path.is_file() else file_path.relative_to(path).as_posix()
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(n).encode("ascii"))
+        h.update(b"\0")
+        h.update(digest.encode("ascii"))
+        h.update(b"\0")
+        byte_count += n
+    out.update(
+        content_digest=h.hexdigest(),
+        file_count=len(files),
+        byte_count=byte_count,
+    )
+    return out
+
+
+def _hf_cached_identity(repo_id: str, filenames: tuple[str, ...]) -> dict:
+    out = {
+        "identifier": str(repo_id),
+        "kind": "hf_repo_cache",
+        "exists": False,
+        "resolved_revision": None,
+        "content_digest": None,
+        "files": [],
+        "file_count": 0,
+        "byte_count": 0,
+    }
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:
+        return out
+    files: list[Path] = []
+    for name in filenames:
+        try:
+            cached = try_to_load_from_cache(str(repo_id), name)
+        except Exception:
+            cached = None
+        if cached and not isinstance(cached, Exception):
+            path = Path(cached)
+            if path.exists():
+                files.append(path)
+    if not files:
+        return out
+    h = hashlib.sha256()
+    byte_count = 0
+    revisions = set()
+    for path in sorted(set(files)):
+        digest, n = _hash_file(path)
+        parts = path.parts
+        if "snapshots" in parts:
+            idx = parts.index("snapshots")
+            if idx + 1 < len(parts):
+                revisions.add(parts[idx + 1])
+        h.update(path.name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(n).encode("ascii"))
+        h.update(b"\0")
+        h.update(digest.encode("ascii"))
+        h.update(b"\0")
+        byte_count += n
+    out.update(
+        exists=True,
+        resolved_revision=sorted(revisions)[0] if len(revisions) == 1 else None,
+        content_digest=h.hexdigest(),
+        files=[str(p) for p in sorted(set(files))],
+        file_count=len(set(files)),
+        byte_count=byte_count,
+    )
+    return out
+
+
+def _artifact_identity(value: str, *, hf_filenames: tuple[str, ...] = ()) -> dict:
+    if not value:
+        return {"identifier": "", "kind": "unset", "exists": False, "content_digest": None}
+    path = Path(str(value)).expanduser()
+    if path.exists():
+        return _path_content_identity(str(value))
+    if hf_filenames and "/" in str(value):
+        return _hf_cached_identity(str(value), hf_filenames)
+    out = _path_content_identity(str(value))
+    out["kind"] = "missing_path_or_unresolved_id"
+    return out
+
+
+def view_selection_policy_spec(data_cfg) -> dict:
+    return {field: getattr(data_cfg, field, None) for field in _VIEW_SELECTION_PROVENANCE_FIELDS}
+
+
+def _contract_uncertified_reasons(contract: dict) -> list[str]:
+    reasons = []
+    if contract.get("warning_only"):
+        reasons.append("mv_feature_cache_warning_only=true")
+    artifacts = contract.get("frozen_feature_provenance", {})
+    for name in ("da3", "dino"):
+        ident = artifacts.get(name, {})
+        if not ident.get("content_digest"):
+            reasons.append(f"{name} artifact has no resolved content digest")
+        elif int(ident.get("file_count") or 0) == 0:
+            reasons.append(f"{name} artifact digest covers zero files")
+    preproc = artifacts.get("image_preprocessor", {})
+    if preproc.get("kind") == "path" and not preproc.get("content_digest"):
+        reasons.append("image_preprocessor path has no resolved content digest")
+    return reasons
+
+
+def build_mv_feature_cache_contract(data_cfg, model_cfg=None) -> dict:
+    """Build the canonical v3 cache provenance contract shared by precompute/train."""
+    model_cfg = model_cfg or object()
+    body = {
+        "schema": "trellis2_mv_feature_cache",
+        "cache_version": MV_FEATURE_CACHE_VERSION,
+        "view_selection_policy": view_selection_policy_spec(data_cfg),
+        "frozen_feature_provenance": {
+            "da3": _artifact_identity(getattr(model_cfg, "da3_ckpt_path", "")),
+            "dino": _artifact_identity(
+                getattr(model_cfg, "image_encoder", ""),
+                hf_filenames=("model.safetensors", "pytorch_model.bin", "config.json"),
+            ),
+            "image_preprocessor": _artifact_identity(
+                getattr(data_cfg, "image_preprocessor", ""),
+                hf_filenames=("preprocessor_config.json", "config.json"),
+            ),
+            "image_size_divisor": getattr(data_cfg, "image_size_divisor", None),
+        },
+        "tensor_schema": _CACHE_TENSOR_SCHEMA,
+        "slot_semantics": {
+            "view_indices": "global HF view indices, ordered by local slot",
+            "view_mask": "valid local slots; padded slots are false",
+            "ref_view": "local slot index into view_indices/view_mask",
+        },
+        "warning_only": bool(getattr(data_cfg, "mv_feature_cache_warning_only", False)),
+    }
+    reasons = _contract_uncertified_reasons(body)
+    body["certifiable"] = not reasons
+    body["uncertified_reasons"] = reasons
+    fingerprint = hashlib.sha256(_json_dumps_canonical(body).encode("utf-8")).hexdigest()[:16]
+    return {**body, "fingerprint": fingerprint}
+
+
+def serialize_mv_feature_cache_contract(contract: dict) -> str:
+    return _json_dumps_canonical(contract)
+
+
+def load_mv_feature_cache_contract(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    return json.loads(str(np.asarray(value).item()))
+
+
+def write_mv_feature_cache_manifest(root: Path, contract: dict, *, overwrite: bool = False) -> Path:
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / MV_FEATURE_CACHE_MANIFEST_NAME
+    if path.exists():
+        existing = json.loads(path.read_text())
+        if existing.get("fingerprint") != contract.get("fingerprint") and not overwrite:
+            raise ValueError(
+                f"{path} fingerprint={existing.get('fingerprint')} does not match current "
+                f"cache contract fingerprint={contract.get('fingerprint')}; use a fresh cache "
+                "root or pass --overwrite after confirming the rebuild is intentional."
+            )
+    path.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def load_mv_feature_cache_manifest(root: Path) -> dict:
+    path = Path(root) / MV_FEATURE_CACHE_MANIFEST_NAME
+    if not path.exists():
+        raise FileNotFoundError(
+            f"MV feature cache root {root} has no {MV_FEATURE_CACHE_MANIFEST_NAME}; "
+            "rebuild it with scripts/data/precompute_mv_features.py to create a v3 manifest."
+        )
+    return json.loads(path.read_text())
+
+
+def mv_feature_cache_contract_errors(expected: dict, actual: dict) -> list[str]:
+    errors = []
+    if actual.get("cache_version") != MV_FEATURE_CACHE_VERSION:
+        errors.append(
+            f"manifest cache_version={actual.get('cache_version')} expected {MV_FEATURE_CACHE_VERSION}"
+        )
+    if expected.get("fingerprint") != actual.get("fingerprint"):
+        errors.append(
+            "manifest fingerprint mismatch: "
+            f"expected {expected.get('fingerprint')} current, got {actual.get('fingerprint')}"
+        )
+    if not actual.get("certifiable"):
+        errors.append(
+            "manifest is not certifiable: "
+            + ", ".join(str(x) for x in actual.get("uncertified_reasons", []))
+        )
+    return errors
+
+
+def validate_mv_feature_cache_root(root: str | Path, data_cfg, model_cfg) -> dict:
+    """Validate the root manifest against the currently composed train/eval config."""
+    expected = build_mv_feature_cache_contract(data_cfg, model_cfg)
+    actual = load_mv_feature_cache_manifest(Path(root))
+    errors = mv_feature_cache_contract_errors(expected, actual)
+    if errors:
+        message = (
+            f"MV feature cache {root} is not valid for the current config:\n- "
+            + "\n- ".join(errors)
+            + "\nRebuild with scripts/data/precompute_mv_features.py using the same config, "
+            "DA3 checkpoint, DINO encoder, preprocessing, and num_views."
+        )
+        if bool(getattr(data_cfg, "mv_feature_cache_warning_only", False)):
+            warnings.warn(message, stacklevel=2)
+        else:
+            raise ValueError(message)
+    return actual
 
 
 def view_selection_policy_fingerprint(data_cfg) -> str:
-    values = [repr(getattr(data_cfg, field, None)) for field in _VIEW_SELECTION_POLICY_FIELDS]
+    values = [repr(getattr(data_cfg, field, None)) for field in _VIEW_SELECTION_PROVENANCE_FIELDS]
     return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()[:16]
 _CAM_YUP_TO_OPENCV_4 = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
 _CAM_YUP_TO_OPENCV_3 = np.diag(np.array([-1, -1, 1], dtype=np.float32))
@@ -392,6 +650,17 @@ class Trellis2MVDataset(Dataset):
         self.is_train = is_train
         self.norm_bound = data_cfg.norm_bound
         self.feature_cache = Path(data_cfg.mv_feature_cache) if data_cfg.mv_feature_cache else None
+        self._cache_warning_only = bool(getattr(data_cfg, "mv_feature_cache_warning_only", False))
+        self._cache_manifest = None
+        self._cache_contract_fingerprint = None
+        if self.feature_cache is not None:
+            try:
+                self._cache_manifest = load_mv_feature_cache_manifest(self.feature_cache)
+                self._cache_contract_fingerprint = self._cache_manifest.get("fingerprint")
+            except Exception as exc:
+                self._cache_contract_problem(
+                    f"mv_feature_cache={self.feature_cache} is missing v3 root provenance: {exc}"
+                )
         self._current_policy_fingerprint = view_selection_policy_fingerprint(data_cfg)
         self._policy_mismatch_warned = False
 
@@ -464,6 +733,12 @@ class Trellis2MVDataset(Dataset):
             weights_only=False,
         )["cond"]
 
+    def _cache_contract_problem(self, message: str) -> None:
+        if getattr(self, "_cache_warning_only", False):
+            warnings.warn(message, stacklevel=3)
+            return
+        raise ValueError(message)
+
     def _load_feature_cache(self, uid: str, n_avail: int) -> dict | None:
         if self.feature_cache is None:
             return None
@@ -474,37 +749,51 @@ class Trellis2MVDataset(Dataset):
                 "Run scripts/data/precompute_mv_features.py for this split or unset mv_feature_cache."
             )
         with np.load(path) as z:
-            missing = sorted(set(MV_FEATURE_CACHE_KEYS) - set(z.files))
-            if missing:
+            missing_base = sorted(set(MV_FEATURE_CACHE_BASE_KEYS) - set(z.files))
+            if missing_base:
                 raise ValueError(
-                    f"{path} is missing required cache keys {missing}; rebuild it with "
+                    f"{path} is missing required cache keys {missing_base}; rebuild it with "
                     "scripts/data/precompute_mv_features.py."
                 )
             cache_version = int(np.asarray(z["cache_version"]).item())
             if cache_version != MV_FEATURE_CACHE_VERSION:
-                raise ValueError(
+                self._cache_contract_problem(
                     f"{path} has cache_version={cache_version}, expected "
                     f"{MV_FEATURE_CACHE_VERSION}; rebuild it with "
                     "scripts/data/precompute_mv_features.py."
                 )
-            current_fingerprint = getattr(self, "_current_policy_fingerprint", None)
-            if (
-                current_fingerprint is not None
-                and MV_FEATURE_CACHE_POLICY_KEY in z.files
-                and not getattr(self, "_policy_mismatch_warned", False)
-            ):
-                cached_fingerprint = str(np.asarray(z[MV_FEATURE_CACHE_POLICY_KEY]).item())
-                if cached_fingerprint != current_fingerprint:
-                    self._policy_mismatch_warned = True
-                    warnings.warn(
-                        f"{path} was cached under a different view-selection policy "
-                        f"(fingerprint {cached_fingerprint} != current "
-                        f"{current_fingerprint} over {_VIEW_SELECTION_POLICY_FIELDS}); its "
-                        "view_indices/view_mask/ref_view reflect the OLD policy. Rebuild "
-                        "mv_feature_cache with scripts/data/precompute_mv_features.py "
-                        "--overwrite to apply the current policy to cached rows. (Warning "
-                        "shown once per dataset instance.)",
-                        stacklevel=2,
+            missing_provenance = sorted(
+                {MV_FEATURE_CACHE_FINGERPRINT_KEY, MV_FEATURE_CACHE_CONTRACT_KEY} - set(z.files)
+            )
+            if missing_provenance:
+                self._cache_contract_problem(
+                    f"{path} is missing v3 provenance keys {missing_provenance}; rebuild it with "
+                    "scripts/data/precompute_mv_features.py."
+                )
+            row_fingerprint = None
+            if MV_FEATURE_CACHE_FINGERPRINT_KEY in z.files:
+                row_fingerprint = str(np.asarray(z[MV_FEATURE_CACHE_FINGERPRINT_KEY]).item())
+            expected_fingerprint = getattr(self, "_cache_contract_fingerprint", None)
+            if expected_fingerprint is None and self.feature_cache is not None:
+                try:
+                    manifest = load_mv_feature_cache_manifest(self.feature_cache)
+                    expected_fingerprint = manifest.get("fingerprint")
+                    self._cache_contract_fingerprint = expected_fingerprint
+                except Exception as exc:
+                    self._cache_contract_problem(
+                        f"mv_feature_cache={self.feature_cache} is missing v3 root provenance: {exc}"
+                    )
+            if row_fingerprint is not None and expected_fingerprint and row_fingerprint != expected_fingerprint:
+                self._cache_contract_problem(
+                    f"{path} provenance fingerprint {row_fingerprint} does not match root manifest "
+                    f"{expected_fingerprint}; rebuild the cache root atomically."
+                )
+            if MV_FEATURE_CACHE_CONTRACT_KEY in z.files:
+                row_contract = load_mv_feature_cache_contract(z[MV_FEATURE_CACHE_CONTRACT_KEY])
+                if row_contract.get("fingerprint") != row_fingerprint:
+                    self._cache_contract_problem(
+                        f"{path} embedded contract fingerprint {row_contract.get('fingerprint')} "
+                        f"does not match row fingerprint {row_fingerprint}."
                     )
             view_indices = np.asarray(z["view_indices"], dtype=np.int64)
             view_mask = np.asarray(z["view_mask"], dtype=bool)

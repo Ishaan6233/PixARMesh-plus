@@ -32,7 +32,12 @@ from scripts.eval.mv_layout_evidence_common import (
     STAGE2_TRAIN_ROOT,
     UID_KEYS,
 )
-from src.data.trellis2_mv import MV_FEATURE_CACHE_KEYS, MV_FEATURE_CACHE_VERSION
+from src.data.trellis2_mv import (
+    MV_FEATURE_CACHE_FINGERPRINT_KEY,
+    MV_FEATURE_CACHE_KEYS,
+    MV_FEATURE_CACHE_MANIFEST_NAME,
+    MV_FEATURE_CACHE_VERSION,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-dataset", default=DEFAULT_HF_DATASET)
     parser.add_argument("--mv-feature-cache", default=DEFAULT_MV_FEATURE_CACHE)
     parser.add_argument(
-        "--sv-downstream", default="outputs/sv/eval/baseline/eval_obj_results.jsonl"
+        "--sv-downstream",
+        default="outputs/sv/certified/pixarmesh-paper/eval_obj_results.jsonl",
     )
     parser.add_argument(
         "--uid-metadata", default="metadata/layout_uid_categories.jsonl"
@@ -332,6 +338,40 @@ def check_feature_cache(
         _record_issue(report, f"MV feature cache has no .npz files: {root}")
         record_cache_remediation()
         return
+    manifest_path = root / MV_FEATURE_CACHE_MANIFEST_NAME
+    manifest = None
+    if not manifest_path.exists():
+        cache_has_manifest_issue = True
+        _record_issue(
+            report,
+            f"MV feature cache root lacks {MV_FEATURE_CACHE_MANIFEST_NAME}; rebuild as schema v{MV_FEATURE_CACHE_VERSION}.",
+        )
+    else:
+        cache_has_manifest_issue = False
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            entry["manifest"] = {
+                "path": str(manifest_path),
+                "fingerprint": manifest.get("fingerprint"),
+                "cache_version": manifest.get("cache_version"),
+                "certifiable": manifest.get("certifiable"),
+                "uncertified_reasons": manifest.get("uncertified_reasons", []),
+            }
+            if manifest.get("cache_version") != MV_FEATURE_CACHE_VERSION:
+                cache_has_manifest_issue = True
+                _record_issue(
+                    report,
+                    f"{manifest_path} has cache_version={manifest.get('cache_version')}, expected {MV_FEATURE_CACHE_VERSION}",
+                )
+            if not manifest.get("certifiable"):
+                cache_has_manifest_issue = True
+                _record_issue(
+                    report,
+                    f"{manifest_path} is not certifiable: {manifest.get('uncertified_reasons', [])}",
+                )
+        except Exception as exc:  # noqa: BLE001
+            cache_has_manifest_issue = True
+            _record_issue(report, f"could not read MV feature cache manifest {manifest_path}: {exc}")
     required = set(MV_FEATURE_CACHE_KEYS)
     expected_by_split, coverage_input_issues = _expected_cache_uids_by_split(mesh_root)
     expected_uids: set[str] | None = None
@@ -403,6 +443,14 @@ def check_feature_cache(
                         report,
                         f"{path} has cache_version={sample['cache_version']}, expected {MV_FEATURE_CACHE_VERSION}",
                     )
+                if MV_FEATURE_CACHE_FINGERPRINT_KEY in z.files:
+                    sample["fingerprint"] = str(np.asarray(z[MV_FEATURE_CACHE_FINGERPRINT_KEY]).item())
+                    if manifest and sample["fingerprint"] != manifest.get("fingerprint"):
+                        cache_has_issue = True
+                        _record_issue(
+                            report,
+                            f"{path} fingerprint={sample['fingerprint']} does not match manifest {manifest.get('fingerprint')}",
+                        )
                 if not missing and "view_mask" in z.files:
                     sample["empty_marker"] = not bool(np.asarray(z["view_mask"], dtype=bool).any())
                     if sample["empty_marker"]:
@@ -437,7 +485,13 @@ def check_feature_cache(
                     f"{warn_empty_marker_frac:.1%} watch threshold; confirm this matches the "
                     "expected runtime-rejection rate before trusting downstream coverage.",
                 )
-    if cache_has_issue or coverage_input_issues or entry["coverage"].get("missing_count") or entry["coverage"].get("extra_count"):
+    if (
+        cache_has_issue
+        or cache_has_manifest_issue
+        or coverage_input_issues
+        or entry["coverage"].get("missing_count")
+        or entry["coverage"].get("extra_count")
+    ):
         record_cache_remediation()
 
 
@@ -506,6 +560,27 @@ def check_sv_downstream(
             "Regenerate the SV baseline so the final row reports aggregate CD/F metrics.",
         )
         return
+    required_protocol = (
+        "coverage",
+        "num_sample_points",
+        "align_sample_points",
+        "alignment_protocol",
+        "mask_area_thresh",
+        "evaluator_seed",
+        "rng_policy",
+        "eval_protocol_fingerprint",
+    )
+    missing_protocol = [key for key in required_protocol if key not in summary]
+    if missing_protocol:
+        _record_issue(
+            report,
+            f"SV downstream summary lacks required evaluation provenance keys: {missing_protocol}",
+        )
+    elif float(summary.get("coverage", 0.0)) < 0.95:
+        _record_issue(
+            report,
+            f"SV downstream coverage={float(summary.get('coverage', 0.0)):.1%} below 95%",
+        )
     _check_sv_baseline_agreement(
         report, path=path, summary=summary, baseline_glob=baseline_glob, tolerance=tolerance
     )
@@ -551,7 +626,7 @@ def _check_sv_baseline_agreement(
             {"path": p, "avg_cd": cd, "relative_diff": diff} for p, cd, diff in disagreements
         ]
         details = "; ".join(f"{p} (avg_cd={cd:.6f}, {diff:.0%} off)" for p, cd, diff in disagreements)
-        _record_warning(
+        _record_issue(
             report,
             f"other candidate SV baseline file(s) disagree with {path} "
             f"(avg_cd={own_cd:.6f}) by more than {tolerance:.0%}: {details}. "

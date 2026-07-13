@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from scripts.eval.mv_layout_evidence_common import (
     downstream_object_key,
     downstream_seed_label,
@@ -40,7 +42,19 @@ REQUIRED_VERIFIER_FILES = [
     "council_review.md",
 ]
 
-REQUIRED_DOWNSTREAM_KEYS = ["avg_cd", "avg_f_score", "num_evaluated"]
+REQUIRED_DOWNSTREAM_KEYS = ["avg_cd", "avg_f_score", "num_evaluated", "coverage"]
+REQUIRED_DOWNSTREAM_PROTOCOL_KEYS = (
+    "num_sample_points",
+    "align_sample_points",
+    "alignment_protocol",
+    "no_align",
+    "mask_area_thresh",
+    "evaluator_seed",
+    "rng_policy",
+    "eval_protocol_fingerprint",
+)
+DOWNSTREAM_PROTOCOL_COMPARE_KEYS = REQUIRED_DOWNSTREAM_PROTOCOL_KEYS
+MIN_DOWNSTREAM_COVERAGE = 0.95
 REQUIRED_LAYOUT_REPORT_KEYS = (
     "config_name",
     "split",
@@ -137,6 +151,23 @@ def parse_args() -> argparse.Namespace:
         "--summary-json",
         default="outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json",
         help="Evidence summary JSON used for category-stability gates.",
+    )
+    parser.add_argument(
+        "--paper-target",
+        default="configs/eval/pixarmesh_paper_target.json",
+        help="Tracked PixARMesh paper target spec that MV downstream seeds must beat.",
+    )
+    parser.add_argument(
+        "--bootstrap-resamples",
+        type=int,
+        default=10000,
+        help="Scene-clustered paired-bootstrap resamples for three-seed downstream certification.",
+    )
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=20260713,
+        help="Deterministic RNG seed for the scene-clustered paired bootstrap.",
     )
     parser.add_argument(
         "--best-layout-run",
@@ -470,6 +501,12 @@ def check_downstream(
     missing = [key for key in REQUIRED_DOWNSTREAM_KEYS if key not in summary]
     if missing:
         record_issue(report, f"downstream summary for {name} missing keys: {missing}")
+    missing_protocol = [key for key in REQUIRED_DOWNSTREAM_PROTOCOL_KEYS if key not in summary]
+    if missing_protocol:
+        record_issue(
+            report,
+            f"downstream summary for {name} missing protocol/provenance keys: {missing_protocol}",
+        )
     if not object_records:
         record_issue(
             report,
@@ -485,10 +522,80 @@ def check_downstream(
             report,
             f"downstream summary for {name} has object rows without cd/f_score: {bad_records[:20]}",
         )
+    bad_protocol_records = [
+        key
+        for key, record in object_records.items()
+        if any(proto_key not in record for proto_key in REQUIRED_DOWNSTREAM_PROTOCOL_KEYS)
+        or "object_eval_seed" not in record
+    ]
+    if bad_protocol_records:
+        record_issue(
+            report,
+            f"downstream summary for {name} has object rows without eval protocol provenance: "
+            f"{bad_protocol_records[:20]}",
+        )
+    coverage = summary.get("coverage")
+    if coverage is not None and float(coverage) < MIN_DOWNSTREAM_COVERAGE:
+        record_issue(
+            report,
+            f"downstream summary for {name} coverage={float(coverage):.1%} below "
+            f"{MIN_DOWNSTREAM_COVERAGE:.0%}",
+        )
     report["downstream"][name].update(
         {key: summary.get(key) for key in REQUIRED_DOWNSTREAM_KEYS}
     )
+    report["downstream"][name]["protocol"] = {
+        key: summary.get(key) for key in REQUIRED_DOWNSTREAM_PROTOCOL_KEYS
+    }
     return object_records
+
+
+def check_downstream_protocol_match(report: dict[str, Any], label: str) -> None:
+    sv_protocol = report["downstream"].get("SV", {}).get("protocol") or {}
+    mv_protocol = report["downstream"].get(label, {}).get("protocol") or {}
+    mismatches = []
+    for key in DOWNSTREAM_PROTOCOL_COMPARE_KEYS:
+        if sv_protocol.get(key) != mv_protocol.get(key):
+            mismatches.append(
+                {"key": key, "sv": sv_protocol.get(key), "mv": mv_protocol.get(key)}
+            )
+    if mismatches:
+        record_issue(
+            report,
+            f"downstream protocol mismatch for {label} vs SV: {mismatches}",
+        )
+
+
+def check_paper_target(report: dict[str, Any], label: str, paper_target: dict[str, Any] | None) -> None:
+    if paper_target is None:
+        record_issue(report, "missing PixARMesh paper target specification")
+        return
+    target = paper_target.get("object_level") or {}
+    target_cd = target.get("mean_cd")
+    target_f = target.get("mean_f_score")
+    min_cov = float(paper_target.get("coverage_min", MIN_DOWNSTREAM_COVERAGE))
+    entry = report["downstream"].get(label, {})
+    if target_cd is None or target_f is None:
+        record_issue(report, "paper target spec lacks object_level.mean_cd/mean_f_score")
+        return
+    cd = entry.get("avg_cd")
+    f_score = entry.get("avg_f_score")
+    coverage = entry.get("coverage")
+    paper_check = {
+        "target_mean_cd": target_cd,
+        "target_mean_f_score": target_f,
+        "coverage_min": min_cov,
+        "cd_beats_paper": cd is not None and float(cd) < float(target_cd),
+        "f_score_beats_paper": f_score is not None and float(f_score) > float(target_f),
+        "coverage_passes": coverage is not None and float(coverage) >= min_cov,
+    }
+    entry["paper_target"] = paper_check
+    if not paper_check["cd_beats_paper"]:
+        record_issue(report, f"downstream {label} does not beat PixARMesh paper CD target")
+    if not paper_check["f_score_beats_paper"]:
+        record_issue(report, f"downstream {label} does not beat PixARMesh paper F-score target")
+    if not paper_check["coverage_passes"]:
+        record_issue(report, f"downstream {label} does not meet paper-target coverage gate")
 
 
 def paired_downstream_deltas(
@@ -516,6 +623,106 @@ def paired_downstream_deltas(
         "avg_f_score_delta_vs_sv": avg_f_delta,
         "cd_beats_sv": avg_cd_delta is not None and avg_cd_delta < 0,
         "f_score_beats_sv": avg_f_delta is not None and avg_f_delta > 0,
+    }
+
+
+def _downstream_cluster_key(
+    key: str,
+    mv_record: dict[str, Any],
+    sv_record: dict[str, Any],
+) -> str:
+    # eval_obj rows use uid as the scene id and obj_id as the object index.
+    # Prefer explicit scene_id if future manifests add it; otherwise uid is the
+    # correct scene cluster for the current object-level eval rows.
+    return str(
+        mv_record.get("scene_id")
+        or sv_record.get("scene_id")
+        or mv_record.get("uid")
+        or sv_record.get("uid")
+        or key
+    )
+
+
+def scene_clustered_paired_bootstrap(
+    mv_record_sets: list[dict[str, dict[str, Any]]],
+    sv_records: dict[str, dict[str, Any]],
+    *,
+    resamples: int,
+    seed: int,
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    clusters: dict[str, list[tuple[float, float]]] = {}
+    for mv_records in mv_record_sets:
+        for key in sorted(set(mv_records) & set(sv_records)):
+            mv_record = mv_records[key]
+            sv_record = sv_records[key]
+            if (
+                mv_record.get("cd") is None
+                or sv_record.get("cd") is None
+                or mv_record.get("f_score") is None
+                or sv_record.get("f_score") is None
+            ):
+                continue
+            cluster = _downstream_cluster_key(key, mv_record, sv_record)
+            clusters.setdefault(cluster, []).append(
+                (
+                    float(mv_record["cd"]) - float(sv_record["cd"]),
+                    float(mv_record["f_score"]) - float(sv_record["f_score"]),
+                )
+            )
+
+    resamples = int(resamples)
+    if resamples <= 0:
+        return {
+            "resamples": resamples,
+            "seed": int(seed),
+            "confidence": float(confidence),
+            "cluster_count": 0,
+            "paired_observation_count": 0,
+            "error": "bootstrap resamples must be positive",
+        }
+
+    cluster_values = [np.asarray(values, dtype=np.float64) for values in clusters.values()]
+    if not cluster_values:
+        return {
+            "resamples": resamples,
+            "seed": int(seed),
+            "confidence": float(confidence),
+            "cluster_count": 0,
+            "paired_observation_count": 0,
+            "error": "no paired downstream observations",
+        }
+
+    all_values = np.concatenate(cluster_values, axis=0)
+    point = all_values.mean(axis=0)
+    rng = np.random.default_rng(int(seed))
+    cd_means = np.empty(resamples, dtype=np.float64)
+    f_means = np.empty(resamples, dtype=np.float64)
+    n_clusters = len(cluster_values)
+    for i in range(resamples):
+        sample_ids = rng.integers(0, n_clusters, size=n_clusters)
+        sample = np.concatenate([cluster_values[idx] for idx in sample_ids], axis=0)
+        means = sample.mean(axis=0)
+        cd_means[i] = means[0]
+        f_means[i] = means[1]
+
+    alpha = (1.0 - float(confidence)) / 2.0
+    cd_low, cd_high = np.quantile(cd_means, [alpha, 1.0 - alpha])
+    f_low, f_high = np.quantile(f_means, [alpha, 1.0 - alpha])
+    return {
+        "resamples": resamples,
+        "seed": int(seed),
+        "confidence": float(confidence),
+        "cluster_count": n_clusters,
+        "paired_observation_count": int(len(all_values)),
+        "cd_delta_mean": float(point[0]),
+        "cd_delta_ci_low": float(cd_low),
+        "cd_delta_ci_high": float(cd_high),
+        "f_score_delta_mean": float(point[1]),
+        "f_score_delta_ci_low": float(f_low),
+        "f_score_delta_ci_high": float(f_high),
+        "cd_upper_bound_below_zero": bool(cd_high < 0.0),
+        "f_score_lower_bound_above_zero": bool(f_low > 0.0),
     }
 
 
@@ -710,6 +917,9 @@ def build_evidence_report(
     summary_json: Path = Path(
         "outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json"
     ),
+    paper_target: Path = Path("configs/eval/pixarmesh_paper_target.json"),
+    bootstrap_resamples: int = 10000,
+    bootstrap_seed: int = 20260713,
     best_layout_run: str = "",
     require_visuals: bool = False,
     require_figures: bool = False,
@@ -740,14 +950,26 @@ def build_evidence_report(
     check_pairing(
         report, layout_root=layout_root, runs=runs, seeds=seeds, ce_run=ce_run
     )
+    paper_target_payload = read_json(paper_target)
+    report["paper_target"] = {
+        "path": str(paper_target),
+        "present": paper_target_payload is not None,
+        "source": (paper_target_payload or {}).get("source"),
+        "object_level": (paper_target_payload or {}).get("object_level"),
+        "coverage_min": (paper_target_payload or {}).get("coverage_min"),
+    }
     sv_records = check_downstream(report, name="SV", path=sv_downstream)
     downstream_groups: dict[str, list[Path]] = {}
+    downstream_records_by_group: dict[str, list[dict[str, dict[str, Any]]]] = {}
     for item in downstream:
         name, path = parse_named_path(item)
         paths = downstream_groups.setdefault(name, [])
         paths.append(path)
         label = name if len(paths) == 1 else f"{name}#{len(paths)}"
         mv_records = check_downstream(report, name=label, path=path)
+        downstream_records_by_group.setdefault(name, []).append(mv_records)
+        check_downstream_protocol_match(report, label)
+        check_paper_target(report, label, paper_target_payload)
         if sv_records and mv_records and set(sv_records) != set(mv_records):
             record_issue(
                 report,
@@ -803,6 +1025,28 @@ def build_evidence_report(
                 report,
                 f"downstream group {name!r} has unexpected seed labels {sorted(observed - expected)}",
             )
+        if len(seeds) >= 3 and sv_records and paths:
+            bootstrap = scene_clustered_paired_bootstrap(
+                downstream_records_by_group.get(name, []),
+                sv_records,
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed,
+            )
+            report["downstream_groups"][name]["scene_clustered_paired_bootstrap"] = bootstrap
+            if bootstrap.get("error"):
+                record_issue(report, f"downstream group {name!r} bootstrap failed: {bootstrap['error']}")
+            elif not bootstrap.get("cd_upper_bound_below_zero"):
+                record_issue(
+                    report,
+                    f"downstream group {name!r} CD bootstrap upper 95% bound is not below zero "
+                    f"({bootstrap.get('cd_delta_ci_high')})",
+                )
+            if not bootstrap.get("error") and not bootstrap.get("f_score_lower_bound_above_zero"):
+                record_issue(
+                    report,
+                    f"downstream group {name!r} F-score bootstrap lower 95% bound is not above zero "
+                    f"({bootstrap.get('f_score_delta_ci_low')})",
+                )
     check_verifier_findings(report, verifier_dir)
     check_figure_artifacts(report, figure_dir, require_figures)
     check_category_stability(
@@ -828,6 +1072,9 @@ def main() -> int:
         verifier_dir=Path(args.verifier_dir),
         figure_dir=Path(args.figure_dir),
         summary_json=Path(args.summary_json),
+        paper_target=Path(args.paper_target),
+        bootstrap_resamples=args.bootstrap_resamples,
+        bootstrap_seed=args.bootstrap_seed,
         best_layout_run=args.best_layout_run,
         require_visuals=args.require_visuals,
         require_figures=args.require_figures,

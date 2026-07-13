@@ -1,18 +1,70 @@
 import numpy as np
 import pytest
 
-import warnings
+import json
 
 from src.data.collator import get_mesh_data_collator
 from src.data.trellis2_mv import (
-    MV_FEATURE_CACHE_POLICY_KEY,
+    MV_FEATURE_CACHE_CONTRACT_KEY,
+    MV_FEATURE_CACHE_FINGERPRINT_KEY,
     MV_FEATURE_CACHE_VERSION,
     Trellis2MVDataset,
     _mask_sanity_for_view,
     _select_diverse_views,
+    build_mv_feature_cache_contract,
     view_selection_policy_fingerprint,
 )
 from src.utils.config import DataConfig, ModelConfig
+
+
+TEST_CACHE_FP = "test-cache-fp"
+
+
+def _test_contract(fingerprint: str = TEST_CACHE_FP) -> dict:
+    return {
+        "schema": "trellis2_mv_feature_cache",
+        "cache_version": MV_FEATURE_CACHE_VERSION,
+        "fingerprint": fingerprint,
+        "certifiable": True,
+        "uncertified_reasons": [],
+    }
+
+
+def _write_cache_manifest(root, fingerprint: str = TEST_CACHE_FP) -> None:
+    (root / "manifest.json").write_text(json.dumps(_test_contract(fingerprint)))
+
+
+def _provenance_kwargs(fingerprint: str = TEST_CACHE_FP) -> dict:
+    return {
+        MV_FEATURE_CACHE_FINGERPRINT_KEY: np.asarray(fingerprint),
+        MV_FEATURE_CACHE_CONTRACT_KEY: np.asarray(json.dumps(_test_contract(fingerprint))),
+    }
+
+
+def _model_cfg_for_cache(tmp_path, dino_dir=None) -> ModelConfig:
+    dino_dir = dino_dir or (tmp_path / "dino")
+    return ModelConfig(
+        vocab_size=64,
+        num_pos_tokens=32,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        pc_token_id=3,
+        tokenization_method="meshxl",
+        max_seq_length=32,
+        pos_token_offset=6,
+        layout_tokenization_method="tri",
+        image_encoder=str(dino_dir),
+        da3_ckpt_path=str(tmp_path / "da3"),
+    )
+
+
+def _write_artifact_dirs(tmp_path):
+    for name in ("da3", "dino", "preproc"):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "config.json").write_text(json.dumps({"name": name}))
+    return tmp_path / "da3", tmp_path / "dino", tmp_path / "preproc"
 
 
 def test_select_diverse_views_requires_minimum_reference_support():
@@ -76,15 +128,17 @@ def test_mask_sanity_accepts_identifiable_target_seed_hits():
 def test_feature_cache_loads_valid_cached_tensors(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
+    _write_cache_manifest(tmp_path)
     np.savez_compressed(
         tmp_path / "uid-a.npz",
-        cache_version=np.array(2, dtype=np.int64),
+        cache_version=np.array(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
         local_points=np.zeros((2, 4, 5, 3), dtype=np.float16),
         conf=np.ones((2, 4, 5, 1), dtype=np.float16),
         dino_feats=np.zeros((2, 8, 2, 3), dtype=np.float16),
         view_indices=np.array([3, 1], dtype=np.int64),
         view_mask=np.array([True, False]),
         ref_view=np.array(0, dtype=np.int64),
+        **_provenance_kwargs(),
     )
 
     cache = ds._load_feature_cache("uid-a", n_avail=4)
@@ -97,6 +151,7 @@ def test_feature_cache_loads_valid_cached_tensors(tmp_path):
 def test_feature_cache_loads_empty_marker_for_runtime_rejected_item(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
+    _write_cache_manifest(tmp_path)
     np.savez_compressed(
         tmp_path / "uid-a.npz",
         cache_version=np.array(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
@@ -107,6 +162,7 @@ def test_feature_cache_loads_empty_marker_for_runtime_rejected_item(tmp_path):
         view_mask=np.array([False, False]),
         ref_view=np.array(0, dtype=np.int64),
         empty_reason=np.asarray("mask sanity rejected all support views"),
+        **_provenance_kwargs(),
     )
 
     cache = ds._load_feature_cache("uid-a", n_avail=4)
@@ -130,6 +186,7 @@ def test_dataset_maps_empty_feature_cache_marker_to_graceful_empty_item(tmp_path
     ds.is_train = False
     ds.norm_bound = 0.9995
     ds.feature_cache = tmp_path
+    _write_cache_manifest(tmp_path)
     ds._uid_to_idx = {"uid-a": 0}
     ds._scene_id_to_idx = {"scene-a": 0}
     ds._pan_key = None
@@ -164,6 +221,7 @@ def test_dataset_maps_empty_feature_cache_marker_to_graceful_empty_item(tmp_path
         view_mask=np.array([False, False]),
         ref_view=np.array(0, dtype=np.int64),
         empty_reason=np.asarray("runtime rejected"),
+        **_provenance_kwargs(),
     )
     # A real (non-marker) cache entry must exist as the shape template for the
     # zero cached features that empty items ship in cache mode.
@@ -176,6 +234,7 @@ def test_dataset_maps_empty_feature_cache_marker_to_graceful_empty_item(tmp_path
         view_indices=np.array([0, 1], dtype=np.int64),
         view_mask=np.array([True, False]),
         ref_view=np.array(0, dtype=np.int64),
+        **_provenance_kwargs(),
     )
 
     with pytest.warns(UserWarning, match="runtime rejected"):
@@ -212,6 +271,7 @@ def test_feature_cache_rejects_stale_old_format(tmp_path):
 def test_feature_cache_rejects_wrong_cache_version(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
+    _write_cache_manifest(tmp_path)
     np.savez_compressed(
         tmp_path / "uid-a.npz",
         cache_version=np.array(1, dtype=np.int64),
@@ -221,6 +281,7 @@ def test_feature_cache_rejects_wrong_cache_version(tmp_path):
         view_indices=np.array([3, 1], dtype=np.int64),
         view_mask=np.array([True, False]),
         ref_view=np.array(0, dtype=np.int64),
+        **_provenance_kwargs(),
     )
 
     with pytest.raises(ValueError, match="cache_version=1"):
@@ -230,15 +291,17 @@ def test_feature_cache_rejects_wrong_cache_version(tmp_path):
 def test_feature_cache_rejects_ref_view_outside_valid_mask(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
+    _write_cache_manifest(tmp_path)
     np.savez_compressed(
         tmp_path / "uid-a.npz",
-        cache_version=np.array(2, dtype=np.int64),
+        cache_version=np.array(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
         local_points=np.zeros((2, 4, 5, 3), dtype=np.float16),
         conf=np.ones((2, 4, 5, 1), dtype=np.float16),
         dino_feats=np.zeros((2, 8, 2, 3), dtype=np.float16),
         view_indices=np.array([3, 1], dtype=np.int64),
         view_mask=np.array([False, True]),
         ref_view=np.array(0, dtype=np.int64),
+        **_provenance_kwargs(),
     )
 
     with pytest.raises(ValueError, match="view_mask\\[ref_view\\] is false"):
@@ -254,9 +317,39 @@ def test_view_selection_policy_fingerprint_changes_with_policy_fields():
     assert view_selection_policy_fingerprint(base) == view_selection_policy_fingerprint(same)
 
 
-def _cache_kwargs(policy_fingerprint: str | None):
+def test_mv_feature_cache_contract_fingerprint_covers_policy_and_artifact_bytes(tmp_path):
+    _da3, dino, preproc = _write_artifact_dirs(tmp_path)
+    data_cfg = DataConfig(
+        type="trellis2_mv",
+        path="unused",
+        num_views=8,
+        image_preprocessor=str(preproc),
+    )
+    model_cfg = _model_cfg_for_cache(tmp_path, dino)
+
+    base = build_mv_feature_cache_contract(data_cfg, model_cfg)
+    same = build_mv_feature_cache_contract(data_cfg, model_cfg)
+    changed_views = build_mv_feature_cache_contract(
+        DataConfig(
+            type="trellis2_mv",
+            path="unused",
+            num_views=4,
+            image_preprocessor=str(preproc),
+        ),
+        model_cfg,
+    )
+    (dino / "config.json").write_text(json.dumps({"name": "dino", "changed": True}))
+    changed_dino = build_mv_feature_cache_contract(data_cfg, model_cfg)
+
+    assert base["certifiable"]
+    assert base["fingerprint"] == same["fingerprint"]
+    assert base["fingerprint"] != changed_views["fingerprint"]
+    assert base["fingerprint"] != changed_dino["fingerprint"]
+
+
+def _cache_kwargs(fingerprint: str | None = TEST_CACHE_FP):
     kwargs = dict(
-        cache_version=np.array(2, dtype=np.int64),
+        cache_version=np.array(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
         local_points=np.zeros((2, 4, 5, 3), dtype=np.float16),
         conf=np.ones((2, 4, 5, 1), dtype=np.float16),
         dino_feats=np.zeros((2, 8, 2, 3), dtype=np.float16),
@@ -264,56 +357,40 @@ def _cache_kwargs(policy_fingerprint: str | None):
         view_mask=np.array([True, False]),
         ref_view=np.array(0, dtype=np.int64),
     )
-    if policy_fingerprint is not None:
-        kwargs[MV_FEATURE_CACHE_POLICY_KEY] = np.asarray(policy_fingerprint)
+    if fingerprint is not None:
+        kwargs.update(_provenance_kwargs(fingerprint))
     return kwargs
 
 
-def test_feature_cache_warns_once_on_policy_fingerprint_mismatch(tmp_path):
+def test_feature_cache_rejects_row_fingerprint_mismatch(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
-    ds._current_policy_fingerprint = "current-policy"
-    ds._policy_mismatch_warned = False
-    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("stale-policy"))
+    _write_cache_manifest(tmp_path, fingerprint="root-fp")
+    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("row-fp"))
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ds._load_feature_cache("uid-a", n_avail=4)
+    with pytest.raises(ValueError, match="does not match root manifest"):
         ds._load_feature_cache("uid-a", n_avail=4)
 
-    policy_warnings = [w for w in caught if "view-selection policy" in str(w.message)]
-    assert len(policy_warnings) == 1
-    assert ds._policy_mismatch_warned is True
 
-
-def test_feature_cache_silent_when_policy_fingerprint_matches(tmp_path):
+def test_feature_cache_loads_when_row_fingerprint_matches_manifest(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
-    ds._current_policy_fingerprint = "same-policy"
-    ds._policy_mismatch_warned = False
-    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("same-policy"))
+    _write_cache_manifest(tmp_path, fingerprint="same-fp")
+    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("same-fp"))
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ds._load_feature_cache("uid-a", n_avail=4)
+    cache = ds._load_feature_cache("uid-a", n_avail=4)
 
-    assert not [w for w in caught if "view-selection policy" in str(w.message)]
+    assert cache["view_indices"].tolist() == [3, 1]
 
 
-def test_feature_cache_silent_when_policy_fingerprint_absent_legacy_cache(tmp_path):
-    # Cache files built before MV_FEATURE_CACHE_POLICY_KEY existed have no such key;
-    # they must keep loading without warning or crashing (backward compatibility).
+def test_feature_cache_rejects_missing_provenance_legacy_cache(tmp_path):
     ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
     ds.feature_cache = tmp_path
-    ds._current_policy_fingerprint = "current-policy"
-    ds._policy_mismatch_warned = False
+    _write_cache_manifest(tmp_path)
     np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs(None))
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with pytest.raises(ValueError, match="missing v3 provenance keys"):
         ds._load_feature_cache("uid-a", n_avail=4)
-
-    assert not [w for w in caught if "view-selection policy" in str(w.message)]
 
 
 def test_mv_collator_keeps_only_plural_scene_transforms():

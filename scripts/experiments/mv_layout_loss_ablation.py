@@ -44,8 +44,10 @@ def parse_args() -> argparse.Namespace:
         "--stage2-config", default="edgerunner_3d_front_trellis2_mv_stage2"
     )
     parser.add_argument(
-        "--sv-downstream", default="outputs/sv/eval/baseline/eval_obj_results.jsonl"
+        "--sv-downstream",
+        default="outputs/sv/certified/pixarmesh-paper/eval_obj_results.jsonl",
     )
+    parser.add_argument("--paper-target", default="configs/eval/pixarmesh_paper_target.json")
     parser.add_argument("--mv-feature-cache", default=DEFAULT_MV_FEATURE_CACHE)
     parser.add_argument("--mesh-dataset", default=DEFAULT_MESH_DATASET)
     parser.add_argument("--hf-dataset", default=DEFAULT_HF_DATASET)
@@ -187,6 +189,7 @@ def train_stage2_command(
     overrides = [
         f"--config-name={args.stage2_config}",
         f"model.local_path={stage1_ckpt}",
+        "model.local_path_load_mode=strict_warm_start",
         f"all.name={run_name}",
         f"all.output_dir={output_dir}",
         f"++train.train_args.seed={seed}",
@@ -257,6 +260,7 @@ def main() -> None:
         "stage1_config": args.stage1_config,
         "stage2_config": args.stage2_config,
         "sv_downstream": args.sv_downstream,
+        "paper_target": args.paper_target,
         "uid_metadata": args.uid_metadata,
         "mesh_dataset": args.mesh_dataset,
         "hf_dataset": args.hf_dataset,
@@ -469,6 +473,7 @@ def main() -> None:
         f"--seeds {seed_args} "
         f"--ce-run A_ce "
         f"--sv-downstream ${{SV_DOWNSTREAM}} "
+        f"--paper-target {args.paper_target} "
         f"{downstream_args} "
         f"--verifier-dir {args.out}/verifiers "
         f"--figure-dir {args.out}/evidence_figures "

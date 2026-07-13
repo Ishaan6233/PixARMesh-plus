@@ -35,11 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.trellis2_mv import (
     MV_FEATURE_CACHE_EMPTY_MARKER_KEY,
+    MV_FEATURE_CACHE_CONTRACT_KEY,
+    MV_FEATURE_CACHE_FINGERPRINT_KEY,
     MV_FEATURE_CACHE_KEYS,
-    MV_FEATURE_CACHE_POLICY_KEY,
     MV_FEATURE_CACHE_VERSION,
     Trellis2MVDataset,
-    view_selection_policy_fingerprint,
+    build_mv_feature_cache_contract,
+    serialize_mv_feature_cache_contract,
+    write_mv_feature_cache_manifest,
 )
 from src.models.utils import get_da3_encoder, get_image_condition_encoder
 from src.utils.config import DataConfig, ModelConfig
@@ -58,6 +61,11 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--da3-ckpt", default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--warning-only-provenance",
+        action="store_true",
+        help="Debug only: write a manifest marked warning-only instead of failing on unresolved provenance.",
+    )
     return parser.parse_args()
 
 
@@ -103,19 +111,29 @@ def _autocast(device: torch.device):
     return torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False)
 
 
-def _cache_is_current(path: Path) -> bool:
+def _cache_is_current(path: Path, expected_fingerprint: str) -> bool:
     if not path.exists():
         return False
     try:
         with np.load(path) as z:
             if not _REQUIRED_CACHE_KEYS.issubset(set(z.files)):
                 return False
-            return int(np.asarray(z["cache_version"]).item()) == MV_FEATURE_CACHE_VERSION
+            return (
+                int(np.asarray(z["cache_version"]).item()) == MV_FEATURE_CACHE_VERSION
+                and str(np.asarray(z[MV_FEATURE_CACHE_FINGERPRINT_KEY]).item())
+                == expected_fingerprint
+            )
     except Exception:
         return False
 
 
-def _write_empty_cache_marker(path: Path, ex: dict, data_cfg: DataConfig, reason: str) -> None:
+def _write_empty_cache_marker(
+    path: Path,
+    ex: dict,
+    data_cfg: DataConfig,
+    contract: dict,
+    reason: str,
+) -> None:
     """Write a cache marker for items the runtime loader already deems empty."""
     view_mask_raw = np.asarray(ex.get("view_mask", []), dtype=bool).reshape(-1)
     view_indices_raw = np.asarray(ex.get("view_indices", []), dtype=np.int64).reshape(-1)
@@ -138,7 +156,8 @@ def _write_empty_cache_marker(path: Path, ex: dict, data_cfg: DataConfig, reason
         **{
             MV_FEATURE_CACHE_EMPTY_MARKER_KEY: np.asarray(True),
             "empty_reason": np.asarray(reason),
-            MV_FEATURE_CACHE_POLICY_KEY: np.asarray(view_selection_policy_fingerprint(data_cfg)),
+            MV_FEATURE_CACHE_FINGERPRINT_KEY: np.asarray(contract["fingerprint"]),
+            MV_FEATURE_CACHE_CONTRACT_KEY: np.asarray(serialize_mv_feature_cache_contract(contract)),
         },
     )
 
@@ -158,6 +177,16 @@ def main():
     if args.da3_ckpt is not None:
         model_cfg.da3_ckpt_path = args.da3_ckpt
     data_cfg.load_images = True
+    data_cfg.mv_feature_cache_warning_only = bool(args.warning_only_provenance)
+    contract = build_mv_feature_cache_contract(data_cfg, model_cfg)
+    if not contract.get("certifiable") and not args.warning_only_provenance:
+        raise ValueError(
+            "MV feature cache contract is not certifiable: "
+            + ", ".join(contract.get("uncertified_reasons", []))
+            + ". Resolve the DA3/DINO/preprocessor artifacts or pass "
+            "--warning-only-provenance for a non-certifiable debug cache."
+        )
+    write_mv_feature_cache_manifest(out_dir, contract, overwrite=args.overwrite)
     data_cfg.mv_feature_cache = ""
 
     image_processor = AutoImageProcessor.from_pretrained(
@@ -184,7 +213,7 @@ def main():
             ex = dataset[idx]
             uid = ex["uid"] if isinstance(ex["uid"], str) else ex["uid"][0]
             out_path = out_dir / f"{uid}.npz"
-            if not args.overwrite and _cache_is_current(out_path):
+            if not args.overwrite and _cache_is_current(out_path, contract["fingerprint"]):
                 skipped += 1
                 continue
             if "pixel_values" not in ex or not bool(np.asarray(ex.get("view_mask", [])).any()):
@@ -192,6 +221,7 @@ def main():
                     out_path,
                     ex,
                     data_cfg,
+                    contract,
                     "runtime loader returned an empty MV conditioning example during precompute",
                 )
                 markers += 1
@@ -228,9 +258,10 @@ def main():
                 view_mask=view_mask,
                 ref_view=ref_view,
                 **{
-                    MV_FEATURE_CACHE_POLICY_KEY: np.asarray(
-                        view_selection_policy_fingerprint(data_cfg)
-                    )
+                    MV_FEATURE_CACHE_FINGERPRINT_KEY: np.asarray(contract["fingerprint"]),
+                    MV_FEATURE_CACHE_CONTRACT_KEY: np.asarray(
+                        serialize_mv_feature_cache_contract(contract)
+                    ),
                 },
             )
             wrote += 1
