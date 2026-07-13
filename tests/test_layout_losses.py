@@ -2,7 +2,12 @@ import torch
 import torch.nn.functional as F
 
 from src.data.typing import TokenType
-from src.models.loss import _dequantize_token_bins, _layout_auxiliary_losses, causal_lm_loss_with_token_types
+from src.models.loss import (
+    _SIZE_LOG_FLOOR,
+    _dequantize_token_bins,
+    _layout_auxiliary_losses,
+    causal_lm_loss_with_token_types,
+)
 
 
 POS_OFFSET = 6
@@ -117,7 +122,9 @@ def test_center_and_log_size_losses_match_24_token_bbox_math():
     expected_center = F.smooth_l1_loss(pred_bbox.mean(dim=1), target_bbox.mean(dim=1))
     pred_size = pred_bbox.amax(dim=1) - pred_bbox.amin(dim=1)
     target_size = target_bbox.amax(dim=1) - target_bbox.amin(dim=1)
-    expected_size = F.smooth_l1_loss(pred_size.clamp_min(1e-6).log(), target_size.clamp_min(1e-6).log())
+    expected_size = F.smooth_l1_loss(
+        pred_size.clamp_min(_SIZE_LOG_FLOOR).log(), target_size.clamp_min(_SIZE_LOG_FLOOR).log()
+    )
 
     assert torch.allclose(aux["loss_layout_center"], expected_center, atol=1e-5)
     assert torch.allclose(aux["loss_layout_size"], expected_size, atol=1e-5)
@@ -139,6 +146,29 @@ def test_unsupported_layout_token_count_skips_geometry_losses():
     assert aux["loss_layout_coord"].item() == 0.0
     assert aux["loss_layout_center"].item() == 0.0
     assert aux["loss_layout_size"].item() == 0.0
+
+
+def test_size_log_floor_bounds_gradient_for_near_degenerate_bbox():
+    # A thin object (near-zero extent on one axis) drives pred_size toward the
+    # clamp floor; d/dx log(x) = 1/x there, so the floor bounds the worst-case
+    # gradient. pred and target must differ near the floor for the smooth_l1
+    # residual (and hence the gradient) to be nonzero -- if both clamp to the
+    # exact same floor value the residual is 0 and this would vacuously pass.
+    pred_size = torch.tensor([3e-6, 0.5, 0.5], requires_grad=True)
+    target_size = torch.tensor([0.05, 0.5, 0.5])
+
+    old_floor_loss = F.smooth_l1_loss(pred_size.clamp_min(1e-6).log(), target_size.clamp_min(1e-6).log())
+    (old_floor_grad,) = torch.autograd.grad(old_floor_loss, pred_size)
+    # At the old 1e-6 floor this exact pattern (thin predicted object vs a
+    # truly degenerate target) produced the 1e6-1e7 grad_norm spikes measured
+    # mid-training in outputs/da3/train/mv_layout_loss/D_geometry/seed11.
+    assert old_floor_grad.abs().max().item() > 1e3
+
+    new_floor_loss = F.smooth_l1_loss(
+        pred_size.clamp_min(_SIZE_LOG_FLOOR).log(), target_size.clamp_min(_SIZE_LOG_FLOOR).log()
+    )
+    (new_floor_grad,) = torch.autograd.grad(new_floor_loss, pred_size)
+    assert new_floor_grad.abs().max().item() < 100.0
 
 
 def test_legacy_loss_api_still_returns_three_values():

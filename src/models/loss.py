@@ -54,6 +54,15 @@ def _zero_like_loss(logits: torch.Tensor) -> torch.Tensor:
     return logits.sum() * 0.0
 
 
+# d/dx log(x) = 1/x: a clamp floor near 0 makes the log-size loss's gradient
+# unbounded for near-degenerate bbox extents (thin objects) even though the
+# loss *value* stays small. 1e-2 is ~2.5 dequantized-bin widths (2/num_pos_tokens
+# at num_pos_tokens=512), bounding the worst-case per-term gradient to ~1e2 --
+# well below the observed healthy CE-dominated grad_norm (~1e4) -- instead of
+# the ~1e6-1e7 spikes measured at 1e-6 (outputs/da3/train/mv_layout_loss/D_geometry).
+_SIZE_LOG_FLOOR = 1e-2
+
+
 def _layout_auxiliary_losses(
     logits: torch.Tensor,
     shift_labels: torch.Tensor,
@@ -130,8 +139,8 @@ def _layout_auxiliary_losses(
     out["loss_layout_center"] = nn.functional.smooth_l1_loss(
         pred_center, target_center, reduction="mean"
     )
-    pred_size = (pred_bbox.amax(dim=1) - pred_bbox.amin(dim=1)).clamp_min(1e-6)
-    target_size = (target_bbox.amax(dim=1) - target_bbox.amin(dim=1)).clamp_min(1e-6)
+    pred_size = (pred_bbox.amax(dim=1) - pred_bbox.amin(dim=1)).clamp_min(_SIZE_LOG_FLOOR)
+    target_size = (target_bbox.amax(dim=1) - target_bbox.amin(dim=1)).clamp_min(_SIZE_LOG_FLOOR)
     out["loss_layout_size"] = nn.functional.smooth_l1_loss(
         pred_size.log(), target_size.log(), reduction="mean"
     )
