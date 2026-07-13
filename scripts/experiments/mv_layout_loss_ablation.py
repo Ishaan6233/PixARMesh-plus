@@ -340,7 +340,7 @@ def main() -> None:
     commands.append("")
     commands.append("# Negative training controls for the selected best loss stack.")
     commands.append(
-        ': "${BEST_EXPERIMENT:?set BEST_EXPERIMENT to mv_layout_loss_ordinal/coord/geometry/etc.}"'
+        ': "${BEST_EXPERIMENT:?set BEST_EXPERIMENT to mv_layout_loss_ordinal or mv_layout_loss_coord}"'
     )
     commands.append(
         ': "${BEST_STAGE1_RUN:?set BEST_STAGE1_RUN to the verified stage-1 run name}"'

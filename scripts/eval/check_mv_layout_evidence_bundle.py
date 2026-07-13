@@ -817,7 +817,7 @@ def build_evidence_report(
 
 def main() -> int:
     args = parse_args()
-    runs = args.run or ["A_ce", "B_ordinal", "C_coord", "D_geometry"]
+    runs = args.run or ["A_ce", "B_ordinal", "C_coord"]
     report = build_evidence_report(
         layout_root=Path(args.layout_root),
         runs=runs,

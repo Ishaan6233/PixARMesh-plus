@@ -54,15 +54,6 @@ def _zero_like_loss(logits: torch.Tensor) -> torch.Tensor:
     return logits.sum() * 0.0
 
 
-# d/dx log(x) = 1/x: a clamp floor near 0 makes the log-size loss's gradient
-# unbounded for near-degenerate bbox extents (thin objects) even though the
-# loss *value* stays small. 1e-2 is ~2.5 dequantized-bin widths (2/num_pos_tokens
-# at num_pos_tokens=512), bounding the worst-case per-term gradient to ~1e2 --
-# well below the observed healthy CE-dominated grad_norm (~1e4) -- instead of
-# the ~1e6-1e7 spikes measured at 1e-6 (outputs/da3/train/mv_layout_loss/D_geometry).
-_SIZE_LOG_FLOOR = 1e-2
-
-
 def _layout_auxiliary_losses(
     logits: torch.Tensor,
     shift_labels: torch.Tensor,
@@ -84,8 +75,6 @@ def _layout_auxiliary_losses(
     out: dict[str, Optional[torch.Tensor]] = {
         "loss_layout_ordinal": None,
         "loss_layout_coord": zero,
-        "loss_layout_center": zero,
-        "loss_layout_size": zero,
     }
     if token_type_ids is None or num_pos_tokens <= 0 or loss_layout_geometry_tokens <= 0:
         return out
@@ -132,18 +121,6 @@ def _layout_auxiliary_losses(
     out["loss_layout_coord"] = nn.functional.smooth_l1_loss(
         pred_coords, target_coords, reduction="mean"
     )
-    pred_bbox = pred_coords.view(-1, 8, 3)
-    target_bbox = target_coords.view(-1, 8, 3)
-    pred_center = pred_bbox.mean(dim=1)
-    target_center = target_bbox.mean(dim=1)
-    out["loss_layout_center"] = nn.functional.smooth_l1_loss(
-        pred_center, target_center, reduction="mean"
-    )
-    pred_size = (pred_bbox.amax(dim=1) - pred_bbox.amin(dim=1)).clamp_min(_SIZE_LOG_FLOOR)
-    target_size = (target_bbox.amax(dim=1) - target_bbox.amin(dim=1)).clamp_min(_SIZE_LOG_FLOOR)
-    out["loss_layout_size"] = nn.functional.smooth_l1_loss(
-        pred_size.log(), target_size.log(), reduction="mean"
-    )
     return out
 
 
@@ -161,8 +138,6 @@ def causal_lm_loss_with_token_types(
     loss_layout_ordinal_sigma: Optional[float] = None,
     loss_layout_ordinal_weight: float = 0.0,
     loss_layout_coord_weight: float = 0.0,
-    loss_layout_center_weight: float = 0.0,
-    loss_layout_size_weight: float = 0.0,
     loss_layout_geometry_tokens: int = 24,
     return_layout_components: bool = False,
     **kwargs,
@@ -216,14 +191,10 @@ def causal_lm_loss_with_token_types(
         "loss_layout_token": loss_layout,
         "loss_layout_ordinal": None,
         "loss_layout_coord": None,
-        "loss_layout_center": None,
-        "loss_layout_size": None,
     }
     aux_requested = (
         (loss_layout_ordinal_sigma is not None and float(loss_layout_ordinal_weight) != 0.0)
         or float(loss_layout_coord_weight) != 0.0
-        or float(loss_layout_center_weight) != 0.0
-        or float(loss_layout_size_weight) != 0.0
     )
     if aux_requested:
         aux = _layout_auxiliary_losses(
@@ -241,10 +212,6 @@ def causal_lm_loss_with_token_types(
             loss = loss + float(loss_layout_ordinal_weight) * components["loss_layout_ordinal"]
         if components["loss_layout_coord"] is not None:
             loss = loss + float(loss_layout_coord_weight) * components["loss_layout_coord"]
-        if components["loss_layout_center"] is not None:
-            loss = loss + float(loss_layout_center_weight) * components["loss_layout_center"]
-        if components["loss_layout_size"] is not None:
-            loss = loss + float(loss_layout_size_weight) * components["loss_layout_size"]
 
     if return_layout_components:
         return loss, loss_layout, loss_object, components
@@ -258,5 +225,3 @@ class CustomCausalLMOutputWithTokenTypes(CausalLMOutputWithPast):
     loss_layout_token: Optional[torch.Tensor] = None
     loss_layout_ordinal: Optional[torch.Tensor] = None
     loss_layout_coord: Optional[torch.Tensor] = None
-    loss_layout_center: Optional[torch.Tensor] = None
-    loss_layout_size: Optional[torch.Tensor] = None

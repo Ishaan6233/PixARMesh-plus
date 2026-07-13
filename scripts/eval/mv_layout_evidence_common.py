@@ -26,7 +26,6 @@ ABLATIONS = {
     "A_ce": "mv_layout_loss_ce",
     "B_ordinal": "mv_layout_loss_ordinal",
     "C_coord": "mv_layout_loss_coord",
-    "D_geometry": "mv_layout_loss_geometry",
 }
 DEFAULT_LAYOUT_RUNS = tuple(ABLATIONS)
 

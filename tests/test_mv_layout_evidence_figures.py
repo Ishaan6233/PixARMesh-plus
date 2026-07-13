@@ -54,7 +54,7 @@ def test_ranked_uid_scores_orders_improved_before_regressed(tmp_path):
     )
     _write_seed(
         tmp_path,
-        "D_geometry",
+        "C_coord",
         11,
         [
             _record("better", bin_mae=2.0, aabb_iou=0.6),
@@ -65,7 +65,7 @@ def test_ranked_uid_scores_orders_improved_before_regressed(tmp_path):
     ranked = ranked_uid_scores(
         layout_root=tmp_path,
         baseline_run="A_ce",
-        candidate_run="D_geometry",
+        candidate_run="C_coord",
         seeds=[11],
         metric="aabb_iou",
     )
@@ -78,7 +78,7 @@ def test_ranked_uid_scores_orders_improved_before_regressed(tmp_path):
 def test_failure_uid_scores_orders_worst_candidate_cases(tmp_path):
     _write_seed(
         tmp_path,
-        "D_geometry",
+        "C_coord",
         11,
         [
             _record("ok", bin_mae=1.0, aabb_iou=0.9),
@@ -87,7 +87,7 @@ def test_failure_uid_scores_orders_worst_candidate_cases(tmp_path):
     )
 
     failures = failure_uid_scores(
-        layout_root=tmp_path, candidate_run="D_geometry", seeds=[11]
+        layout_root=tmp_path, candidate_run="C_coord", seeds=[11]
     )
 
     assert [item["uid"] for item in failures] == ["bad", "ok"]
@@ -107,7 +107,7 @@ def test_build_figures_writes_plots_uid_lists_and_composites(tmp_path):
     )
     _write_seed(
         layout_root,
-        "D_geometry",
+        "C_coord",
         11,
         [
             _record("better", bin_mae=2.0, aabb_iou=0.6),
@@ -115,7 +115,7 @@ def test_build_figures_writes_plots_uid_lists_and_composites(tmp_path):
         ],
     )
     summary = {
-        "layout": layout_summary(layout_root, ["A_ce", "D_geometry"], [11], "A_ce"),
+        "layout": layout_summary(layout_root, ["A_ce", "C_coord"], [11], "A_ce"),
         "downstream": {"runs": {}, "comparison_to_sv": {}, "missing": []},
         "seeds": [11],
         "ce_run": "A_ce",
@@ -126,11 +126,11 @@ def test_build_figures_writes_plots_uid_lists_and_composites(tmp_path):
     manifest = build_figures(
         summary_json=summary_json,
         layout_root=layout_root,
-        runs=["A_ce", "D_geometry"],
+        runs=["A_ce", "C_coord"],
         seeds=[11],
         ce_run="A_ce",
         baseline_run="A_ce",
-        candidate_run="D_geometry",
+        candidate_run="C_coord",
         rank_metric="aabb_iou",
         max_gallery_cases=2,
         image_names=["topdown_bbox.png"],
@@ -176,14 +176,14 @@ def test_build_figures_records_empty_improved_uid_list_justification(tmp_path):
     layout_root = tmp_path / "layout"
     _write_seed(layout_root, "A_ce", 11, [_record("same", bin_mae=1.0, aabb_iou=0.5)])
     _write_seed(
-        layout_root, "D_geometry", 11, [_record("same", bin_mae=1.0, aabb_iou=0.5)]
+        layout_root, "C_coord", 11, [_record("same", bin_mae=1.0, aabb_iou=0.5)]
     )
     summary_json = tmp_path / "summary.json"
     summary_json.write_text(
         json.dumps(
             {
                 "layout": layout_summary(
-                    layout_root, ["A_ce", "D_geometry"], [11], "A_ce"
+                    layout_root, ["A_ce", "C_coord"], [11], "A_ce"
                 ),
                 "downstream": {"runs": {}, "comparison_to_sv": {}, "missing": []},
                 "seeds": [11],
@@ -195,11 +195,11 @@ def test_build_figures_records_empty_improved_uid_list_justification(tmp_path):
     manifest = build_figures(
         summary_json=summary_json,
         layout_root=layout_root,
-        runs=["A_ce", "D_geometry"],
+        runs=["A_ce", "C_coord"],
         seeds=[11],
         ce_run="A_ce",
         baseline_run="A_ce",
-        candidate_run="D_geometry",
+        candidate_run="C_coord",
         rank_metric="aabb_iou",
         max_gallery_cases=2,
         image_names=["topdown_bbox.png"],

@@ -1,11 +1,9 @@
-"""Terminal summary + plots for a D_geometry MV layout-loss training run.
+"""Terminal summary + plots for an MV layout-loss training run.
 
 Reads the run's log.jsonl directly (no tensorboard needed), prints a compact
 progress table, and saves a multi-panel PNG covering the metrics relevant to
-this loss stack: overall loss, grad_norm (log scale — this run's grad_norm
-legitimately spans tens to 1e7+ early on, see loss.py's size-loss clamp_min
-gradient spike), token accuracy, learning rate, and the four D_geometry
-components (loss_layout_token/ordinal/coord/center/size).
+this loss stack: overall loss, grad_norm (log scale), token accuracy, learning
+rate, and enabled layout-loss components (loss_layout_token/ordinal/coord).
 
 Usage:
     python scripts/figures/plot_geoloss_progress.py
@@ -18,14 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.plot_training import extract_series, load_log, smooth
 
-DEFAULT_LOG = "outputs/da3/train/mv_layout_loss/D_geometry/seed11/logs/log.jsonl"
-DEFAULT_OUT = "outputs/da3/experiments/geoloss/figures/D_geometry_seed11_progress.png"
+DEFAULT_LOG = "outputs/da3/train/mv_layout_loss/C_coord/seed11/logs/log.jsonl"
+DEFAULT_OUT = "outputs/da3/experiments/geoloss/figures/C_coord_seed11_progress.png"
 DEFAULT_MAX_STEPS = 100000
 
 TRAIN_KEYS = [
     "loss", "grad_norm", "mean_token_accuracy", "learning_rate",
     "loss_layout_token", "loss_layout_ordinal", "loss_layout_coord",
-    "loss_layout_center", "loss_layout_size",
 ]
 
 
@@ -38,12 +35,12 @@ def print_summary(records, max_steps, n_recent):
 
     last = train[-1]
     step = last["step"]
-    print(f"=== D_geometry progress: step {step:,} / {max_steps:,} "
+    print(f"=== layout-loss progress: step {step:,} / {max_steps:,} "
           f"({100 * step / max_steps:.2f}%), epoch {last.get('epoch', 0):.2f} ===\n")
 
     cols = ["step", "loss", "grad_norm", "mean_token_accuracy", "loss_layout_token",
-            "loss_layout_ordinal", "loss_layout_coord", "loss_layout_center", "loss_layout_size"]
-    widths = [7, 9, 11, 10, 11, 11, 10, 10, 10]
+            "loss_layout_ordinal", "loss_layout_coord"]
+    widths = [7, 9, 11, 10, 11, 11, 10]
     print(" ".join(f"{c:>{w}}" for c, w in zip(cols, widths)))
     print("-" * (sum(widths) + len(widths) - 1))
     for r in train[-n_recent:]:
@@ -88,10 +85,9 @@ def plot_progress(records, out_path, smooth_weight=0.9):
         ("learning_rate", False),
         ("loss_layout_token", False),
         ("loss_layout_ordinal", False),
-        ("loss_layout_center", False),
-        ("loss_layout_size", False),
+        ("loss_layout_coord", False),
     ]
-    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
+    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
     for ax, (metric, log_scale) in zip(axes.flat, panels):
         steps, vals = extract_series(records, metric)
         if not steps:
@@ -104,7 +100,7 @@ def plot_progress(records, out_path, smooth_weight=0.9):
         ax.set_xlabel("step")
         ax.set_title(metric)
         ax.grid(True, alpha=0.3)
-    fig.suptitle("D_geometry seed-11 stage-1 training progress")
+    fig.suptitle("MV layout-loss stage-1 training progress")
     fig.tight_layout()
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)

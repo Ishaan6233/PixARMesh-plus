@@ -26,7 +26,7 @@ def _summary(
     return {
         "layout": {
             "runs": {
-                "D_geometry": {
+                "C_coord": {
                     "paired_delta_vs_ce": paired_delta_vs_ce,
                     "seeds": {
                         "11": {
@@ -72,7 +72,7 @@ def _set_run_deltas(summary: dict, run: str, *, benefit: float) -> None:
     paired_delta_vs_ce["aabb_iou"] = {"mean": benefit, "n": 2, "improved_seed_count": 2}
     summary["layout"]["runs"][run] = {
         "paired_delta_vs_ce": paired_delta_vs_ce,
-        "seeds": summary["layout"]["runs"]["D_geometry"]["seeds"],
+        "seeds": summary["layout"]["runs"]["C_coord"]["seeds"],
     }
 
 
@@ -86,11 +86,11 @@ def _category_metrics(*, stable: bool = True) -> dict:
 
 def _summary_with_categories(*, stable: bool = True) -> dict:
     summary = _summary()
-    summary["layout"]["runs"]["D_geometry"]["category_paired_delta_vs_ce"] = {
+    summary["layout"]["runs"]["C_coord"]["category_paired_delta_vs_ce"] = {
         "chair": _category_metrics(stable=True),
         "table": _category_metrics(stable=stable),
     }
-    summary["layout"]["runs"]["D_geometry"]["missing_category_count"] = 0
+    summary["layout"]["runs"]["C_coord"]["missing_category_count"] = 0
     return summary
 
 
@@ -125,7 +125,7 @@ def _write_report_bundle(root, *, bin_mae: float, aabb_iou: float, uids: list[st
 def test_council_review_passes_when_all_gates_are_satisfied(tmp_path):
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={
@@ -150,7 +150,7 @@ def test_council_review_passes_when_all_gates_are_satisfied(tmp_path):
 def test_council_review_passes_with_required_category_stability():
     result = evaluate_council(
         summary=_summary_with_categories(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -165,7 +165,7 @@ def test_council_review_passes_with_required_category_stability():
 def test_council_review_fails_when_required_category_regresses():
     result = evaluate_council(
         summary=_summary_with_categories(stable=False),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -180,7 +180,7 @@ def test_council_review_fails_when_required_category_regresses():
 def test_council_review_fails_without_downstream_sv_win():
     result = evaluate_council(
         summary=_summary(downstream_beats_sv=False),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -201,7 +201,7 @@ def test_council_review_fails_without_grouped_downstream_seed_evidence():
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -220,7 +220,7 @@ def test_council_review_fails_when_downstream_mean_hides_seed_regression():
             downstream_cd_improved_seed_count=1,
             downstream_f_improved_seed_count=2,
         ),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -242,7 +242,7 @@ def test_council_review_fails_when_downstream_seed_labels_are_duplicated():
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -257,7 +257,7 @@ def test_council_review_fails_when_downstream_seed_labels_are_duplicated():
 def test_council_review_fails_when_negative_control_does_not_degrade():
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=1.5, aabb_iou=0.8)},
@@ -271,7 +271,7 @@ def test_council_review_fails_when_negative_control_does_not_degrade():
 def test_council_review_fails_when_negative_control_uids_differ():
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7, uids=["a", "b"]),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65, uids=["a", "c"])},
@@ -288,7 +288,7 @@ def test_council_review_fails_when_negative_control_uids_differ():
 def test_council_review_fails_when_view_control_identity_is_wrong():
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={
@@ -313,7 +313,7 @@ def test_council_review_fails_when_view_control_identity_is_wrong():
 def test_council_review_fails_when_training_control_override_is_missing():
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"no_aabb": _report(bin_mae=2.5, aabb_iou=0.65, overrides=[])},
@@ -342,7 +342,7 @@ def test_council_review_fails_when_downstream_is_not_object_paired():
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -355,14 +355,14 @@ def test_council_review_fails_when_downstream_is_not_object_paired():
 
 def test_council_review_fails_when_layout_uids_are_not_exactly_paired():
     summary = _summary()
-    summary["layout"]["runs"]["D_geometry"]["seeds"]["11"]["exact_uid_match"] = False
-    summary["layout"]["runs"]["D_geometry"]["seeds"]["11"]["run_uid_count"] = 1
-    summary["layout"]["runs"]["D_geometry"]["seeds"]["11"]["missing_vs_ce"] = ["dropped-bad-case"]
-    summary["layout"]["missing"] = ["D_geometry/seed11 UID mismatch vs A_ce: missing=1 extra=0"]
+    summary["layout"]["runs"]["C_coord"]["seeds"]["11"]["exact_uid_match"] = False
+    summary["layout"]["runs"]["C_coord"]["seeds"]["11"]["run_uid_count"] = 1
+    summary["layout"]["runs"]["C_coord"]["seeds"]["11"]["missing_vs_ce"] = ["dropped-bad-case"]
+    summary["layout"]["missing"] = ["C_coord/seed11 UID mismatch vs A_ce: missing=1 extra=0"]
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -375,11 +375,11 @@ def test_council_review_fails_when_layout_uids_are_not_exactly_paired():
 
 def test_council_review_fails_when_selected_best_run_is_dominated():
     summary = _summary()
-    _set_run_deltas(summary, "C_coord", benefit=0.2)
+    _set_run_deltas(summary, "B_ordinal", benefit=0.2)
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -387,7 +387,7 @@ def test_council_review_fails_when_selected_best_run_is_dominated():
     )
 
     assert result["status"] == "fail"
-    assert any("dominated by C_coord" in issue for issue in result["issues"])
+    assert any("dominated by B_ordinal" in issue for issue in result["issues"])
 
 
 def test_council_review_allows_best_run_metric_tradeoff():
@@ -397,14 +397,14 @@ def test_council_review_allows_best_run_metric_tradeoff():
         tradeoff[metric] = {"mean": -0.2, "n": 2, "improved_seed_count": 2}
     tradeoff["size_rel_error"] = {"mean": -0.05, "n": 2, "improved_seed_count": 2}
     tradeoff["aabb_iou"] = {"mean": 0.2, "n": 2, "improved_seed_count": 2}
-    summary["layout"]["runs"]["C_coord"] = {
+    summary["layout"]["runs"]["B_ordinal"] = {
         "paired_delta_vs_ce": tradeoff,
-        "seeds": summary["layout"]["runs"]["D_geometry"]["seeds"],
+        "seeds": summary["layout"]["runs"]["C_coord"]["seeds"],
     }
 
     result = evaluate_council(
         summary=summary,
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=_report(bin_mae=2.0, aabb_iou=0.7),
         negative_controls={"one_view_eval": _report(bin_mae=2.5, aabb_iou=0.65)},
@@ -418,7 +418,7 @@ def test_council_review_allows_best_run_metric_tradeoff():
 def test_council_review_requires_control_report_for_each_best_report():
     result = evaluate_council(
         summary=_summary(),
-        best_layout_run="D_geometry",
+        best_layout_run="C_coord",
         downstream_run="E_stage2_best",
         best_layout_report=[
             _report(bin_mae=2.0, aabb_iou=0.7),
@@ -435,4 +435,4 @@ def test_council_review_requires_control_report_for_each_best_report():
 def test_council_recommendation_distinguishes_missing_from_reject():
     assert recommendation_for("pass", []) == "merge"
     assert recommendation_for("fail", ["summary.json is missing or unreadable"]) == "keep-experimental"
-    assert recommendation_for("fail", ["D_geometry does not improve bin_mae against CE across all paired seeds"]) == "reject"
+    assert recommendation_for("fail", ["C_coord does not improve bin_mae against CE across all paired seeds"]) == "reject"

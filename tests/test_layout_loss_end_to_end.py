@@ -21,8 +21,6 @@ GEOMETRY_LAYOUT_DEFAULTS = {
     "loss_layout_ordinal_sigma": 2.0,
     "loss_layout_ordinal_weight": 1.0,
     "loss_layout_coord_weight": 1.0,
-    "loss_layout_center_weight": 0.5,
-    "loss_layout_size_weight": 0.5,
 }
 
 
@@ -121,8 +119,6 @@ def _assert_weighted_layout_total(model, output):
     for weight_name, component_name in (
         ("loss_layout_ordinal_weight", "loss_layout_ordinal"),
         ("loss_layout_coord_weight", "loss_layout_coord"),
-        ("loss_layout_center_weight", "loss_layout_center"),
-        ("loss_layout_size_weight", "loss_layout_size"),
     ):
         weight = float(getattr(model.config, weight_name))
         component = getattr(output, component_name)
@@ -168,8 +164,6 @@ def test_mv_stage_configs_round_trip_layout_losses_through_loader_and_forward(
     [
         ("loss_layout_ordinal_weight", "loss_layout_ordinal", 1.25, 2.0),
         ("loss_layout_coord_weight", "loss_layout_coord", 1.5, None),
-        ("loss_layout_center_weight", "loss_layout_center", 2.0, None),
-        ("loss_layout_size_weight", "loss_layout_size", 0.75, None),
     ],
 )
 def test_each_layout_loss_weight_independently_reaches_forward_total(
@@ -188,8 +182,6 @@ def test_each_layout_loss_weight_independently_reaches_forward_total(
         "loss_layout_ordinal_sigma": sigma,
         "loss_layout_ordinal_weight": 0.0,
         "loss_layout_coord_weight": 0.0,
-        "loss_layout_center_weight": 0.0,
-        "loss_layout_size_weight": 0.0,
     }
     kwargs[weight_name] = weight
     model_cfg = ModelConfig(**kwargs)
@@ -216,8 +208,6 @@ def test_mv_ce_control_round_trip_disables_auxiliary_layout_losses(tmp_path):
     assert model_cfg.loss_layout_ordinal_sigma is None
     assert model_cfg.loss_layout_ordinal_weight == 0.0
     assert model_cfg.loss_layout_coord_weight == 0.0
-    assert model_cfg.loss_layout_center_weight == 0.0
-    assert model_cfg.loss_layout_size_weight == 0.0
 
     checkpoint = _tiny_pretrained_shapeopt(tmp_path, model_cfg)
     model = get_model(str(checkpoint), model_cfg, cond_encoder=_DummyCondEncoder())
@@ -226,8 +216,6 @@ def test_mv_ce_control_round_trip_disables_auxiliary_layout_losses(tmp_path):
     assert output.loss_layout_token is not None
     assert output.loss_layout_ordinal is None
     assert output.loss_layout_coord is None
-    assert output.loss_layout_center is None
-    assert output.loss_layout_size is None
     assert torch.allclose(
         output.loss,
         output.loss_layout_token * LAYOUT_GEOMETRY_TOKENS,

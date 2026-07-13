@@ -19,16 +19,12 @@ GEOMETRY_LAYOUT_DEFAULTS = {
     "loss_layout_ordinal_sigma": 2.0,
     "loss_layout_ordinal_weight": 1.0,
     "loss_layout_coord_weight": 1.0,
-    "loss_layout_center_weight": 0.5,
-    "loss_layout_size_weight": 0.5,
 }
 
 CE_LAYOUT_CONTROL = {
     "loss_layout_ordinal_sigma": None,
     "loss_layout_ordinal_weight": 0.0,
     "loss_layout_coord_weight": 0.0,
-    "loss_layout_center_weight": 0.0,
-    "loss_layout_size_weight": 0.0,
 }
 
 
@@ -62,7 +58,7 @@ class ConfigTest(unittest.TestCase):
         ):
             cfg = compose(
                 config_name="edgerunner_3d_front_trellis2_mv_stage1",
-                overrides=["+experiment=mv_layout_loss_geometry"],
+                overrides=["+experiment=mv_layout_loss_coord"],
             )
         OmegaConf.resolve(cfg)
         model_values = OmegaConf.to_container(cfg.model, resolve=True)
@@ -71,8 +67,6 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(cfg.model.loss_layout_ordinal_sigma, 2.0)
         self.assertEqual(cfg.model.loss_layout_coord_weight, 1.0)
-        self.assertEqual(cfg.model.loss_layout_center_weight, 0.5)
-        self.assertEqual(cfg.model.loss_layout_size_weight, 0.5)
         self.assertEqual(mv_prefix_len(model_cfg), 2371)
 
     def test_mv_stage_configs_default_to_geometry_layout_losses(self):

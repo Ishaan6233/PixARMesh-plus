@@ -8,11 +8,10 @@ losses into default training until the evidence gates below pass.
 - Baseline layout CE remains the default and is still logged as `loss_layout`.
 - `loss_layout_ordinal`: ordinal-smoothed CE over position-token logits only.
 - `loss_layout_coord`: SmoothL1 between expected dequantized coordinates and GT coordinates.
-- `loss_layout_center`: SmoothL1 between predicted and GT bbox centers.
-- `loss_layout_size`: SmoothL1 between predicted and GT log extents.
 
-All added losses are off by default. Enable them with the configs in
-`configs/experiment/mv_layout_loss_*.yaml`.
+The `ModelConfig` dataclass defaults keep added losses off for non-MV callers.
+The Trellis2-MV stage configs opt into ordinal+coord supervision, and the
+configs in `configs/experiment/mv_layout_loss_*.yaml` define the ablation arms.
 
 ## Required Ablations
 
@@ -22,10 +21,9 @@ budget, and seed list:
 - A: `+experiment=mv_layout_loss_ce`
 - B: `+experiment=mv_layout_loss_ordinal`
 - C: `+experiment=mv_layout_loss_coord`
-- D: `+experiment=mv_layout_loss_geometry`
 - E: best verified stage-1 loss carried into stage 2
 
-Run at least three seeds for A-D before selecting E. Generate the command
+Run at least three seeds for A-C before selecting E. Generate the command
 manifest with:
 
 ```bash
@@ -58,7 +56,7 @@ downstream files under `outputs/da3/eval/stage2_best/seed*/`.
 The expected frozen-feature cache root is
 `datasets/mv-feature-cache/da3/trellis2-mv`. If readiness reports that it is
 missing or has the wrong cache contract, rebuild it with
-the generated `precompute_cache.sh` before launching A-D training; it invokes
+the generated `precompute_cache.sh` before launching A-C training; it invokes
 `scripts/data/precompute_mv_features.py` for both train and val splits. The
 older flat `datasets/mv-feature-cache/*.npz` layout is not accepted by the
 current Trellis2-MV loader. The readiness report records the exact accepted
@@ -113,7 +111,7 @@ with:
 PYTHONPATH=. /home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python \
   scripts/eval/summarize_mv_layout_evidence.py \
   --layout-root outputs/da3/eval/layout_mv \
-  --run A_ce --run B_ordinal --run C_coord --run D_geometry \
+  --run A_ce --run B_ordinal --run C_coord \
   --seeds 11 23 37 \
   --ce-run A_ce \
   --sv-downstream outputs/sv/eval/baseline/eval_obj_results.jsonl \
@@ -134,7 +132,7 @@ They also reject duplicate, missing, or unexpected downstream seed labels, so
 passing `seed11` twice cannot stand in for the requested
 `seed11/seed23/seed37` set.
 
-Every main A-D `eval_layout_mv.py` report must come from the same
+Every main A-C `eval_layout_mv.py` report must come from the same
 `config_name`, split, requested sample count, eval batch size, and
 `mv_feature_cache`, with `view_limit=0`, `reference_only=false`, and
 `shuffle_views=false`. It must also include `view_usage` with the per-object
@@ -153,11 +151,11 @@ PYTHONPATH=. /home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python
   scripts/eval/build_mv_layout_evidence_figures.py \
   --summary-json outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json \
   --layout-root outputs/da3/eval/layout_mv \
-  --run A_ce --run B_ordinal --run C_coord --run D_geometry \
+  --run A_ce --run B_ordinal --run C_coord \
   --seeds 11 23 37 \
   --ce-run A_ce \
   --baseline-run A_ce \
-  --candidate-run D_geometry \
+  --candidate-run C_coord \
   --out outputs/da3/experiments/mv_layout_loss_ablation/evidence_figures
 ```
 
@@ -179,47 +177,47 @@ Before accepting the evidence bundle, run the hard gate:
 PYTHONPATH=. /home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python \
   scripts/eval/write_mv_layout_council_review.py \
   --summary-json outputs/da3/experiments/mv_layout_loss_ablation/evidence_summary/summary.json \
-  --best-layout-run D_geometry \
-  --best-layout-report outputs/da3/eval/layout_mv/D_geometry/seed11/report.json \
-  --best-layout-report outputs/da3/eval/layout_mv/D_geometry/seed23/report.json \
-  --best-layout-report outputs/da3/eval/layout_mv/D_geometry/seed37/report.json \
+  --best-layout-run C_coord \
+  --best-layout-report outputs/da3/eval/layout_mv/C_coord/seed11/report.json \
+  --best-layout-report outputs/da3/eval/layout_mv/C_coord/seed23/report.json \
+  --best-layout-report outputs/da3/eval/layout_mv/C_coord/seed37/report.json \
   --downstream-run E_stage2_best \
-  --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/one_view_eval/report.json \
-  --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/one_view_eval/report.json \
-  --negative-control one_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/one_view_eval/report.json \
-  --negative-control two_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/two_view_eval/report.json \
-  --negative-control two_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/two_view_eval/report.json \
-  --negative-control two_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/two_view_eval/report.json \
-  --negative-control four_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/four_view_eval/report.json \
-  --negative-control four_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/four_view_eval/report.json \
-  --negative-control four_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/four_view_eval/report.json \
-  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/eight_view_eval/report.json \
-  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/eight_view_eval/report.json \
-  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/eight_view_eval/report.json \
-  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/reference_only_eval/report.json \
-  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/reference_only_eval/report.json \
-  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/reference_only_eval/report.json \
-  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/D_geometry/seed11/shuffled_views_eval/report.json \
-  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/D_geometry/seed23/shuffled_views_eval/report.json \
-  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/D_geometry/seed37/shuffled_views_eval/report.json \
-  --negative-control no_aabb=outputs/da3/eval/layout_mv/D_geometry_no_aabb/seed11/report.json \
-  --negative-control no_aabb=outputs/da3/eval/layout_mv/D_geometry_no_aabb/seed23/report.json \
-  --negative-control no_aabb=outputs/da3/eval/layout_mv/D_geometry_no_aabb/seed37/report.json \
-  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/D_geometry_no_voxel_encoder/seed11/report.json \
-  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/D_geometry_no_voxel_encoder/seed23/report.json \
-  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/D_geometry_no_voxel_encoder/seed37/report.json \
-  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_cond/seed11/report.json \
-  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_cond/seed23/report.json \
-  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_cond/seed37/report.json \
-  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_appearance/seed11/report.json \
-  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_appearance/seed23/report.json \
-  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/D_geometry_no_obj_pc_appearance/seed37/report.json \
+  --negative-control one_view_eval=outputs/da3/eval/layout_mv/C_coord/seed11/one_view_eval/report.json \
+  --negative-control one_view_eval=outputs/da3/eval/layout_mv/C_coord/seed23/one_view_eval/report.json \
+  --negative-control one_view_eval=outputs/da3/eval/layout_mv/C_coord/seed37/one_view_eval/report.json \
+  --negative-control two_view_eval=outputs/da3/eval/layout_mv/C_coord/seed11/two_view_eval/report.json \
+  --negative-control two_view_eval=outputs/da3/eval/layout_mv/C_coord/seed23/two_view_eval/report.json \
+  --negative-control two_view_eval=outputs/da3/eval/layout_mv/C_coord/seed37/two_view_eval/report.json \
+  --negative-control four_view_eval=outputs/da3/eval/layout_mv/C_coord/seed11/four_view_eval/report.json \
+  --negative-control four_view_eval=outputs/da3/eval/layout_mv/C_coord/seed23/four_view_eval/report.json \
+  --negative-control four_view_eval=outputs/da3/eval/layout_mv/C_coord/seed37/four_view_eval/report.json \
+  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/C_coord/seed11/eight_view_eval/report.json \
+  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/C_coord/seed23/eight_view_eval/report.json \
+  --negative-control eight_view_eval=outputs/da3/eval/layout_mv/C_coord/seed37/eight_view_eval/report.json \
+  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/C_coord/seed11/reference_only_eval/report.json \
+  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/C_coord/seed23/reference_only_eval/report.json \
+  --negative-control reference_only_eval=outputs/da3/eval/layout_mv/C_coord/seed37/reference_only_eval/report.json \
+  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/C_coord/seed11/shuffled_views_eval/report.json \
+  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/C_coord/seed23/shuffled_views_eval/report.json \
+  --negative-control shuffled_views_eval=outputs/da3/eval/layout_mv/C_coord/seed37/shuffled_views_eval/report.json \
+  --negative-control no_aabb=outputs/da3/eval/layout_mv/C_coord_no_aabb/seed11/report.json \
+  --negative-control no_aabb=outputs/da3/eval/layout_mv/C_coord_no_aabb/seed23/report.json \
+  --negative-control no_aabb=outputs/da3/eval/layout_mv/C_coord_no_aabb/seed37/report.json \
+  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/C_coord_no_voxel_encoder/seed11/report.json \
+  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/C_coord_no_voxel_encoder/seed23/report.json \
+  --negative-control no_voxel_encoder=outputs/da3/eval/layout_mv/C_coord_no_voxel_encoder/seed37/report.json \
+  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_cond/seed11/report.json \
+  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_cond/seed23/report.json \
+  --negative-control no_obj_pc_cond=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_cond/seed37/report.json \
+  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_appearance/seed11/report.json \
+  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_appearance/seed23/report.json \
+  --negative-control no_obj_pc_appearance=outputs/da3/eval/layout_mv/C_coord_no_obj_pc_appearance/seed37/report.json \
   --out outputs/da3/experiments/mv_layout_loss_ablation/verifiers/council_review.md
 
 PYTHONPATH=. /home/vision-ishaan/.local/share/mamba/envs/pixarmesh124/bin/python \
   scripts/eval/check_mv_layout_evidence_bundle.py \
   --layout-root outputs/da3/eval/layout_mv \
-  --run A_ce --run B_ordinal --run C_coord --run D_geometry \
+  --run A_ce --run B_ordinal --run C_coord \
   --seeds 11 23 37 \
   --ce-run A_ce \
   --sv-downstream outputs/sv/eval/baseline/eval_obj_results.jsonl \
@@ -279,8 +277,7 @@ Train or compose separate runs for:
 If shuffled views do not hurt, or reference-only matches all views, the current
 model is not providing strong evidence that additional views are being used.
 Generated training-control commands use `BEST_EXPERIMENT` and
-`BEST_STAGE1_RUN`, so controls follow whichever loss stack wins A-D rather than
-assuming `D_geometry` is best.
+`BEST_STAGE1_RUN`, so controls follow whichever loss stack wins A-C.
 
 ## Independent Verification
 

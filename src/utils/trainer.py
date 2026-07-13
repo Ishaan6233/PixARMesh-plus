@@ -362,8 +362,6 @@ class CustomSFTTrainer(SFTTrainer):
             "loss_layout_token",
             "loss_layout_ordinal",
             "loss_layout_coord",
-            "loss_layout_center",
-            "loss_layout_size",
         ):
             if name in outputs and getattr(outputs, name) is not None:
                 value = getattr(outputs, name)

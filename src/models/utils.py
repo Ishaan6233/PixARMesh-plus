@@ -112,8 +112,6 @@ def get_model(
         extra_args["loss_layout_ordinal_sigma"] = model_cfg.loss_layout_ordinal_sigma
         extra_args["loss_layout_ordinal_weight"] = model_cfg.loss_layout_ordinal_weight
         extra_args["loss_layout_coord_weight"] = model_cfg.loss_layout_coord_weight
-        extra_args["loss_layout_center_weight"] = model_cfg.loss_layout_center_weight
-        extra_args["loss_layout_size_weight"] = model_cfg.loss_layout_size_weight
         extra_args["loss_layout_geometry_tokens"] = (
             model_cfg.loss_layout_geometry_tokens
         )
@@ -188,8 +186,6 @@ def get_model(
             "loss_layout_ordinal_sigma",
             "loss_layout_ordinal_weight",
             "loss_layout_coord_weight",
-            "loss_layout_center_weight",
-            "loss_layout_size_weight",
             "loss_layout_geometry_tokens",
         ]:
             if _f in extra_args:

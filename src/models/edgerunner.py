@@ -100,8 +100,6 @@ class ShapeOPTConfig(OPTConfig):
         loss_layout_ordinal_sigma: Optional[float] = None,
         loss_layout_ordinal_weight: float = 0.0,
         loss_layout_coord_weight: float = 0.0,
-        loss_layout_center_weight: float = 0.0,
-        loss_layout_size_weight: float = 0.0,
         loss_layout_geometry_tokens: int = 24,
         **kwargs,
     ):
@@ -118,8 +116,6 @@ class ShapeOPTConfig(OPTConfig):
         self.loss_layout_ordinal_sigma = loss_layout_ordinal_sigma
         self.loss_layout_ordinal_weight = loss_layout_ordinal_weight
         self.loss_layout_coord_weight = loss_layout_coord_weight
-        self.loss_layout_center_weight = loss_layout_center_weight
-        self.loss_layout_size_weight = loss_layout_size_weight
         self.loss_layout_geometry_tokens = loss_layout_geometry_tokens
 
 
@@ -788,12 +784,6 @@ class ShapeOPT(OPTForCausalLM):
                 loss_layout_coord_weight=getattr(
                     self.config, "loss_layout_coord_weight", 0.0
                 ),
-                loss_layout_center_weight=getattr(
-                    self.config, "loss_layout_center_weight", 0.0
-                ),
-                loss_layout_size_weight=getattr(
-                    self.config, "loss_layout_size_weight", 0.0
-                ),
                 loss_layout_geometry_tokens=getattr(
                     self.config, "loss_layout_geometry_tokens", 24
                 ),
@@ -808,8 +798,6 @@ class ShapeOPT(OPTForCausalLM):
             loss_layout_token=layout_components.get("loss_layout_token"),
             loss_layout_ordinal=layout_components.get("loss_layout_ordinal"),
             loss_layout_coord=layout_components.get("loss_layout_coord"),
-            loss_layout_center=layout_components.get("loss_layout_center"),
-            loss_layout_size=layout_components.get("loss_layout_size"),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
@@ -981,12 +969,6 @@ class ShapeOPT(OPTForCausalLM):
                 loss_layout_coord_weight=getattr(
                     self.config, "loss_layout_coord_weight", 0.0
                 ),
-                loss_layout_center_weight=getattr(
-                    self.config, "loss_layout_center_weight", 0.0
-                ),
-                loss_layout_size_weight=getattr(
-                    self.config, "loss_layout_size_weight", 0.0
-                ),
                 loss_layout_geometry_tokens=getattr(
                     self.config, "loss_layout_geometry_tokens", 24
                 ),
@@ -1001,8 +983,6 @@ class ShapeOPT(OPTForCausalLM):
             loss_layout_token=layout_components.get("loss_layout_token"),
             loss_layout_ordinal=layout_components.get("loss_layout_ordinal"),
             loss_layout_coord=layout_components.get("loss_layout_coord"),
-            loss_layout_center=layout_components.get("loss_layout_center"),
-            loss_layout_size=layout_components.get("loss_layout_size"),
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
