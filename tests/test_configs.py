@@ -40,6 +40,7 @@ def _filter_dataclass_kwargs(dataclass_type, values):
 class ConfigTest(unittest.TestCase):
     def test_default_config_composes(self):
         os.environ.setdefault("RUN_TS", "pytest")
+        OmegaConf.register_new_resolver("sub", lambda x, y: x - y, replace=True)
         repo_root = Path(__file__).resolve().parents[1]
         with initialize_config_dir(
             config_dir=str(repo_root / "configs"),
