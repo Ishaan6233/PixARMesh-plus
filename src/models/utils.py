@@ -26,8 +26,10 @@ def _fix_uninit_params(model):
     init_std = getattr(getattr(model, "config", None), "init_std", 0.02)
     for module in model.modules():
         has_bad = any(
-            p.is_floating_point() and (
-                torch.isnan(p.data).any() or torch.isinf(p.data).any()
+            p.is_floating_point()
+            and (
+                torch.isnan(p.data).any()
+                or torch.isinf(p.data).any()
                 # Uninitialized GPU memory is finite-but-huge (e.g. ~1e31) and does NOT
                 # become NaN/inf — the mv_voxel_encoder (absent from single-view
                 # checkpoints) hits exactly this. Scope the magnitude test to trainable
@@ -112,25 +114,45 @@ def get_model(
         extra_args["loss_layout_coord_weight"] = model_cfg.loss_layout_coord_weight
         extra_args["loss_layout_center_weight"] = model_cfg.loss_layout_center_weight
         extra_args["loss_layout_size_weight"] = model_cfg.loss_layout_size_weight
-        extra_args["loss_layout_geometry_tokens"] = model_cfg.loss_layout_geometry_tokens
+        extra_args["loss_layout_geometry_tokens"] = (
+            model_cfg.loss_layout_geometry_tokens
+        )
         if model_cfg.sep_token_id is not None:
             extra_args["sep_token_id"] = model_cfg.sep_token_id
         # MV voxel encoder fields — override stale values in single-view checkpoints
         # so that from_pretrained() creates mv_voxel_encoder when mv_voxel_encoder=True.
         _mv_fields = [
-            "mv_voxel_encoder", "mv_num_obj_voxels", "mv_num_ctx_voxels",
-            "mv_voxel_dim", "mv_num_obj_queries", "mv_num_scene_queries",
-            "mv_num_heads", "mv_mask_seeded_pool", "mv_boundary_bias_alpha",
-            "mv_obj_pc_cond", "mv_use_voxel_encoder", "mv_obj_pc_appearance",
-            "mv_obj_pc_oracle", "mv_discovery_method",
+            "mv_voxel_encoder",
+            "mv_num_obj_voxels",
+            "mv_num_ctx_voxels",
+            "mv_voxel_dim",
+            "mv_num_obj_queries",
+            "mv_num_scene_queries",
+            "mv_num_heads",
+            "mv_mask_seeded_pool",
+            "mv_boundary_bias_alpha",
+            "mv_obj_pc_cond",
+            "mv_use_voxel_encoder",
+            "mv_obj_pc_appearance",
+            "mv_obj_pc_oracle",
+            "mv_discovery_method",
             # Discovery / voxelization params — must be here so yaml overrides reach
             # ShapeOPTConfig; without this, getattr fallbacks in edgerunner.py fire
             # instead of the configured values (e.g. mv_min_views: 2 → was using 3).
-            "mv_min_views", "mv_conf_threshold", "mv_depth_rtol", "mv_pool_size",
-            "mv_intra_obj_register", "mv_register_iters",
-            "mv_geom_norm_quantile", "mv_use_geometry", "mv_voxel_sampling",
-            "mv_covis_min_support_pix", "mv_view_conf_gate",
-            "mv_view_gate_min_views", "mv_obj_aabb_token",
+            "mv_min_views",
+            "mv_conf_threshold",
+            "mv_depth_rtol",
+            "mv_pool_size",
+            "mv_intra_obj_register",
+            "mv_register_iters",
+            "mv_geom_norm_quantile",
+            "mv_geom_norm_trim_fallback_ratio",
+            "mv_use_geometry",
+            "mv_voxel_sampling",
+            "mv_covis_min_support_pix",
+            "mv_view_conf_gate",
+            "mv_view_gate_min_views",
+            "mv_obj_aabb_token",
         ]
         for _f in _mv_fields:
             if hasattr(model_cfg, _f):
@@ -198,7 +220,9 @@ def get_model(
     if cond_enc_state is not None:
         with torch.no_grad():
             model_enc_params = dict(model.cond_encoder.named_parameters())
-            trainable_keys = set(getattr(model.cond_encoder, "extra_feat_proj_keys", []))
+            trainable_keys = set(
+                getattr(model.cond_encoder, "extra_feat_proj_keys", [])
+            )
             for name, pretrained_val in cond_enc_state.items():
                 if name not in model_enc_params:
                     continue

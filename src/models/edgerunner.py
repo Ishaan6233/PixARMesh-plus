@@ -8,7 +8,12 @@ from transformers.models.opt.modeling_opt import OPTDecoder
 from .cond import EdgeRunnerProjector, ContextAggregator
 from .embed import CoordEmbed
 from .loss import causal_lm_loss_with_token_types, CustomCausalLMOutputWithTokenTypes
-from .frozen_geo_encoder import _apply_scene_transform, build_geo_ctx_pc, build_geo_obj_pc, fps_centroid_seeded
+from .frozen_geo_encoder import (
+    _apply_scene_transform,
+    build_geo_ctx_pc,
+    build_geo_obj_pc,
+    fps_centroid_seeded,
+)
 from .discovery import get_discovery_fn
 from .mv_voxel_encoder import (
     MultiViewVoxelAlignedEncoder,
@@ -20,6 +25,48 @@ from .mv_voxel_encoder import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_mv_obj_geom_voxels(
+    src_voxels: torch.Tensor,
+    obj_canon_transform: torch.Tensor,
+    *,
+    quantile: float = 0.0,
+    trim_fallback_ratio: float = 0.2,
+    bound: float = 0.95,
+) -> torch.Tensor:
+    """Canonicalize discovered object geometry while guarding collapsed quantile spans."""
+    with torch.autocast(device_type=src_voxels.device.type, enabled=False):
+        R = obj_canon_transform[:, :3, :3].to(
+            device=src_voxels.device, dtype=torch.float32
+        )
+        v = torch.bmm(src_voxels.to(dtype=torch.float32), R.transpose(1, 2))
+        raw_vmin = v.amin(dim=1, keepdim=True)
+        raw_vmax = v.amax(dim=1, keepdim=True)
+        vmin = raw_vmin
+        vmax = raw_vmax
+
+        q = float(quantile or 0.0)
+        if q > 0.0:
+            qs = torch.tensor([q, 1.0 - q], device=v.device, dtype=torch.float32)
+            bounds = torch.quantile(v, qs, dim=1)
+            trim_vmin = bounds[0].unsqueeze(1)
+            trim_vmax = bounds[1].unsqueeze(1)
+
+            ratio = float(trim_fallback_ratio or 0.0)
+            if ratio > 0.0:
+                raw_extent = (raw_vmax - raw_vmin).amax(dim=-1, keepdim=True)
+                trim_extent = (trim_vmax - trim_vmin).amax(dim=-1, keepdim=True)
+                use_raw = trim_extent < (ratio * raw_extent).clamp_min(1e-6)
+                vmin = torch.where(use_raw, raw_vmin, trim_vmin)
+                vmax = torch.where(use_raw, raw_vmax, trim_vmax)
+            else:
+                vmin = trim_vmin
+                vmax = trim_vmax
+
+        center = 0.5 * (vmin + vmax)
+        scale = (2 * bound) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
+        return (v - center) * scale
 
 
 class OPTLearnedPositionalEmbeddingNoOffset(nn.Embedding):
@@ -265,7 +312,9 @@ class ShapeOPT(OPTForCausalLM):
     ) -> torch.Tensor:
         """Reference view fallback: view with the most positive-depth pixels."""
         bsz, num_views, _, _, _ = local_points.shape
-        valid_count = (local_points[..., 2] > 0).reshape(bsz, num_views, -1).sum(-1).float()
+        valid_count = (
+            (local_points[..., 2] > 0).reshape(bsz, num_views, -1).sum(-1).float()
+        )
         if view_mask is not None:
             valid_count = valid_count * view_mask.float()
         return valid_count.argmax(dim=1)
@@ -313,7 +362,9 @@ class ShapeOPT(OPTForCausalLM):
             conf_vox = conf_vox.squeeze(-1).squeeze(1).reshape(B, N, V).permute(0, 2, 1)
             weights = weights * conf_vox.unsqueeze(-1).clamp(min=0.0)
         denom = weights.sum(dim=2).clamp(min=1e-6)
-        return ((dino_sampled.float() * weights).sum(dim=2) / denom).to(dino_feats.dtype)
+        return ((dino_sampled.float() * weights).sum(dim=2) / denom).to(
+            dino_feats.dtype
+        )
 
     def get_mv_inputs_with_cond(
         self,
@@ -351,9 +402,13 @@ class ShapeOPT(OPTForCausalLM):
             }
         else:
             if self.geo_encoder is None:
-                raise RuntimeError("Multi-view path requires a frozen geo_encoder or cached_local_points")
+                raise RuntimeError(
+                    "Multi-view path requires a frozen geo_encoder or cached_local_points"
+                )
             geo_out = self.geo_encoder.forward_all_views_joint(pixel_values)
-            local_points = geo_out["local_points"].to(device=device, dtype=torch.float32)
+            local_points = geo_out["local_points"].to(
+                device=device, dtype=torch.float32
+            )
         geo_depth = local_points[..., 2]
         st = scene_transforms.to(device, dtype=torch.float32)
         K_f = K_per_view.to(device=device, dtype=torch.float32)
@@ -365,7 +420,9 @@ class ShapeOPT(OPTForCausalLM):
             mean_view_conf = geo_out["conf"][..., 0].float().mean(dim=(-1, -2))
             gate_ok = mean_view_conf >= view_gate
             if ref_view is not None:
-                gate_ok.scatter_(1, ref_view.to(gate_ok.device).long().view(-1, 1), True)
+                gate_ok.scatter_(
+                    1, ref_view.to(gate_ok.device).long().view(-1, 1), True
+                )
             min_keep = int(getattr(self.config, "mv_view_gate_min_views", 2))
             kept = (view_mask & gate_ok).sum(dim=-1)
             if bool((kept < min_keep).any()):
@@ -373,7 +430,9 @@ class ShapeOPT(OPTForCausalLM):
                 k = min(min_keep, ranked.shape[1])
                 force = torch.zeros_like(gate_ok)
                 force.scatter_(1, ranked.topk(k, dim=-1).indices, True)
-                gate_ok = torch.where((kept < min_keep).view(-1, 1), gate_ok | force, gate_ok)
+                gate_ok = torch.where(
+                    (kept < min_keep).view(-1, 1), gate_ok | force, gate_ok
+                )
             view_mask = view_mask & gate_ok
 
         mv_num_obj_voxels = getattr(self.config, "mv_num_obj_voxels", 512)
@@ -391,14 +450,16 @@ class ShapeOPT(OPTForCausalLM):
                 rv = int(ref_idx[b].item())
                 seed_list.append(
                     build_geo_obj_pc(
-                        local_points[b:b + 1, rv],
-                        cond_pcs_2d[b:b + 1],
-                        st[b:b + 1, rv],
+                        local_points[b : b + 1, rv],
+                        cond_pcs_2d[b : b + 1],
+                        st[b : b + 1, rv],
                     )
                 )
             seed_pcs = torch.cat(seed_list, dim=0)
 
-            discover_fn = get_discovery_fn(getattr(self.config, "mv_discovery_method", "consensus"))
+            discover_fn = get_discovery_fn(
+                getattr(self.config, "mv_discovery_method", "consensus")
+            )
             obj_voxels, ctx_voxels, mv_target_ids, obj_voxels_geom = discover_fn(
                 local_points=local_points,
                 scene_transforms=st,
@@ -421,7 +482,9 @@ class ShapeOPT(OPTForCausalLM):
                 return_target_ids=True,
             )
         else:
-            logger.warning("panoptic_masks not provided; falling back to seed-FPS MV voxels.")
+            logger.warning(
+                "panoptic_masks not provided; falling back to seed-FPS MV voxels."
+            )
             mv_target_ids = None
             ref_idx = (
                 ref_view.to(local_points.device).long()
@@ -433,9 +496,9 @@ class ShapeOPT(OPTForCausalLM):
                 rv = int(ref_idx[b].item())
                 seed_list.append(
                     build_geo_obj_pc(
-                        local_points[b:b + 1, rv],
-                        cond_pcs_2d[b:b + 1],
-                        st[b:b + 1, rv],
+                        local_points[b : b + 1, rv],
+                        cond_pcs_2d[b : b + 1],
+                        st[b : b + 1, rv],
                     )
                 )
             seed_pcs = torch.cat(seed_list, dim=0)
@@ -450,12 +513,14 @@ class ShapeOPT(OPTForCausalLM):
                     valid = lp_n[..., 2] > 0
                     if valid.any():
                         pts_s = _apply_scene_transform(
-                            lp_n[valid].float().unsqueeze(0), st[b:b + 1, n]
+                            lp_n[valid].float().unsqueeze(0), st[b : b + 1, n]
                         ).squeeze(0)
                         pts_all.append(pts_s.float())
                 merged = torch.cat(pts_all, dim=0) if pts_all else seed_pcs[b].float()
                 ctx_list.append(
-                    fps_centroid_seeded(merged.unsqueeze(0), mv_num_ctx_voxels).squeeze(0)
+                    fps_centroid_seeded(merged.unsqueeze(0), mv_num_ctx_voxels).squeeze(
+                        0
+                    )
                 )
             ctx_voxels = torch.stack(ctx_list, dim=0)
 
@@ -465,30 +530,27 @@ class ShapeOPT(OPTForCausalLM):
         obj_geom_voxels = None
         if obj_canon_transform is not None:
             src_voxels = obj_voxels_geom if obj_voxels_geom is not None else obj_voxels
-            with torch.autocast(device_type=src_voxels.device.type, enabled=False):
-                R = obj_canon_transform[:, :3, :3].to(
-                    device=src_voxels.device, dtype=torch.float32
-                )
-                v = torch.bmm(src_voxels.to(dtype=torch.float32), R.transpose(1, 2))
-                q = float(getattr(self.config, "mv_geom_norm_quantile", 0.0) or 0.0)
-                if q > 0.0:
-                    qs = torch.tensor([q, 1.0 - q], device=v.device, dtype=torch.float32)
-                    bounds = torch.quantile(v, qs, dim=1)
-                    vmin = bounds[0].unsqueeze(1)
-                    vmax = bounds[1].unsqueeze(1)
-                else:
-                    vmin = v.amin(dim=1, keepdim=True)
-                    vmax = v.amax(dim=1, keepdim=True)
-                center = 0.5 * (vmin + vmax)
-                scale = (2 * 0.95) / (vmax - vmin).amax(dim=-1, keepdim=True).clamp_min(1e-6)
-                obj_geom_voxels = (v - center) * scale
+            obj_geom_voxels = _normalize_mv_obj_geom_voxels(
+                src_voxels,
+                obj_canon_transform,
+                quantile=getattr(self.config, "mv_geom_norm_quantile", 0.0),
+                trim_fallback_ratio=getattr(
+                    self.config, "mv_geom_norm_trim_fallback_ratio", 0.2
+                ),
+            )
 
-        if getattr(self.config, "mv_obj_pc_oracle", False) and gt_obj_vertices is not None:
-            obj_geom_voxels = gt_obj_vertices.to(device=obj_voxels.device, dtype=torch.float32)
+        if (
+            getattr(self.config, "mv_obj_pc_oracle", False)
+            and gt_obj_vertices is not None
+        ):
+            obj_geom_voxels = gt_obj_vertices.to(
+                device=obj_voxels.device, dtype=torch.float32
+            )
 
         mv_conf = geo_out["conf"][..., 0] if geo_out.get("conf") is not None else None
         need_dino = getattr(self.config, "mv_obj_pc_appearance", False) or (
-            getattr(self.config, "mv_use_voxel_encoder", True) and self.mv_voxel_encoder is not None
+            getattr(self.config, "mv_use_voxel_encoder", True)
+            and self.mv_voxel_encoder is not None
         )
         dino_feats = None
         if need_dino:
@@ -496,7 +558,9 @@ class ShapeOPT(OPTForCausalLM):
                 dino_feats = cached_dino_feats.to(device)
             else:
                 if self.cond_encoder_img is None:
-                    raise RuntimeError("cond_encoder_img is required for multi-view DINO features")
+                    raise RuntimeError(
+                        "cond_encoder_img is required for multi-view DINO features"
+                    )
                 pv_flat = pixel_values.reshape(B * N, C, H, W)
                 dino_flat = self.cond_encoder_img(pixel_values=pv_flat)
                 _, C_d, Hf, Wf = dino_flat.shape
@@ -519,9 +583,13 @@ class ShapeOPT(OPTForCausalLM):
                     mv_target_ids,
                     mv_conf,
                 )
-            cond_dtype = _floating_module_dtype(self.cond_encoder, obj_geom_voxels.dtype)
+            cond_dtype = _floating_module_dtype(
+                self.cond_encoder, obj_geom_voxels.dtype
+            )
             obj_pc_extra_feat = (
-                obj_pc_extra_feat.to(dtype=cond_dtype) if obj_pc_extra_feat is not None else None
+                obj_pc_extra_feat.to(dtype=cond_dtype)
+                if obj_pc_extra_feat is not None
+                else None
             )
             obj_pc_conds = self.cond_encoder(
                 obj_geom_voxels.to(dtype=cond_dtype),
@@ -533,14 +601,18 @@ class ShapeOPT(OPTForCausalLM):
         obj_view_mask = None
         if mv_target_ids is not None and panoptic_masks is not None:
             pm_dev = panoptic_masks.to(device)
-            pixel_support_n = (pm_dev == mv_target_ids[:, :, None, None]).sum((-1, -2)).float()
+            pixel_support_n = (
+                (pm_dev == mv_target_ids[:, :, None, None]).sum((-1, -2)).float()
+            )
             min_sup_pix = float(getattr(self.config, "mv_covis_min_support_pix", 200))
             obj_view_mask = view_mask & (pixel_support_n >= min_sup_pix)
 
         z_i = z_scene = None
         if getattr(self.config, "mv_use_voxel_encoder", True):
             if self.mv_voxel_encoder is None:
-                raise RuntimeError("mv_use_voxel_encoder=True but mv_voxel_encoder was not built")
+                raise RuntimeError(
+                    "mv_use_voxel_encoder=True but mv_voxel_encoder was not built"
+                )
             mv_out = self.mv_voxel_encoder(
                 obj_voxels,
                 ctx_voxels,
@@ -549,7 +621,9 @@ class ShapeOPT(OPTForCausalLM):
                 K_f,
                 geo_depth,
                 view_mask,
-                panoptic_masks=panoptic_masks.to(device) if panoptic_masks is not None else None,
+                panoptic_masks=panoptic_masks.to(device)
+                if panoptic_masks is not None
+                else None,
                 target_ids=mv_target_ids,
                 conf=mv_conf,
                 obj_geom_voxels=obj_geom_voxels,
@@ -566,7 +640,9 @@ class ShapeOPT(OPTForCausalLM):
         cond_token_mask = input_ids_clone == self.config.pc_token_id
         indicator_mask = input_ids_clone == self.config.indicator_token_id
         obj_pc_mask = input_ids_clone == self.config.obj_pc_token_id
-        input_ids_clone[cond_token_mask | indicator_mask | obj_pc_mask] = self.config.pad_token_id
+        input_ids_clone[cond_token_mask | indicator_mask | obj_pc_mask] = (
+            self.config.pad_token_id
+        )
         inputs_embeds = self.model.decoder.embed_tokens(input_ids_clone)
 
         cond_parts = []
@@ -579,27 +655,41 @@ class ShapeOPT(OPTForCausalLM):
         if self.mv_aabb_embed is not None:
             aabb = torch.cat([obj_voxels.amin(dim=1), obj_voxels.amax(dim=1)], dim=-1)
             aabb_dtype = _floating_module_dtype(self.mv_aabb_embed, inputs_embeds.dtype)
-            cond_parts.append(self.mv_aabb_embed(aabb.to(dtype=aabb_dtype)).unsqueeze(1))
+            cond_parts.append(
+                self.mv_aabb_embed(aabb.to(dtype=aabb_dtype)).unsqueeze(1)
+            )
         cond_parts.append(num_face_embeds.to(inputs_embeds.dtype))
         all_cond = torch.cat(cond_parts, dim=1).flatten(0, 1)
         assert all_cond.shape[0] == int(cond_token_mask.sum()), (
             f"MV cond token count {all_cond.shape[0]} != pc_token slots "
             f"{int(cond_token_mask.sum())}; prefix_len must equal mv_prefix_len(config)."
         )
-        inputs_embeds = inputs_embeds.masked_scatter(cond_token_mask.unsqueeze(-1), all_cond)
+        inputs_embeds = inputs_embeds.masked_scatter(
+            cond_token_mask.unsqueeze(-1), all_cond
+        )
         if return_diagnostics:
             diagnostics = {
                 "obj_voxels": obj_voxels.detach(),
                 "ctx_voxels": ctx_voxels.detach(),
-                "obj_geom_voxels": obj_geom_voxels.detach() if obj_geom_voxels is not None else None,
+                "obj_geom_voxels": obj_geom_voxels.detach()
+                if obj_geom_voxels is not None
+                else None,
                 "seed_pcs": seed_pcs.detach() if "seed_pcs" in locals() else None,
-                "seed_pcs_2d": cond_pcs_2d.detach() if cond_pcs_2d is not None else None,
+                "seed_pcs_2d": cond_pcs_2d.detach()
+                if cond_pcs_2d is not None
+                else None,
                 "view_mask": view_mask.detach(),
-                "obj_view_mask": obj_view_mask.detach() if obj_view_mask is not None else None,
+                "obj_view_mask": obj_view_mask.detach()
+                if obj_view_mask is not None
+                else None,
                 "ref_view": ref_idx.detach() if "ref_idx" in locals() else None,
                 "obj_aabb": aabb.detach() if aabb is not None else None,
-                "mv_target_ids": mv_target_ids.detach() if mv_target_ids is not None else None,
-                "view_conf_mean": mv_conf.float().mean(dim=(-1, -2)).detach() if mv_conf is not None else None,
+                "mv_target_ids": mv_target_ids.detach()
+                if mv_target_ids is not None
+                else None,
+                "view_conf_mean": mv_conf.float().mean(dim=(-1, -2)).detach()
+                if mv_conf is not None
+                else None,
             }
             return inputs_embeds, diagnostics
         return inputs_embeds
@@ -641,7 +731,9 @@ class ShapeOPT(OPTForCausalLM):
             ref_view=ref_view,
         )
 
-        output_attentions = decoder_kwargs.pop("output_attentions", self.config.output_attentions)
+        output_attentions = decoder_kwargs.pop(
+            "output_attentions", self.config.output_attentions
+        )
         output_hidden_states = decoder_kwargs.pop(
             "output_hidden_states", self.config.output_hidden_states
         )
@@ -812,7 +904,9 @@ class ShapeOPT(OPTForCausalLM):
                 conf = geo_out.get("conf")
                 st = scene_transform.to(pixel_values.device)
                 if ctx_pcs is not None:
-                    ctx_pcs, ctx_pcs_2d = build_geo_ctx_pc(lp, conf, st, ctx_pcs.shape[1])
+                    ctx_pcs, ctx_pcs_2d = build_geo_ctx_pc(
+                        lp, conf, st, ctx_pcs.shape[1]
+                    )
                 if cond_pcs is not None and cond_pcs_2d is not None:
                     cond_pcs = build_geo_obj_pc(lp, cond_pcs_2d, st)
 

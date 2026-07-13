@@ -50,7 +50,9 @@ class DataConfig:
     ignore_obj_seq: bool = False
     ignore_layout_seq: bool = False
     # Multi-view
-    num_views: int = 1  # max slots to pad to; actual count determined by covisibility selection
+    num_views: int = (
+        1  # max slots to pad to; actual count determined by covisibility selection
+    )
     # Trellis2-MV dataset: path to local HF dataset used to cross-ref images/cameras.
     # Defaults to <dataset_path>/../../3d-front-multiview-full when empty.
     trellis2_hf_path: str = ""
@@ -167,6 +169,9 @@ class ModelConfig:
     mv_intra_obj_register: bool = False
     mv_register_iters: int = 4
     mv_geom_norm_quantile: float = 0.0
+    # If quantile trimming collapses the max-axis span below this fraction of the
+    # raw span, fall back to raw min/max for that object to avoid unbounded scale.
+    mv_geom_norm_trim_fallback_ratio: float = 0.2
     mv_use_geometry: bool = True
     # Sampling strategy for obj_voxels after discovery: "fps" = score-seeded FPS (default,
     # maximises spread), "grid" = fixed voxel-grid reps, "adaptive" = occupied-cell

@@ -17,7 +17,9 @@ def _mv_test_inputs(feat_dim: int = 4):
         [[[0.1, 0.1, 1.1], [0.3, 0.0, 1.5], [0.0, 0.3, 1.7], [0.2, 0.2, 1.3]]],
         dtype=torch.float32,
     )
-    scene_transforms = torch.eye(4, dtype=torch.float32).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    scene_transforms = (
+        torch.eye(4, dtype=torch.float32).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    )
     K_per_view = torch.eye(3, dtype=torch.float32).view(1, 1, 3, 3).repeat(1, 2, 1, 1)
     geo_depth = torch.full((1, 2, 4, 4), 3.0, dtype=torch.float32)
     view_mask = torch.ones(1, 2, dtype=torch.bool)
@@ -126,6 +128,76 @@ def test_obj_view_feature_fusion_accepts_bf16_features_and_fp32_geometry_under_a
     assert out.shape == (1, 3, 4)
     assert out.dtype == torch.bfloat16
     assert torch.isfinite(out.float()).all()
+
+
+def _max_axis_extent(points: torch.Tensor) -> torch.Tensor:
+    return (points.amax(dim=1) - points.amin(dim=1)).amax(dim=-1)
+
+
+def test_mv_obj_geom_quantile_norm_falls_back_when_trimmed_extent_collapses():
+    from src.models.edgerunner import _normalize_mv_obj_geom_voxels
+
+    num_points = 2048
+    cluster_points = int(num_points * 0.97)
+    cluster = torch.zeros(1, cluster_points, 3, dtype=torch.float32)
+    cluster[..., 0] = torch.linspace(0.0, 1e-6, cluster_points)
+    spread = torch.zeros(1, num_points - cluster_points, 3, dtype=torch.float32)
+    spread[..., 0] = torch.linspace(0.0, 2.0, spread.shape[1])
+    src_voxels = torch.cat([cluster, spread], dim=1)
+    obj_canon_transform = torch.eye(4, dtype=torch.float32).view(1, 4, 4)
+
+    raw = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.0,
+    )
+    exploded = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.05,
+        trim_fallback_ratio=0.0,
+    )
+    guarded = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.05,
+        trim_fallback_ratio=0.2,
+    )
+
+    assert torch.allclose(_max_axis_extent(raw), torch.tensor([1.9]), atol=1e-5)
+    assert _max_axis_extent(exploded).item() > 1e5
+    assert torch.allclose(_max_axis_extent(guarded), torch.tensor([1.9]), atol=1e-5)
+
+
+def test_mv_obj_geom_quantile_norm_keeps_noncollapsed_trim_behavior():
+    from src.models.edgerunner import _normalize_mv_obj_geom_voxels
+
+    core = torch.zeros(1, 2046, 3, dtype=torch.float32)
+    core[..., 0] = torch.linspace(0.0, 1.0, core.shape[1])
+    outliers = torch.tensor([[[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]], dtype=torch.float32)
+    src_voxels = torch.cat([core, outliers], dim=1)
+    obj_canon_transform = torch.eye(4, dtype=torch.float32).view(1, 4, 4)
+
+    trimmed = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.05,
+        trim_fallback_ratio=0.0,
+    )
+    guarded = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.05,
+        trim_fallback_ratio=0.2,
+    )
+    raw = _normalize_mv_obj_geom_voxels(
+        src_voxels,
+        obj_canon_transform,
+        quantile=0.0,
+    )
+
+    assert torch.allclose(guarded, trimmed)
+    assert _max_axis_extent(guarded).item() > _max_axis_extent(raw).item()
 
 
 def test_mv_voxel_encoder_accepts_fp32_geometry_and_bf16_features_under_autocast():
