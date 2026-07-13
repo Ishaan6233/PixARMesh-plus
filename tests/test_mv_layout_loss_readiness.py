@@ -98,8 +98,7 @@ def test_mv_layout_loss_readiness_accepts_complete_prerequisites(tmp_path):
     assert report["checks"]["uid_metadata"]["category_count"] == 2
 
 
-def test_mv_layout_loss_readiness_accepts_empty_marker_cache_files(tmp_path):
-    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+def _write_empty_marker_npz(cache):
     np.savez(
         cache / "uid-a.npz",
         cache_version=np.asarray(MV_FEATURE_CACHE_VERSION, dtype=np.int64),
@@ -112,12 +111,60 @@ def test_mv_layout_loss_readiness_accepts_empty_marker_cache_files(tmp_path):
         empty_reason=np.asarray("runtime rejected"),
     )
 
-    result, report = _run_readiness_for_paths(tmp_path, mesh, hf, cache, sv, uid_meta)
+
+def test_mv_layout_loss_readiness_recognizes_empty_marker_cache_files_as_present(tmp_path):
+    # An empty-marker file still counts as present (not missing) for coverage purposes;
+    # this fixture's single expected uid is 100% empty-marker, so with the default
+    # thresholds it now also blocks readiness (see the two tests below) -- this test
+    # isolates the "present, not missing" bookkeeping from the threshold gate.
+    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+    _write_empty_marker_npz(cache)
+
+    result, report = _run_readiness_for_paths(
+        tmp_path, mesh, hf, cache, sv, uid_meta, "--max-empty-marker-frac", "1.0"
+    )
 
     assert result.returncode == 0, result.stdout + result.stderr
     coverage = report["checks"]["mv_feature_cache"]["coverage"]
+    assert coverage["missing_count"] == 0
     assert coverage["empty_marker_count"] == 1
     assert coverage["feature_file_count"] == 0
+
+
+def test_mv_layout_loss_readiness_blocks_on_excessive_empty_marker_fraction(tmp_path):
+    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+    _write_empty_marker_npz(cache)
+
+    result, report = _run_readiness_for_paths(tmp_path, mesh, hf, cache, sv, uid_meta)
+
+    assert result.returncode == 1
+    assert not report["ok"]
+    coverage = report["checks"]["mv_feature_cache"]["coverage"]
+    assert coverage["empty_marker_frac"] == 1.0
+    assert any("empty-marker placeholders" in issue for issue in report["issues"])
+    assert any(item["check"] == "mv_feature_cache" for item in report["remediations"])
+
+
+def test_mv_layout_loss_readiness_warns_without_blocking_below_max_empty_marker_frac(tmp_path):
+    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+    _write_empty_marker_npz(cache)
+
+    result, report = _run_readiness_for_paths(
+        tmp_path,
+        mesh,
+        hf,
+        cache,
+        sv,
+        uid_meta,
+        "--max-empty-marker-frac",
+        "1.0",
+        "--warn-empty-marker-frac",
+        "0.05",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report["ok"]
+    assert any("empty-marker placeholders" in warning for warning in report["warnings"])
 
 
 def test_mv_layout_loss_readiness_reports_filter_keep_cache_coverage_gaps(tmp_path):
@@ -279,3 +326,59 @@ def test_mv_layout_loss_readiness_reports_existing_checkpoint_guards(tmp_path):
     assert str(existing) in report["checks"]["existing_checkpoints"]["paths"]
     assert any("existing checkpoint directories" in issue for issue in report["issues"])
     assert any(item["check"] == "existing_checkpoints" for item in report["remediations"])
+
+
+def test_mv_layout_loss_readiness_warns_on_disagreeing_sv_baseline(tmp_path):
+    # 2026-07-13 red-team Finding 2: two on-disk "frozen SV baseline" files disagreed by
+    # ~2x avg_cd on identical objects with no warning anywhere. This is the guard.
+    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+    other_dir = tmp_path / "other_sv_baseline"
+    other_dir.mkdir()
+    other_sv = other_dir / "eval_obj_results.jsonl"
+    with other_sv.open("w") as f:
+        f.write(json.dumps({"uid": "uid-a", "obj_id": 0, "cd": 0.05, "f_score": 0.6}) + "\n")
+        f.write(json.dumps({"avg_cd": 0.05, "avg_f_score": 0.6, "num_evaluated": 1}) + "\n")
+
+    result, report = _run_readiness_for_paths(
+        tmp_path,
+        mesh,
+        hf,
+        cache,
+        sv,
+        uid_meta,
+        "--sv-baseline-glob",
+        str(tmp_path / "**" / "eval_obj_results.jsonl"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report["ok"]
+    disagreements = report["checks"]["sv_downstream"]["baseline_disagreements"]
+    assert len(disagreements) == 1
+    assert disagreements[0]["path"] == str(other_sv)
+    assert disagreements[0]["avg_cd"] == 0.05
+    assert any("disagree with" in warning for warning in report["warnings"])
+
+
+def test_mv_layout_loss_readiness_silent_when_candidate_baselines_agree(tmp_path):
+    mesh, hf, cache, sv, uid_meta = _write_ready_fixture(tmp_path)
+    other_dir = tmp_path / "other_sv_baseline"
+    other_dir.mkdir()
+    other_sv = other_dir / "eval_obj_results.jsonl"
+    with other_sv.open("w") as f:
+        f.write(json.dumps({"uid": "uid-a", "obj_id": 0, "cd": 0.101, "f_score": 0.2}) + "\n")
+        f.write(json.dumps({"avg_cd": 0.101, "avg_f_score": 0.2, "num_evaluated": 1}) + "\n")
+
+    result, report = _run_readiness_for_paths(
+        tmp_path,
+        mesh,
+        hf,
+        cache,
+        sv,
+        uid_meta,
+        "--sv-baseline-glob",
+        str(tmp_path / "**" / "eval_obj_results.jsonl"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "baseline_disagreements" not in report["checks"]["sv_downstream"]
+    assert not any("disagree with" in warning for warning in report["warnings"])

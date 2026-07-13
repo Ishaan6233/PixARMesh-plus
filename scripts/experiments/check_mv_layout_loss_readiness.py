@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+import glob as glob_module
 import json
 import subprocess
 import sys
@@ -67,6 +68,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-existing-checkpoints", action="store_true")
     parser.add_argument("--sample-cache-files", type=int, default=3)
+    parser.add_argument(
+        "--max-empty-marker-frac",
+        type=float,
+        default=0.15,
+        help="Fail readiness if more than this fraction of expected cache files are "
+        "empty-marker placeholders (runtime-rejected instances), not real features.",
+    )
+    parser.add_argument(
+        "--warn-empty-marker-frac",
+        type=float,
+        default=0.08,
+        help="Warn (without failing) once the empty-marker fraction exceeds this.",
+    )
+    parser.add_argument(
+        "--sv-baseline-glob",
+        default="outputs/sv/**/eval_obj_results.jsonl",
+        help="Glob (relative to repo root) used to detect other candidate SV baseline "
+        "files that disagree with --sv-downstream, so a silent swap to a different "
+        "baseline doesn't go unnoticed.",
+    )
+    parser.add_argument(
+        "--sv-baseline-tolerance",
+        type=float,
+        default=0.10,
+        help="Relative avg_cd difference above which another eval_obj_results.jsonl "
+        "under --sv-baseline-glob is flagged as disagreeing with --sv-downstream.",
+    )
     parser.add_argument(
         "--out",
         default="outputs/da3/experiments/mv_layout_loss_ablation/readiness.json",
@@ -273,6 +301,8 @@ def check_feature_cache(
     root: Path,
     sample_count: int,
     precompute_script: str,
+    max_empty_marker_frac: float = 0.15,
+    warn_empty_marker_frac: float = 0.08,
 ) -> None:
     entry: dict[str, Any] = {
         "path": str(root),
@@ -387,6 +417,26 @@ def check_feature_cache(
         entry["coverage"]["empty_marker_count"] = empty_marker_count
         entry["coverage"]["feature_file_count"] = len(files_to_check) - empty_marker_count
         entry["coverage"]["checked_expected_files"] = len(files_to_check)
+        if files_to_check:
+            empty_marker_frac = empty_marker_count / len(files_to_check)
+            entry["coverage"]["empty_marker_frac"] = empty_marker_frac
+            if empty_marker_frac > max_empty_marker_frac:
+                cache_has_issue = True
+                _record_issue(
+                    report,
+                    f"MV feature cache is {empty_marker_frac:.1%} empty-marker placeholders "
+                    f"({empty_marker_count}/{len(files_to_check)}), exceeding the "
+                    f"{max_empty_marker_frac:.1%} max — too many instances would silently "
+                    "train on degenerate features instead of real DA3/DINO conditioning.",
+                )
+            elif empty_marker_frac > warn_empty_marker_frac:
+                _record_warning(
+                    report,
+                    f"MV feature cache is {empty_marker_frac:.1%} empty-marker placeholders "
+                    f"({empty_marker_count}/{len(files_to_check)}) — above the "
+                    f"{warn_empty_marker_frac:.1%} watch threshold; confirm this matches the "
+                    "expected runtime-rejection rate before trusting downstream coverage.",
+                )
     if cache_has_issue or coverage_input_issues or entry["coverage"].get("missing_count") or entry["coverage"].get("extra_count"):
         record_cache_remediation()
 
@@ -416,7 +466,13 @@ def _first_present(row: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     return None
 
 
-def check_sv_downstream(report: dict[str, Any], path: Path) -> None:
+def check_sv_downstream(
+    report: dict[str, Any],
+    path: Path,
+    *,
+    baseline_glob: str = "outputs/sv/**/eval_obj_results.jsonl",
+    tolerance: float = 0.10,
+) -> None:
     rows = read_jsonl(path)
     object_rows = [row for row in rows if not is_downstream_summary(row)]
     summary = rows[-1] if rows else None
@@ -448,6 +504,58 @@ def check_sv_downstream(report: dict[str, Any], path: Path) -> None:
             report,
             "sv_downstream",
             "Regenerate the SV baseline so the final row reports aggregate CD/F metrics.",
+        )
+        return
+    _check_sv_baseline_agreement(
+        report, path=path, summary=summary, baseline_glob=baseline_glob, tolerance=tolerance
+    )
+
+
+def _check_sv_baseline_agreement(
+    report: dict[str, Any],
+    *,
+    path: Path,
+    summary: dict[str, Any],
+    baseline_glob: str,
+    tolerance: float,
+) -> None:
+    """Warn if another eval_obj_results.jsonl under outputs/sv/ reports a materially
+    different avg_cd than the one --sv-downstream points at.
+
+    Two on-disk baselines (outputs/sv/eval/baseline vs outputs/sv/fair-benchmark/eval-obj)
+    are known to disagree by ~2x CD on identical objects despite both looking like a valid
+    "frozen SV baseline" (2026-07-13 red-team Finding 2) — this is the guard against
+    silently pointing --sv-downstream at the wrong one without noticing.
+    """
+    own_cd = summary.get("avg_cd")
+    if own_cd is None:
+        return
+    resolved = path.resolve()
+    disagreements = []
+    for candidate_str in sorted(glob_module.glob(baseline_glob, recursive=True)):
+        candidate = Path(candidate_str)
+        if candidate.resolve() == resolved:
+            continue
+        candidate_rows = read_jsonl(candidate)
+        candidate_summary = candidate_rows[-1] if candidate_rows else None
+        if not candidate_summary or not is_downstream_summary(candidate_summary):
+            continue
+        other_cd = candidate_summary.get("avg_cd")
+        if other_cd is None or own_cd == 0:
+            continue
+        rel_diff = abs(other_cd - own_cd) / abs(own_cd)
+        if rel_diff > tolerance:
+            disagreements.append((str(candidate), other_cd, rel_diff))
+    if disagreements:
+        report["checks"]["sv_downstream"]["baseline_disagreements"] = [
+            {"path": p, "avg_cd": cd, "relative_diff": diff} for p, cd, diff in disagreements
+        ]
+        details = "; ".join(f"{p} (avg_cd={cd:.6f}, {diff:.0%} off)" for p, cd, diff in disagreements)
+        _record_warning(
+            report,
+            f"other candidate SV baseline file(s) disagree with {path} "
+            f"(avg_cd={own_cd:.6f}) by more than {tolerance:.0%}: {details}. "
+            "Confirm which is the intended comparison bar before trusting a beat-SV claim.",
         )
 
 
@@ -613,8 +721,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         root=_literal_path(args.mv_feature_cache),
         sample_count=args.sample_cache_files,
         precompute_script=precompute_script,
+        max_empty_marker_frac=args.max_empty_marker_frac,
+        warn_empty_marker_frac=args.warn_empty_marker_frac,
     )
-    check_sv_downstream(report, Path(args.sv_downstream))
+    check_sv_downstream(
+        report,
+        Path(args.sv_downstream),
+        baseline_glob=args.sv_baseline_glob,
+        tolerance=args.sv_baseline_tolerance,
+    )
     check_uid_metadata(report, args.uid_metadata, args.require_uid_metadata)
     check_existing_outputs(
         report,
