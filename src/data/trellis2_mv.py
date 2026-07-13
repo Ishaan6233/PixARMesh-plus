@@ -48,6 +48,26 @@ MV_FEATURE_CACHE_KEYS = (
     "ref_view",
 )
 MV_FEATURE_CACHE_EMPTY_MARKER_KEY = "empty_marker"
+# Optional (not in MV_FEATURE_CACHE_KEYS, so cache files built before this field existed
+# still pass the required-keys check): a fingerprint of the DataConfig fields that decide
+# which HF views got selected/rejected for an item. Stamped at precompute time; the loader
+# compares it against the currently active config so a later view-selection/mask-sanity/
+# frame-correction policy change doesn't silently keep serving views chosen under the old
+# policy for every cache-hit row (2026-07-13 red-team Finding 4).
+MV_FEATURE_CACHE_POLICY_KEY = "view_selection_policy_fingerprint"
+_VIEW_SELECTION_POLICY_FIELDS = (
+    "mv_covis_k_max",
+    "mv_covis_min_support_pts",
+    "mv_mask_min_area_px",
+    "mv_mask_min_hit_pts",
+    "mv_mask_min_hit_frac",
+    "mv_frame_correction",
+)
+
+
+def view_selection_policy_fingerprint(data_cfg) -> str:
+    values = [repr(getattr(data_cfg, field, None)) for field in _VIEW_SELECTION_POLICY_FIELDS]
+    return hashlib.sha1("|".join(values).encode("utf-8")).hexdigest()[:16]
 _CAM_YUP_TO_OPENCV_4 = np.diag(np.array([-1, -1, 1, 1], dtype=np.float32))
 _CAM_YUP_TO_OPENCV_3 = np.diag(np.array([-1, -1, 1], dtype=np.float32))
 
@@ -372,6 +392,8 @@ class Trellis2MVDataset(Dataset):
         self.is_train = is_train
         self.norm_bound = data_cfg.norm_bound
         self.feature_cache = Path(data_cfg.mv_feature_cache) if data_cfg.mv_feature_cache else None
+        self._current_policy_fingerprint = view_selection_policy_fingerprint(data_cfg)
+        self._policy_mismatch_warned = False
 
         with (self.root / "metadata.csv").open(newline="") as f:
             rows = list(csv.DictReader(f))
@@ -465,6 +487,25 @@ class Trellis2MVDataset(Dataset):
                     f"{MV_FEATURE_CACHE_VERSION}; rebuild it with "
                     "scripts/data/precompute_mv_features.py."
                 )
+            current_fingerprint = getattr(self, "_current_policy_fingerprint", None)
+            if (
+                current_fingerprint is not None
+                and MV_FEATURE_CACHE_POLICY_KEY in z.files
+                and not getattr(self, "_policy_mismatch_warned", False)
+            ):
+                cached_fingerprint = str(np.asarray(z[MV_FEATURE_CACHE_POLICY_KEY]).item())
+                if cached_fingerprint != current_fingerprint:
+                    self._policy_mismatch_warned = True
+                    warnings.warn(
+                        f"{path} was cached under a different view-selection policy "
+                        f"(fingerprint {cached_fingerprint} != current "
+                        f"{current_fingerprint} over {_VIEW_SELECTION_POLICY_FIELDS}); its "
+                        "view_indices/view_mask/ref_view reflect the OLD policy. Rebuild "
+                        "mv_feature_cache with scripts/data/precompute_mv_features.py "
+                        "--overwrite to apply the current policy to cached rows. (Warning "
+                        "shown once per dataset instance.)",
+                        stacklevel=2,
+                    )
             view_indices = np.asarray(z["view_indices"], dtype=np.int64)
             view_mask = np.asarray(z["view_mask"], dtype=bool)
             if view_indices.ndim != 1 or view_mask.shape != view_indices.shape:

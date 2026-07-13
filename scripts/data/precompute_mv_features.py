@@ -36,8 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.data.trellis2_mv import (
     MV_FEATURE_CACHE_EMPTY_MARKER_KEY,
     MV_FEATURE_CACHE_KEYS,
+    MV_FEATURE_CACHE_POLICY_KEY,
     MV_FEATURE_CACHE_VERSION,
     Trellis2MVDataset,
+    view_selection_policy_fingerprint,
 )
 from src.models.utils import get_da3_encoder, get_image_condition_encoder
 from src.utils.config import DataConfig, ModelConfig
@@ -136,6 +138,7 @@ def _write_empty_cache_marker(path: Path, ex: dict, data_cfg: DataConfig, reason
         **{
             MV_FEATURE_CACHE_EMPTY_MARKER_KEY: np.asarray(True),
             "empty_reason": np.asarray(reason),
+            MV_FEATURE_CACHE_POLICY_KEY: np.asarray(view_selection_policy_fingerprint(data_cfg)),
         },
     )
 
@@ -224,6 +227,11 @@ def main():
                 view_indices=view_indices,
                 view_mask=view_mask,
                 ref_view=ref_view,
+                **{
+                    MV_FEATURE_CACHE_POLICY_KEY: np.asarray(
+                        view_selection_policy_fingerprint(data_cfg)
+                    )
+                },
             )
             wrote += 1
 

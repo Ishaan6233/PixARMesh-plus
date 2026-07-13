@@ -1,12 +1,16 @@
 import numpy as np
 import pytest
 
+import warnings
+
 from src.data.collator import get_mesh_data_collator
 from src.data.trellis2_mv import (
+    MV_FEATURE_CACHE_POLICY_KEY,
     MV_FEATURE_CACHE_VERSION,
     Trellis2MVDataset,
     _mask_sanity_for_view,
     _select_diverse_views,
+    view_selection_policy_fingerprint,
 )
 from src.utils.config import DataConfig, ModelConfig
 
@@ -239,6 +243,77 @@ def test_feature_cache_rejects_ref_view_outside_valid_mask(tmp_path):
 
     with pytest.raises(ValueError, match="view_mask\\[ref_view\\] is false"):
         ds._load_feature_cache("uid-a", n_avail=4)
+
+
+def test_view_selection_policy_fingerprint_changes_with_policy_fields():
+    base = DataConfig(type="trellis2_mv", path="unused")
+    changed = DataConfig(type="trellis2_mv", path="unused", mv_mask_min_area_px=base.mv_mask_min_area_px + 1)
+    same = DataConfig(type="trellis2_mv", path="unused")
+
+    assert view_selection_policy_fingerprint(base) != view_selection_policy_fingerprint(changed)
+    assert view_selection_policy_fingerprint(base) == view_selection_policy_fingerprint(same)
+
+
+def _cache_kwargs(policy_fingerprint: str | None):
+    kwargs = dict(
+        cache_version=np.array(2, dtype=np.int64),
+        local_points=np.zeros((2, 4, 5, 3), dtype=np.float16),
+        conf=np.ones((2, 4, 5, 1), dtype=np.float16),
+        dino_feats=np.zeros((2, 8, 2, 3), dtype=np.float16),
+        view_indices=np.array([3, 1], dtype=np.int64),
+        view_mask=np.array([True, False]),
+        ref_view=np.array(0, dtype=np.int64),
+    )
+    if policy_fingerprint is not None:
+        kwargs[MV_FEATURE_CACHE_POLICY_KEY] = np.asarray(policy_fingerprint)
+    return kwargs
+
+
+def test_feature_cache_warns_once_on_policy_fingerprint_mismatch(tmp_path):
+    ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
+    ds.feature_cache = tmp_path
+    ds._current_policy_fingerprint = "current-policy"
+    ds._policy_mismatch_warned = False
+    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("stale-policy"))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds._load_feature_cache("uid-a", n_avail=4)
+        ds._load_feature_cache("uid-a", n_avail=4)
+
+    policy_warnings = [w for w in caught if "view-selection policy" in str(w.message)]
+    assert len(policy_warnings) == 1
+    assert ds._policy_mismatch_warned is True
+
+
+def test_feature_cache_silent_when_policy_fingerprint_matches(tmp_path):
+    ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
+    ds.feature_cache = tmp_path
+    ds._current_policy_fingerprint = "same-policy"
+    ds._policy_mismatch_warned = False
+    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs("same-policy"))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds._load_feature_cache("uid-a", n_avail=4)
+
+    assert not [w for w in caught if "view-selection policy" in str(w.message)]
+
+
+def test_feature_cache_silent_when_policy_fingerprint_absent_legacy_cache(tmp_path):
+    # Cache files built before MV_FEATURE_CACHE_POLICY_KEY existed have no such key;
+    # they must keep loading without warning or crashing (backward compatibility).
+    ds = Trellis2MVDataset.__new__(Trellis2MVDataset)
+    ds.feature_cache = tmp_path
+    ds._current_policy_fingerprint = "current-policy"
+    ds._policy_mismatch_warned = False
+    np.savez_compressed(tmp_path / "uid-a.npz", **_cache_kwargs(None))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds._load_feature_cache("uid-a", n_avail=4)
+
+    assert not [w for w in caught if "view-selection policy" in str(w.message)]
 
 
 def test_mv_collator_keeps_only_plural_scene_transforms():
